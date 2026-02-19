@@ -1,64 +1,47 @@
 # Dev Environment Infrastructure
 
-Self-contained, leak-proof Docker development environments behind Xray (VLESS + Reality).
+Self-contained Docker development environments behind Xray (VLESS + Reality), with full-tunnel routing.
 
-This setup provides:
+## What this setup gives you
 
-* 🔒 Network isolation (no traffic leaks)
-* 🧱 Disposable dev containers
-* 💾 Persistent home + repo volumes
-* 🔑 SSH access with agent forwarding
-* 🌍 Optional HTTP/SOCKS proxy for host apps (VS Code, etc.)
-* ♻ One-command environment creation & removal
+- Centralized VPN/proxy config in one place: `vpn-gateway/.env`
+- Disposable dev containers with persistent `/home/<user>` and `/repo`
+- SSH access with agent forwarding
+- Per-dev sidecar network namespace (`<name>-net`) that routes all container traffic through Xray
+- Kill-switch behavior in sidecar: if Xray is unavailable, outbound traffic is blocked
 
----
+## Repository structure
 
-# Repository Structure
-
-```
+```text
 dev-env/
 ├── bin-dev-env/
-│   └── dev-env              # CLI tool for managing dev containers
+│   └── dev-env                    # CLI tool for managing dev containers
 ├── dev-containers/
+│   ├── net-sidecar/
+│   │   ├── Dockerfile             # sidecar image (sing-box + kill-switch)
+│   │   └── entrypoint.sh
 │   └── sshdev/
-│       ├── Dockerfile       # Dev container image
-│       └── entrypoint.sh    # Dynamic user setup
+│       ├── Dockerfile             # dev container image
+│       └── entrypoint.sh
 └── vpn-gateway/
     ├── Dockerfile.render
     ├── compose.yml
     └── config.template.json
 ```
 
----
+## Requirements
 
-# 1️⃣ Requirements
+- macOS
+- Docker Desktop
+- SSH key for GitHub (`~/.ssh/ghub_key` recommended)
 
-* macOS
-* Docker Desktop
-* SSH key for GitHub (`~/.ssh/ghub_key` recommended)
+## 1) Configure VPN gateway
 
----
+Create `vpn-gateway/.env`:
 
-# 2️⃣ Setup VPN Gateway
-
-## Step 1 — Create `.env`
-
-Inside:
-
-```
-vpn-gateway/
-```
-
-Create:
-
-```
-.env
-```
-
-Example:
-
-```
+```bash
 XRAY_INBOUND_PORT=1080
+XRAY_HTTP_PROXY_PORT=1081
 XRAY_SERVER_IP=YOUR_SERVER_IP
 XRAY_SERVER_PORT=443
 XRAY_UUID=YOUR_UUID
@@ -67,37 +50,42 @@ XRAY_SNI=www.example.com
 XRAY_SHORT_ID=YOUR_SHORT_ID
 ```
 
----
+Notes:
+- `XRAY_HTTP_PROXY_PORT` is optional unless you need HTTP proxy inbound for host apps.
+- `compose.yml` keeps backward compatibility with the old typoed variable name `XRAY_HTTP_RPOXY_PORT`.
 
-## Step 2 — Start VPN Gateway
+Start gateway:
 
 ```bash
 cd vpn-gateway
 docker compose up -d --build
 ```
 
-Verify:
+Verify from host:
 
 ```bash
 curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
 ```
 
-Should return your remote server IP.
+Expected: remote server IP (not your local ISP IP).
 
----
+## 2) Build images
 
-# 3️⃣ Build Dev Container Image
+Build dev container image:
 
 ```bash
 cd dev-containers/sshdev
 docker build -t sshdev:24.04 .
 ```
 
----
+Build sidecar image:
 
-# 4️⃣ Install `dev-env` CLI
+```bash
+cd dev-containers/net-sidecar
+docker build -t devnet-sidecar:1 .
+```
 
-Move the script somewhere in PATH:
+## 3) Install `dev-env` CLI
 
 ```bash
 sudo mv bin-dev-env/dev-env /opt/homebrew/bin/dev-env
@@ -110,9 +98,7 @@ Verify:
 dev-env help
 ```
 
----
-
-# 5️⃣ Create Dev Environment
+## 4) Create and use a dev environment
 
 ```bash
 dev-env new dev1
@@ -120,12 +106,12 @@ dev-env new dev1
 
 This creates:
 
-* Container: `dev1`
-* Linux user: `dev1`
-* Home volume: `dev1-home`
-* Repo volume: `dev1-repo`
-* SSH port auto-assigned
-* SSH config entry auto-created
+- Dev container: `dev1`
+- Network sidecar: `dev1-net`
+- Linux user: `dev1`
+- Volumes: `dev1-home`, `dev1-repo`
+- Local SSH port mapping on `dev1-net`
+- SSH config entry for `dev1`
 
 Connect:
 
@@ -133,154 +119,63 @@ Connect:
 dev-env ssh dev1
 ```
 
-Or:
+or:
 
 ```bash
 ssh dev1
 ```
 
----
+## 5) Validate full-tunnel behavior
 
-# 6️⃣ Persistence Model
-
-### What Persists
-
-| Item                         | Reason                     |
-| ---------------------------- | -------------------------- |
-| Installed packages           | Docker writable layer      |
-| `/home/<user>`               | Named volume               |
-| `/repo`                      | Named volume               |
-| Git repos                    | Stored in volume           |
-| Container after macOS reboot | `--restart unless-stopped` |
-
-### What Does Not Persist
-
-| Item                         | Reason             |
-| ---------------------------- | ------------------ |
-| Container after `dev-env rm` | Explicitly removed |
-| Volumes after `dev-env rm`   | Explicitly deleted |
-
----
-
-# 7️⃣ GitHub SSH (Agent Forwarding)
-
-Recommended macOS SSH config:
-
-```
-Host *
-  AddKeysToAgent yes
-  UseKeychain yes
-  IdentityFile ~/.ssh/ghub_key
-```
-
-Add key to keychain:
+Inside container:
 
 ```bash
-ssh-add --apple-use-keychain ~/.ssh/ghub_key
+dev-env ssh dev1
+env | grep -Ei 'proxy|all_proxy' || true
+curl -s https://api.ipify.org
 ```
 
-Agent forwarding is enabled automatically for dev containers.
+Expected:
+- No proxy env vars are required for tooling.
+- Public IP should be the VPN/Xray egress IP.
 
-Test inside container:
+Kill-switch behavior check:
 
-```bash
-ssh -T git@github.com
-```
+1. Stop Xray (`cd vpn-gateway && docker compose stop xray`)
+2. Try outbound request from `dev1` (`curl https://example.com`)
 
----
+Expected: request fails (no direct leak).
 
-# 8️⃣ CLI Commands
+## 6) CLI commands
 
-Create environment:
-
-```
+```text
 dev-env new <name>
-```
-
-Remove environment:
-
-```
 dev-env rm <name>
-```
-
-List environments:
-
-```
 dev-env list
-```
-
-Restart environment:
-
-```
 dev-env restart <name>
-```
-
-SSH into environment:
-
-```
 dev-env ssh <name>
-```
-
-Open repo volume on host:
-
-```
 dev-env cd <name>
-```
-
-Help:
-
-```
 dev-env help
 ```
 
----
+`dev-env restart <name>` restarts both `<name>-net` and `<name>`.
 
-# 9️⃣ Optional: HTTP Proxy for Host Apps
+## 7) Persistence model
 
-If using HTTP inbound in Xray (port 1081):
+Persists:
+- Installed packages in container writable layer
+- `/home/<user>` named volume
+- `/repo` named volume
+- Container restart on macOS reboot (`--restart unless-stopped`)
 
-VS Code settings:
+Does not persist:
+- Container after `dev-env rm <name>`
+- Volumes after `dev-env rm <name>`
 
-```json
-"http.proxy": "http://127.0.0.1:1081",
-"http.proxySupport": "override",
-"http.proxyStrictSSL": false
-```
+## 8) Security model
 
----
-
-# 🔒 Security Model
-
-* Dev containers are on internal Docker network.
-* No direct internet access.
-* All traffic must go through Xray.
-* Removing environment deletes volumes.
-* No private SSH keys stored in containers.
-
----
-
-# 🧹 Cleanup
-
-Remove all dev containers:
-
-```bash
-docker rm -f $(docker ps -aq --filter "name=dev")
-```
-
-Remove unused volumes:
-
-```bash
-docker volume prune -f
-```
-
----
-
-# 🚀 Philosophy
-
-You are not installing development tools on your Mac.
-
-You are spawning disposable Linux workspaces inside a controlled VPN-gated network bubble.
-
-Host stays clean.
-Environments are reproducible.
-Removal leaves no residue.
+- Dev containers use sidecar network namespace.
+- Outbound is forced through sidecar TUN routing to Xray socks inbound.
+- Sidecar iptables policy defaults to drop.
+- Only Xray upstream, loopback, established traffic, SSH ingress, and TUN path are allowed.
+- No private SSH keys are stored in dev containers.

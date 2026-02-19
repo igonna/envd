@@ -3,13 +3,18 @@ set -euo pipefail
 
 NETWORK="vpn-gateway_inside"
 IMAGE="sshdev:24.04"
+NET_IMAGE="devnet-sidecar:1"
 PORT_BASE=2223
 PORT_MAX=2299
 
 LABEL_KEY="dev-env.managed"
 LABEL_VAL="true"
+ROLE_KEY="dev-env.role"
+ROLE_DEV="dev"
+ROLE_NET="net"
 
 SSHCFG="${HOME}/.ssh/config"
+KNOWN_HOSTS_DEV="${HOME}/.ssh/known_hosts_dev_env"
 KEY_PRIV="${HOME}/.ssh/id_ed25519"
 KEY_PUB="${HOME}/.ssh/id_ed25519.pub"
 
@@ -56,6 +61,7 @@ ensure_ssh_key() {
 ensure_network_and_image() {
   docker network inspect "$NETWORK" >/dev/null 2>&1 || die "Network '$NETWORK' not found. Start vpn-gateway first."
   docker image inspect "$IMAGE" >/dev/null 2>&1 || die "Image '$IMAGE' not found. Build it first: docker build -t $IMAGE <path>"
+  docker image inspect "$NET_IMAGE" >/dev/null 2>&1 || die "Image '$NET_IMAGE' not found. Build it first: docker build -t $NET_IMAGE <path-to-dev-containers/net-sidecar>"
 }
 
 pick_port() {
@@ -65,6 +71,22 @@ pick_port() {
       echo "$p"; return 0
     fi
     p=$((p+1))
+  done
+  return 1
+}
+
+wait_for_healthy() {
+  local container="$1"
+  for _ in {1..80}; do
+    local status
+    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container" 2>/dev/null || true)"
+    if [[ "$status" == "healthy" ]]; then
+      return 0
+    fi
+    if [[ "$status" == "unhealthy" ]]; then
+      return 1
+    fi
+    sleep 0.25
   done
   return 1
 }
@@ -81,6 +103,14 @@ remove_ssh_config_host() {
   mv "${SSHCFG}.tmp" "$SSHCFG"
 }
 
+remove_known_host_entry() {
+  local host="$1" port="$2"
+  mkdir -p "${HOME}/.ssh"
+  touch "$KNOWN_HOSTS_DEV"
+  chmod 600 "$KNOWN_HOSTS_DEV"
+  ssh-keygen -R "[${host}]:${port}" -f "$KNOWN_HOSTS_DEV" >/dev/null 2>&1 || true
+}
+
 set_ssh_config_host() {
   local host="$1" port="$2" user="$3"
 
@@ -89,6 +119,8 @@ set_ssh_config_host() {
 
   # remove old block if exists
   remove_ssh_config_host "$host"
+  # avoid stale key mismatch when a recreated env reuses the same local port
+  remove_known_host_entry "127.0.0.1" "$port"
 
   cat >> "$SSHCFG" <<EOCFG
 
@@ -116,8 +148,10 @@ case "$cmd" in
     ;;
 
   list)
+    echo -e "NAME\tSTATUS\tIMAGE"
     docker ps -a --filter "label=$LABEL_KEY=$LABEL_VAL" \
-      --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+      --format "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Label \"$ROLE_KEY\"}}" \
+      | awk -F '\t' 'BEGIN{OFS="\t"} { if ($4 == "net" || $1 ~ /-net$/) next; print $1, $2, $3 }'
     ;;
 
   new)
@@ -129,40 +163,79 @@ case "$cmd" in
     docker inspect "$name" >/dev/null 2>&1 && die "Container '$name' already exists."
 
     USER_NAME="$name"
+    NET_NAME="${name}-net"
     PORT="$(pick_port)" || die "No free port in ${PORT_BASE}-${PORT_MAX}"
 
     HOME_VOL="${name}-home"
     REPO_VOL="${name}-repo"
+    created_home_vol="false"
+    created_repo_vol="false"
+    created_net="false"
+    created_dev="false"
+
+    cleanup_partial_new() {
+      local code=$?
+      if [[ $code -eq 0 ]]; then
+        return 0
+      fi
+
+      [[ "$created_dev" == "true" ]] && docker rm -f "$name" >/dev/null 2>&1 || true
+      [[ "$created_net" == "true" ]] && docker rm -f "$NET_NAME" >/dev/null 2>&1 || true
+      [[ "$created_home_vol" == "true" ]] && docker volume rm "$HOME_VOL" >/dev/null 2>&1 || true
+      [[ "$created_repo_vol" == "true" ]] && docker volume rm "$REPO_VOL" >/dev/null 2>&1 || true
+    }
+    trap cleanup_partial_new EXIT
+
+    docker inspect "$NET_NAME" >/dev/null 2>&1 && die "Sidecar '$NET_NAME' already exists."
 
     docker volume create "$HOME_VOL" >/dev/null
+    created_home_vol="true"
     docker volume create "$REPO_VOL" >/dev/null
+    created_repo_vol="true"
+
+    docker run -d \
+      --name "$NET_NAME" \
+      --label "$LABEL_KEY=$LABEL_VAL" \
+      --label "$ROLE_KEY=$ROLE_NET" \
+      --restart unless-stopped \
+      --network "$NETWORK" \
+      --cap-add NET_ADMIN \
+      --device /dev/net/tun \
+      -e XRAY_HOST="xray" \
+      -e XRAY_PORT="1080" \
+      -p "127.0.0.1:${PORT}:22" \
+      "$NET_IMAGE" >/dev/null
+    created_net="true"
+
+    wait_for_healthy "$NET_NAME" || die "Sidecar '$NET_NAME' did not become healthy."
 
     docker run -d \
       --name "$name" \
       --label "$LABEL_KEY=$LABEL_VAL" \
+      --label "$ROLE_KEY=$ROLE_DEV" \
       --restart unless-stopped \
-      --network "$NETWORK" \
+      --network "container:${NET_NAME}" \
       -e DEV_USER="$USER_NAME" \
-      -e ALL_PROXY="socks5h://xray:1080" \
-      -e HTTP_PROXY="socks5h://xray:1080" \
-      -e HTTPS_PROXY="socks5h://xray:1080" \
       -v "${HOME_VOL}:/home/${USER_NAME}" \
       -v "${REPO_VOL}:/repo" \
-      -p "127.0.0.1:${PORT}:22" \
       "$IMAGE" >/dev/null
+    created_dev="true"
 
     for _ in {1..50}; do
       nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1 && break
       sleep 0.1
     done
+    nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1 || die "SSH port ${PORT} did not open for '$name'."
 
     docker exec -u root "$name" bash -lc "mkdir -p /home/${USER_NAME}/.ssh && chmod 700 /home/${USER_NAME}/.ssh && chown -R ${USER_NAME}:${USER_NAME} /home/${USER_NAME}/.ssh" >/dev/null
     docker cp "$KEY_PUB" "${name}:/home/${USER_NAME}/.ssh/authorized_keys"
     docker exec -u root "$name" bash -lc "chown ${USER_NAME}:${USER_NAME} /home/${USER_NAME}/.ssh/authorized_keys && chmod 600 /home/${USER_NAME}/.ssh/authorized_keys" >/dev/null
 
     set_ssh_config_host "$name" "$PORT" "$USER_NAME"
+    trap - EXIT
 
     echo "Created: $name"
+    echo "  Network sidecar: $NET_NAME"
     echo "  Linux user: $USER_NAME"
     echo "  SSH: dev-env ssh $name   (or: ssh $name)"
     echo "  Repo: /repo (volume: ${REPO_VOL})"
@@ -176,6 +249,7 @@ case "$cmd" in
 
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     docker rm -f "$name" >/dev/null
+    docker rm -f "${name}-net" >/dev/null 2>&1 || true
 
     docker volume rm "${name}-home" >/dev/null 2>&1 || true
     docker volume rm "${name}-repo" >/dev/null 2>&1 || true
@@ -197,8 +271,15 @@ case "$cmd" in
     [[ -z "$name" ]] && die "Usage: dev-env restart <name>"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
+    if docker inspect "${name}-net" >/dev/null 2>&1; then
+      docker restart "${name}-net" >/dev/null
+    fi
     docker restart "$name" >/dev/null
-    echo "Restarted: $name"
+    if docker inspect "${name}-net" >/dev/null 2>&1; then
+      echo "Restarted: $name (and ${name}-net)"
+    else
+      echo "Restarted: $name"
+    fi
     ;;
 
   cd)

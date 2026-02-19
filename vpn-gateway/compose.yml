@@ -10,6 +10,7 @@ services:
       - xray_config:/out
     command: >
       sh -lc "
+        export XRAY_HTTP_PROXY_PORT=\${XRAY_HTTP_PROXY_PORT:-\${XRAY_HTTP_RPOXY_PORT:-1081}} &&
         envsubst < /in/config.template.json > /out/config.json &&
         test -s /out/config.json
       "
