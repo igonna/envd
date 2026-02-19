@@ -3,6 +3,7 @@ set -euo pipefail
 
 DEV_USER="${DEV_USER:-dev}"
 HOME_DIR="/home/${DEV_USER}"
+SSH_DIR="${HOME_DIR}/.ssh"
 
 if ! id -u "$DEV_USER" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$DEV_USER"
@@ -19,13 +20,12 @@ if [ ! -f "${HOME_DIR}/.bashrc" ] && [ -d /etc/skel ]; then
 fi
 
 # --- ensure /repo exists and is writable by DEV_USER ---
-if [ -d /repo ]; then
-  chown -R "${DEV_USER}:${DEV_USER}" /repo 2>/dev/null || true
-  chmod 775 /repo 2>/dev/null || true
-fi
+mkdir -p /repo
+chown -R "${DEV_USER}:${DEV_USER}" /repo 2>/dev/null || true
+chmod 775 /repo 2>/dev/null || true
 
 # Ensure colored prompt even if skel was minimal
-if ! grep -q "force_color_prompt" "${HOME_DIR}/.bashrc" 2>/dev/null; then
+if ! grep -q "dev-env: ensure colored prompt" "${HOME_DIR}/.bashrc" 2>/dev/null; then
   cat >> "${HOME_DIR}/.bashrc" <<'EOF'
 
 # --- dev-env: ensure colored prompt ---
@@ -33,7 +33,7 @@ force_color_prompt=yes
 if [ -n "$force_color_prompt" ] && [ -x /usr/bin/tput ] && tput setaf 1 >/dev/null 2>&1; then
   color_prompt=yes
 fi
-if [ "$color_prompt" = yes ]; then
+if [ "${color_prompt:-}" = yes ]; then
   PS1='\[\e[01;32m\]\u@\h\[\e[00m\]:\[\e[01;34m\]\w\[\e[00m\]\$ '
 else
   PS1='\u@\h:\w\$ '
@@ -42,13 +42,31 @@ unset color_prompt force_color_prompt
 EOF
 fi
 
-# fix perms for mounted home volume
+# Auto-cd to /repo for normal SSH login shells only (safe for VS Code)
+BASH_PROFILE="${HOME_DIR}/.bash_profile"
+if [ ! -f "$BASH_PROFILE" ]; then
+  touch "$BASH_PROFILE"
+fi
+
+if ! grep -q "dev-env: auto-cd" "$BASH_PROFILE" 2>/dev/null; then
+  cat >> "$BASH_PROFILE" <<'EOF'
+
+# --- dev-env: auto-cd ---
+# Only for interactive SSH login shells. Avoids breaking VS Code bootstrap.
+if [ -n "${SSH_TTY:-}" ] && [ -t 1 ] && [ -d /repo ]; then
+  cd /repo 2>/dev/null || true
+fi
+EOF
+fi
+
+# fix perms for mounted home volume (includes .bashrc/.bash_profile)
 chown -R "${DEV_USER}:${DEV_USER}" "$HOME_DIR"
 chmod 755 "$HOME_DIR"
 
-mkdir -p "${HOME_DIR}/.ssh"
-chmod 700 "${HOME_DIR}/.ssh"
-chown -R "${DEV_USER}:${DEV_USER}" "${HOME_DIR}/.ssh"
+# ssh directory in home
+mkdir -p "$SSH_DIR"
+chmod 700 "$SSH_DIR"
+chown -R "${DEV_USER}:${DEV_USER}" "$SSH_DIR"
 
 # IMPORTANT: unlock account so SSH allows login
 usermod -U "$DEV_USER" 2>/dev/null || true
