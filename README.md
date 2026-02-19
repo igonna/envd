@@ -110,6 +110,7 @@ This creates:
 - Network sidecar: `dev1-net`
 - Linux user: `dev1`
 - Volumes: `dev1-home`, `dev1-repo`
+- Repo path mapping: `/repo` symlink to `/home/dev1/repo` (for better tool compatibility)
 - Local SSH port mapping on `dev1-net`
 - SSH config entry for `dev1`
 
@@ -155,10 +156,22 @@ dev-env list
 dev-env restart <name>
 dev-env ssh <name>
 dev-env cd <name>
+dev-env port-open <name> <container-port> [host-port]
+dev-env port-close <name> <container-port> [host-port]
+dev-env port-list [name]
 dev-env help
 ```
 
 `dev-env restart <name>` restarts both `<name>-net` and `<name>`.
+
+Expose app ports to macOS on demand:
+
+```bash
+dev-env port-open dev1 3000
+# then open http://127.0.0.1:3000 on macOS
+dev-env port-list dev1
+dev-env port-close dev1 3000
+```
 
 ## 7) Persistence model
 

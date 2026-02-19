@@ -4,6 +4,7 @@ set -euo pipefail
 DEV_USER="${DEV_USER:-dev}"
 HOME_DIR="/home/${DEV_USER}"
 SSH_DIR="${HOME_DIR}/.ssh"
+REPO_DIR="${REPO_DIR:-${HOME_DIR}/repo}"
 
 if ! id -u "$DEV_USER" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$DEV_USER"
@@ -19,10 +20,15 @@ if [ ! -f "${HOME_DIR}/.bashrc" ] && [ -d /etc/skel ]; then
   cp -an /etc/skel/. "$HOME_DIR/" 2>/dev/null || true
 fi
 
-# --- ensure /repo exists and is writable by DEV_USER ---
-mkdir -p /repo
-chown -R "${DEV_USER}:${DEV_USER}" /repo 2>/dev/null || true
-chmod 775 /repo 2>/dev/null || true
+# --- ensure repo dir exists and is writable by DEV_USER ---
+mkdir -p "$REPO_DIR"
+chown -R "${DEV_USER}:${DEV_USER}" "$REPO_DIR" 2>/dev/null || true
+chmod 775 "$REPO_DIR" 2>/dev/null || true
+
+# Keep /repo as stable path, but point it to a user-writable parent hierarchy.
+if [ ! -e /repo ]; then
+  ln -s "$REPO_DIR" /repo
+fi
 
 # Ensure colored prompt even if skel was minimal
 if ! grep -q "dev-env: ensure colored prompt" "${HOME_DIR}/.bashrc" 2>/dev/null; then

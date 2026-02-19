@@ -4,6 +4,7 @@ set -euo pipefail
 NETWORK="vpn-gateway_inside"
 IMAGE="sshdev:24.04"
 NET_IMAGE="devnet-sidecar:1"
+PORT_FWD_IMAGE="alpine/socat:latest"
 PORT_BASE=2223
 PORT_MAX=2299
 
@@ -12,6 +13,7 @@ LABEL_VAL="true"
 ROLE_KEY="dev-env.role"
 ROLE_DEV="dev"
 ROLE_NET="net"
+ROLE_PORT="port"
 
 SSHCFG="${HOME}/.ssh/config"
 KNOWN_HOSTS_DEV="${HOME}/.ssh/known_hosts_dev_env"
@@ -28,6 +30,9 @@ Usage:
   dev-env ssh <name>
   dev-env restart <name>
   dev-env cd <name>
+  dev-env port-open <name> <container-port> [host-port]
+  dev-env port-close <name> <container-port> [host-port]
+  dev-env port-list [name]
 
 Naming rule (enforced):
 - <name> is also the Linux username inside the container.
@@ -73,6 +78,33 @@ pick_port() {
     p=$((p+1))
   done
   return 1
+}
+
+ensure_port_number() {
+  local p="$1" field="$2"
+  [[ "$p" =~ ^[0-9]+$ ]] || die "Invalid ${field}: '${p}' (must be numeric)"
+  (( p >= 1 && p <= 65535 )) || die "Invalid ${field}: '${p}' (must be 1-65535)"
+}
+
+port_fwd_name() {
+  local env_name="$1" host_port="$2" container_port="$3"
+  echo "${env_name}-pf-${host_port}-${container_port}"
+}
+
+ensure_port_forward_image() {
+  docker image inspect "$PORT_FWD_IMAGE" >/dev/null 2>&1 || docker pull "$PORT_FWD_IMAGE" >/dev/null
+}
+
+allow_sidecar_port() {
+  local env_name="$1" target_port="$2"
+  docker exec "${env_name}-net" sh -lc \
+    "iptables -C INPUT -p tcp --dport ${target_port} -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT 1 -p tcp --dport ${target_port} -j ACCEPT"
+}
+
+deny_sidecar_port() {
+  local env_name="$1" target_port="$2"
+  docker exec "${env_name}-net" sh -lc \
+    "iptables -D INPUT -p tcp --dport ${target_port} -j ACCEPT >/dev/null 2>&1 || true"
 }
 
 wait_for_healthy() {
@@ -151,7 +183,7 @@ case "$cmd" in
     echo -e "NAME\tSTATUS\tIMAGE"
     docker ps -a --filter "label=$LABEL_KEY=$LABEL_VAL" \
       --format "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Label \"$ROLE_KEY\"}}" \
-      | awk -F '\t' 'BEGIN{OFS="\t"} { if ($4 == "net" || $1 ~ /-net$/) next; print $1, $2, $3 }'
+      | awk -F '\t' 'BEGIN{OFS="\t"} { if ($4 == "net" || $4 == "port" || $1 ~ /-net$/) next; print $1, $2, $3 }'
     ;;
 
   new)
@@ -209,6 +241,8 @@ case "$cmd" in
 
     wait_for_healthy "$NET_NAME" || die "Sidecar '$NET_NAME' did not become healthy."
 
+    REPO_MOUNT="/home/${USER_NAME}/repo"
+
     docker run -d \
       --name "$name" \
       --label "$LABEL_KEY=$LABEL_VAL" \
@@ -216,8 +250,9 @@ case "$cmd" in
       --restart unless-stopped \
       --network "container:${NET_NAME}" \
       -e DEV_USER="$USER_NAME" \
+      -e REPO_DIR="$REPO_MOUNT" \
       -v "${HOME_VOL}:/home/${USER_NAME}" \
-      -v "${REPO_VOL}:/repo" \
+      -v "${REPO_VOL}:${REPO_MOUNT}" \
       "$IMAGE" >/dev/null
     created_dev="true"
 
@@ -238,7 +273,7 @@ case "$cmd" in
     echo "  Network sidecar: $NET_NAME"
     echo "  Linux user: $USER_NAME"
     echo "  SSH: dev-env ssh $name   (or: ssh $name)"
-    echo "  Repo: /repo (volume: ${REPO_VOL})"
+    echo "  Repo: /repo -> ${REPO_MOUNT} (volume: ${REPO_VOL})"
     echo "  Home: /home/${USER_NAME} (volume: ${HOME_VOL})"
     echo "  Port: 127.0.0.1:${PORT}"
     ;;
@@ -250,6 +285,14 @@ case "$cmd" in
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     docker rm -f "$name" >/dev/null
     docker rm -f "${name}-net" >/dev/null 2>&1 || true
+    pf_ids="$(docker ps -a \
+      --filter "label=$LABEL_KEY=$LABEL_VAL" \
+      --filter "label=$ROLE_KEY=$ROLE_PORT" \
+      --filter "label=dev-env.name=$name" \
+      --format '{{.ID}}')"
+    if [[ -n "$pf_ids" ]]; then
+      docker rm -f $pf_ids >/dev/null 2>&1 || true
+    fi
 
     docker volume rm "${name}-home" >/dev/null 2>&1 || true
     docker volume rm "${name}-repo" >/dev/null 2>&1 || true
@@ -275,6 +318,17 @@ case "$cmd" in
       docker restart "${name}-net" >/dev/null
     fi
     docker restart "$name" >/dev/null
+    mapped_ports="$(docker ps -a \
+      --filter "label=$LABEL_KEY=$LABEL_VAL" \
+      --filter "label=$ROLE_KEY=$ROLE_PORT" \
+      --filter "label=dev-env.name=$name" \
+      --format '{{.Label "dev-env.target_port"}}')"
+    if [[ -n "$mapped_ports" ]]; then
+      while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        allow_sidecar_port "$name" "$p"
+      done <<< "$mapped_ports"
+    fi
     if docker inspect "${name}-net" >/dev/null 2>&1; then
       echo "Restarted: $name (and ${name}-net)"
     else
@@ -286,7 +340,92 @@ case "$cmd" in
     [[ -z "$name" ]] && die "Usage: dev-env cd <name>"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
-    exec docker exec -it "$name" bash -lc 'cd /repo && exec bash'
+    exec docker exec -it -u "$name" "$name" bash -lc 'cd /repo && exec bash'
+    ;;
+
+  port-open)
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env port-open <name> <container-port> [host-port]"
+    validate_name_and_user "$name"
+    docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
+    docker inspect "${name}-net" >/dev/null 2>&1 || die "No such sidecar: ${name}-net"
+
+    CONTAINER_PORT="$3"
+    HOST_PORT="${4:-$CONTAINER_PORT}"
+    ensure_port_number "$CONTAINER_PORT" "container-port"
+    ensure_port_number "$HOST_PORT" "host-port"
+
+    PF_NAME="$(port_fwd_name "$name" "$HOST_PORT" "$CONTAINER_PORT")"
+    docker inspect "$PF_NAME" >/dev/null 2>&1 && die "Port forward already exists: $PF_NAME"
+    nc -z 127.0.0.1 "$HOST_PORT" >/dev/null 2>&1 && die "Host port ${HOST_PORT} is already in use."
+
+    ensure_port_forward_image
+    allow_sidecar_port "$name" "$CONTAINER_PORT"
+    docker run -d \
+      --name "$PF_NAME" \
+      --label "$LABEL_KEY=$LABEL_VAL" \
+      --label "$ROLE_KEY=$ROLE_PORT" \
+      --label "dev-env.name=$name" \
+      --label "dev-env.host_port=$HOST_PORT" \
+      --label "dev-env.target_port=$CONTAINER_PORT" \
+      --restart unless-stopped \
+      --network "$NETWORK" \
+      -p "127.0.0.1:${HOST_PORT}:${HOST_PORT}" \
+      "$PORT_FWD_IMAGE" \
+      "TCP-LISTEN:${HOST_PORT},fork,reuseaddr,bind=0.0.0.0" \
+      "TCP:${name}-net:${CONTAINER_PORT}" >/dev/null
+
+    for _ in {1..30}; do
+      nc -z 127.0.0.1 "$HOST_PORT" >/dev/null 2>&1 && break
+      sleep 0.1
+    done
+    nc -z 127.0.0.1 "$HOST_PORT" >/dev/null 2>&1 || die "Port forward did not become ready on 127.0.0.1:${HOST_PORT}"
+
+    echo "Opened: 127.0.0.1:${HOST_PORT} -> ${name}:${CONTAINER_PORT}"
+    ;;
+
+  port-close)
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env port-close <name> <container-port> [host-port]"
+    validate_name_and_user "$name"
+
+    CONTAINER_PORT="$3"
+    HOST_PORT="${4:-$CONTAINER_PORT}"
+    ensure_port_number "$CONTAINER_PORT" "container-port"
+    ensure_port_number "$HOST_PORT" "host-port"
+
+    PF_NAME="$(port_fwd_name "$name" "$HOST_PORT" "$CONTAINER_PORT")"
+    docker inspect "$PF_NAME" >/dev/null 2>&1 || die "No such port forward: $PF_NAME"
+    docker rm -f "$PF_NAME" >/dev/null
+    remaining_same_target="$(docker ps -a \
+      --filter "label=$LABEL_KEY=$LABEL_VAL" \
+      --filter "label=$ROLE_KEY=$ROLE_PORT" \
+      --filter "label=dev-env.name=$name" \
+      --filter "label=dev-env.target_port=$CONTAINER_PORT" \
+      --format '{{.ID}}')"
+    if [[ -z "$remaining_same_target" ]]; then
+      deny_sidecar_port "$name" "$CONTAINER_PORT"
+    fi
+    echo "Closed: 127.0.0.1:${HOST_PORT} -> ${name}:${CONTAINER_PORT}"
+    ;;
+
+  port-list)
+    if [[ $# -gt 2 ]]; then
+      die "Usage: dev-env port-list [name]"
+    fi
+
+    echo -e "NAME\tSTATUS\tENV\tHOST_PORT\tTARGET_PORT"
+    if [[ $# -eq 2 ]]; then
+      validate_name_and_user "$name"
+      docker ps -a \
+        --filter "label=$LABEL_KEY=$LABEL_VAL" \
+        --filter "label=$ROLE_KEY=$ROLE_PORT" \
+        --filter "label=dev-env.name=$name" \
+        --format "{{.Names}}\t{{.Status}}\t{{.Label \"dev-env.name\"}}\t{{.Label \"dev-env.host_port\"}}\t{{.Label \"dev-env.target_port\"}}"
+    else
+      docker ps -a \
+        --filter "label=$LABEL_KEY=$LABEL_VAL" \
+        --filter "label=$ROLE_KEY=$ROLE_PORT" \
+        --format "{{.Names}}\t{{.Status}}\t{{.Label \"dev-env.name\"}}\t{{.Label \"dev-env.host_port\"}}\t{{.Label \"dev-env.target_port\"}}"
+    fi
     ;;
 
   *)
