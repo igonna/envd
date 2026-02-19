@@ -18,6 +18,12 @@ if [ ! -f "${HOME_DIR}/.bashrc" ] && [ -d /etc/skel ]; then
   cp -an /etc/skel/. "$HOME_DIR/" 2>/dev/null || true
 fi
 
+# --- ensure /repo exists and is writable by DEV_USER ---
+if [ -d /repo ]; then
+  chown -R "${DEV_USER}:${DEV_USER}" /repo 2>/dev/null || true
+  chmod 775 /repo 2>/dev/null || true
+fi
+
 # Ensure colored prompt even if skel was minimal
 if ! grep -q "force_color_prompt" "${HOME_DIR}/.bashrc" 2>/dev/null; then
   cat >> "${HOME_DIR}/.bashrc" <<'EOF'
