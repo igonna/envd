@@ -1,0 +1,58 @@
+{
+  "log": { "loglevel": "error" },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "0.0.0.0",
+      "port": ${XRAY_INBOUND_PORT},
+      "protocol": "socks",
+      "settings": { "auth": "noauth", "udp": true },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+    },
+    {
+      "tag": "http-in",
+      "listen": "0.0.0.0",
+      "port": ${XRAY_HTTP_RPOXY_PORT},
+      "protocol": "http",
+      "settings": {}
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "${XRAY_SERVER_IP}",
+            "port": ${XRAY_SERVER_PORT},
+            "users": [
+              { "id": "${XRAY_UUID}", "encryption": "none", "flow": "xtls-rprx-vision" }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "fingerprint": "chrome",
+          "publicKey": "${XRAY_PUBLIC_KEY}",
+          "serverName": "${XRAY_SNI}",
+          "shortId": "${XRAY_SHORT_ID}",
+          "spiderX": ""
+        }
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["socks-in", "http-in"],
+        "outboundTag": "proxy"
+      }
+    ]
+  }
+}
+

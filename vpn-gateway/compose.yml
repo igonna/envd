@@ -1,0 +1,41 @@
+services:
+  render:
+    build:
+      context: .
+      dockerfile: Dockerfile.render
+    restart: "no"
+    env_file: [.env]
+    volumes:
+      - ./config.template.json:/in/config.template.json:ro
+      - xray_config:/out
+    command: >
+      sh -lc "
+        envsubst < /in/config.template.json > /out/config.json &&
+        test -s /out/config.json
+      "
+    networks: [inside]
+
+  xray:
+    image: teddysun/xray:latest
+    restart: unless-stopped
+    depends_on:
+      render:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:1080:1080"
+      - "127.0.0.1:1081:1081"
+    volumes:
+      - xray_config:/etc/xray:ro
+    command: xray -config /etc/xray/config.json
+    networks: [inside, outside]
+
+networks:
+  inside:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  outside: {}
+
+
+volumes:
+  xray_config:

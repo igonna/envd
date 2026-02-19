@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NETWORK="vpn-gateway_inside"
+IMAGE="sshdev:24.04"
+PORT_BASE=2223
+PORT_MAX=2299
+
+LABEL_KEY="dev-env.managed"
+LABEL_VAL="true"
+
+SSHCFG="${HOME}/.ssh/config"
+KEY_PRIV="${HOME}/.ssh/id_ed25519"
+KEY_PUB="${HOME}/.ssh/id_ed25519.pub"
+
+usage() {
+  cat <<'EOT'
+Usage:
+  dev-env help
+  dev-env list
+  dev-env new <name>
+  dev-env rm <name>
+  dev-env ssh <name>
+  dev-env restart <name>
+  dev-env cd <name>
+
+Naming rule (enforced):
+- <name> is also the Linux username inside the container.
+- Must match: ^[a-z][a-z0-9]{0,31}$
+  Examples: dev1, dev2, alice, alice2
+  Not allowed: dev-1, Dev1, dev_1
+EOT
+}
+
+die(){ echo "ERROR: $*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
+
+need docker
+need nc
+need ssh
+need ssh-keygen
+need awk
+
+cmd="${1:-help}"
+name="${2:-}"
+
+ensure_ssh_key() {
+  mkdir -p ~/.ssh
+  chmod 700 ~/.ssh
+  if [[ ! -f "$KEY_PRIV" || ! -f "$KEY_PUB" ]]; then
+    echo "Generating SSH key at $KEY_PRIV"
+    ssh-keygen -t ed25519 -f "$KEY_PRIV" -N "" >/dev/null
+  fi
+}
+
+ensure_network_and_image() {
+  docker network inspect "$NETWORK" >/dev/null 2>&1 || die "Network '$NETWORK' not found. Start vpn-gateway first."
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "Image '$IMAGE' not found. Build it first: docker build -t $IMAGE <path>"
+}
+
+pick_port() {
+  local p=$PORT_BASE
+  while [[ $p -le $PORT_MAX ]]; do
+    if ! nc -z 127.0.0.1 "$p" >/dev/null 2>&1; then
+      echo "$p"; return 0
+    fi
+    p=$((p+1))
+  done
+  return 1
+}
+
+remove_ssh_config_host() {
+  local host="$1"
+  [[ -f "$SSHCFG" ]] || return 0
+  awk -v h="$host" '
+    BEGIN{skip=0}
+    $1=="Host" && $2==h {skip=1; next}
+    $1=="Host" && skip==1 {skip=0}
+    skip==0 {print}
+  ' "$SSHCFG" > "${SSHCFG}.tmp"
+  mv "${SSHCFG}.tmp" "$SSHCFG"
+}
+
+set_ssh_config_host() {
+  local host="$1" port="$2" user="$3"
+
+  touch "$SSHCFG"
+  chmod 600 "$SSHCFG"
+
+  # remove old block if exists
+  remove_ssh_config_host "$host"
+
+  cat >> "$SSHCFG" <<EOCFG
+
+Host ${host}
+  HostName 127.0.0.1
+  Port ${port}
+  User ${user}
+  IdentityFile ${KEY_PRIV}
+  IdentitiesOnly yes
+  ForwardAgent yes
+  UserKnownHostsFile ~/.ssh/known_hosts_dev_env
+  StrictHostKeyChecking accept-new
+
+EOCFG
+}
+
+validate_name_and_user() {
+  local n="$1"
+  [[ "$n" =~ ^[a-z][a-z0-9]{0,31}$ ]] || die "Invalid name '$n'. Must match: ^[a-z][a-z0-9]{0,31}$ (example: dev1, alice2)."
+}
+
+case "$cmd" in
+  help|-h|--help|"")
+    usage
+    ;;
+
+  list)
+    docker ps -a --filter "label=$LABEL_KEY=$LABEL_VAL" \
+      --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+    ;;
+
+  new)
+    [[ -z "$name" ]] && die "Usage: dev-env new <name>"
+    validate_name_and_user "$name"
+    ensure_network_and_image
+    ensure_ssh_key
+
+    docker inspect "$name" >/dev/null 2>&1 && die "Container '$name' already exists."
+
+    USER_NAME="$name"
+    PORT="$(pick_port)" || die "No free port in ${PORT_BASE}-${PORT_MAX}"
+
+    HOME_VOL="${name}-home"
+    REPO_VOL="${name}-repo"
+
+    docker volume create "$HOME_VOL" >/dev/null
+    docker volume create "$REPO_VOL" >/dev/null
+
+    docker run -d \
+      --name "$name" \
+      --label "$LABEL_KEY=$LABEL_VAL" \
+      --restart unless-stopped \
+      --network "$NETWORK" \
+      -e DEV_USER="$USER_NAME" \
+      -e ALL_PROXY="socks5h://xray:1080" \
+      -e HTTP_PROXY="socks5h://xray:1080" \
+      -e HTTPS_PROXY="socks5h://xray:1080" \
+      -v "${HOME_VOL}:/home/${USER_NAME}" \
+      -v "${REPO_VOL}:/repo" \
+      -p "127.0.0.1:${PORT}:22" \
+      "$IMAGE" >/dev/null
+
+    for _ in {1..50}; do
+      nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1 && break
+      sleep 0.1
+    done
+
+    docker exec -u root "$name" bash -lc "mkdir -p /home/${USER_NAME}/.ssh && chmod 700 /home/${USER_NAME}/.ssh && chown -R ${USER_NAME}:${USER_NAME} /home/${USER_NAME}/.ssh" >/dev/null
+    docker cp "$KEY_PUB" "${name}:/home/${USER_NAME}/.ssh/authorized_keys"
+    docker exec -u root "$name" bash -lc "chown ${USER_NAME}:${USER_NAME} /home/${USER_NAME}/.ssh/authorized_keys && chmod 600 /home/${USER_NAME}/.ssh/authorized_keys" >/dev/null
+
+    set_ssh_config_host "$name" "$PORT" "$USER_NAME"
+
+    echo "Created: $name"
+    echo "  Linux user: $USER_NAME"
+    echo "  SSH: dev-env ssh $name   (or: ssh $name)"
+    echo "  Repo: /repo (volume: ${REPO_VOL})"
+    echo "  Home: /home/${USER_NAME} (volume: ${HOME_VOL})"
+    echo "  Port: 127.0.0.1:${PORT}"
+    ;;
+
+  rm)
+    [[ -z "$name" ]] && die "Usage: dev-env rm <name>"
+    validate_name_and_user "$name"
+
+    docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
+    docker rm -f "$name" >/dev/null
+
+    docker volume rm "${name}-home" >/dev/null 2>&1 || true
+    docker volume rm "${name}-repo" >/dev/null 2>&1 || true
+
+    remove_ssh_config_host "$name"
+
+    echo "Removed: $name"
+    echo "  Deleted volumes: ${name}-home, ${name}-repo"
+    ;;
+
+  ssh)
+    [[ -z "$name" ]] && die "Usage: dev-env ssh <name>"
+    validate_name_and_user "$name"
+    ssh-add --apple-use-keychain ~/.ssh/ghub_key >/dev/null 2>&1 || true
+    exec ssh -A "$name"
+    ;;
+
+  restart)
+    [[ -z "$name" ]] && die "Usage: dev-env restart <name>"
+    validate_name_and_user "$name"
+    docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
+    docker restart "$name" >/dev/null
+    echo "Restarted: $name"
+    ;;
+
+  cd)
+    [[ -z "$name" ]] && die "Usage: dev-env cd <name>"
+    validate_name_and_user "$name"
+    docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
+    exec docker exec -it "$name" bash -lc 'cd /repo && exec bash'
+    ;;
+
+  *)
+    usage
+    die "Unknown command: $cmd"
+    ;;
+esac
