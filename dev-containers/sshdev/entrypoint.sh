@@ -67,6 +67,17 @@ fi
 EOF
 fi
 
+if ! grep -q "dev-env: clear screen" "$BASH_PROFILE" 2>/dev/null; then
+  cat >> "$BASH_PROFILE" <<'EOF'
+
+# --- dev-env: clear screen ---
+# Keep SSH entry clean by clearing terminal before showing the prompt.
+if [ -n "${SSH_TTY:-}" ] && [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; then
+  clear 2>/dev/null || true
+fi
+EOF
+fi
+
 if ! grep -q "dev-env: auto-cd" "$BASH_PROFILE" 2>/dev/null; then
   cat >> "$BASH_PROFILE" <<'EOF'
 

@@ -161,6 +161,8 @@ Expected: request fails (no direct leak).
 dev-env new <name>
 dev-env rm <name>
 dev-env list
+dev-env start <name>
+dev-env stop <name>
 dev-env restart <name>
 dev-env ssh <name>
 dev-env cd <name>
@@ -170,7 +172,8 @@ dev-env port-list [name]
 dev-env help
 ```
 
-`dev-env restart <name>` restarts both `<name>-net` and `<name>`.
+`dev-env start/stop/restart <name>` manage both `<name>` and `<name>-net`.
+`dev-env list` includes `STATE` as `active` or `stopped`.
 
 Expose app ports to macOS on demand:
 

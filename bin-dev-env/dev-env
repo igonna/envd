@@ -29,6 +29,8 @@ Usage:
   dev-env new <name>
   dev-env rm <name>
   dev-env ssh <name>
+  dev-env start <name>
+  dev-env stop <name>
   dev-env restart <name>
   dev-env cd <name>
   dev-env port-open <name> <container-port> [host-port]
@@ -131,6 +133,36 @@ deny_sidecar_port() {
     "iptables -D INPUT -p tcp --dport ${target_port} -j ACCEPT >/dev/null 2>&1 || true"
 }
 
+port_forward_ids_for_env() {
+  local env_name="$1"
+  docker ps -a \
+    --filter "label=$LABEL_KEY=$LABEL_VAL" \
+    --filter "label=$ROLE_KEY=$ROLE_PORT" \
+    --filter "label=dev-env.name=$env_name" \
+    --format '{{.ID}}'
+}
+
+port_target_ports_for_env() {
+  local env_name="$1"
+  docker ps -a \
+    --filter "label=$LABEL_KEY=$LABEL_VAL" \
+    --filter "label=$ROLE_KEY=$ROLE_PORT" \
+    --filter "label=dev-env.name=$env_name" \
+    --format '{{.Label "dev-env.target_port"}}'
+}
+
+allow_sidecar_ports_for_env() {
+  local env_name="$1"
+  local mapped_ports
+  mapped_ports="$(port_target_ports_for_env "$env_name")"
+  if [[ -n "$mapped_ports" ]]; then
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      allow_sidecar_port "$env_name" "$p"
+    done <<< "$mapped_ports"
+  fi
+}
+
 wait_for_healthy() {
   local container="$1"
   for _ in {1..80}; do
@@ -204,10 +236,15 @@ case "$cmd" in
     ;;
 
   list)
-    echo -e "NAME\tSTATUS\tIMAGE"
+    printf "%-20s %-8s %-28s %s\n" "NAME" "STATE" "STATUS" "IMAGE"
     docker ps -a --filter "label=$LABEL_KEY=$LABEL_VAL" \
       --format "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Label \"$ROLE_KEY\"}}" \
-      | awk -F '\t' 'BEGIN{OFS="\t"} { if ($4 == "net" || $4 == "port" || $1 ~ /-net$/) next; print $1, $2, $3 }'
+      | awk -F '\t' 'BEGIN{OFS="\t"} {
+          if ($4 == "net" || $4 == "port" || $1 ~ /-net$/) next;
+          state = "stopped";
+          if ($2 ~ /^Up( |$)/ || $2 ~ /^Restarting( |$)/) state = "active";
+          printf "%-20s %-8s %-28s %s\n", $1, state, $2, $3
+        }'
     ;;
 
   new)
@@ -329,11 +366,7 @@ case "$cmd" in
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     docker rm -f "$name" >/dev/null
     docker rm -f "${name}-net" >/dev/null 2>&1 || true
-    pf_ids="$(docker ps -a \
-      --filter "label=$LABEL_KEY=$LABEL_VAL" \
-      --filter "label=$ROLE_KEY=$ROLE_PORT" \
-      --filter "label=dev-env.name=$name" \
-      --format '{{.ID}}')"
+    pf_ids="$(port_forward_ids_for_env "$name")"
     if [[ -n "$pf_ids" ]]; then
       docker rm -f $pf_ids >/dev/null 2>&1 || true
     fi
@@ -354,6 +387,50 @@ case "$cmd" in
     exec ssh -A "$name"
     ;;
 
+  start)
+    [[ -z "$name" ]] && die "Usage: dev-env start <name>"
+    validate_name_and_user "$name"
+    docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
+
+    if docker inspect "${name}-net" >/dev/null 2>&1; then
+      docker start "${name}-net" >/dev/null 2>&1 || true
+      wait_for_healthy "${name}-net" || die "Sidecar '${name}-net' did not become healthy."
+    fi
+
+    docker start "$name" >/dev/null 2>&1 || true
+
+    pf_ids="$(port_forward_ids_for_env "$name")"
+    if [[ -n "$pf_ids" ]]; then
+      docker start $pf_ids >/dev/null 2>&1 || true
+    fi
+
+    if docker inspect "${name}-net" >/dev/null 2>&1; then
+      allow_sidecar_ports_for_env "$name"
+      echo "Started: $name (and ${name}-net)"
+    else
+      echo "Started: $name"
+    fi
+    ;;
+
+  stop)
+    [[ -z "$name" ]] && die "Usage: dev-env stop <name>"
+    validate_name_and_user "$name"
+    docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
+
+    pf_ids="$(port_forward_ids_for_env "$name")"
+    if [[ -n "$pf_ids" ]]; then
+      docker stop $pf_ids >/dev/null 2>&1 || true
+    fi
+
+    docker stop "$name" >/dev/null 2>&1 || true
+    if docker inspect "${name}-net" >/dev/null 2>&1; then
+      docker stop "${name}-net" >/dev/null 2>&1 || true
+      echo "Stopped: $name (and ${name}-net)"
+    else
+      echo "Stopped: $name"
+    fi
+    ;;
+
   restart)
     [[ -z "$name" ]] && die "Usage: dev-env restart <name>"
     validate_name_and_user "$name"
@@ -362,17 +439,7 @@ case "$cmd" in
       docker restart "${name}-net" >/dev/null
     fi
     docker restart "$name" >/dev/null
-    mapped_ports="$(docker ps -a \
-      --filter "label=$LABEL_KEY=$LABEL_VAL" \
-      --filter "label=$ROLE_KEY=$ROLE_PORT" \
-      --filter "label=dev-env.name=$name" \
-      --format '{{.Label "dev-env.target_port"}}')"
-    if [[ -n "$mapped_ports" ]]; then
-      while IFS= read -r p; do
-        [[ -n "$p" ]] || continue
-        allow_sidecar_port "$name" "$p"
-      done <<< "$mapped_ports"
-    fi
+    allow_sidecar_ports_for_env "$name"
     if docker inspect "${name}-net" >/dev/null 2>&1; then
       echo "Restarted: $name (and ${name}-net)"
     else
