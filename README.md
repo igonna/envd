@@ -9,6 +9,7 @@ Self-contained Docker development environments behind Xray (VLESS + Reality), wi
 - SSH access with agent forwarding
 - Per-dev sidecar network namespace (`<name>-net`) that routes all container traffic through Xray
 - Kill-switch behavior in sidecar: if Xray is unavailable, outbound traffic is blocked
+- Docker CLI inside dev containers with optional host daemon access via mounted socket
 
 ## Repository structure
 
@@ -115,6 +116,12 @@ This creates:
 - SSH config entry for `dev1`
 - Git identity auto-propagated from host global Git config (if set)
 - Automations mount (read-only): `dev-containers/automations` -> `/automations`
+- Docker socket mount (if found): host socket -> `/var/run/docker.sock` (for Docker CLI access)
+
+Docker daemon access controls:
+- Default: enabled (auto-detects socket from `/var/run/docker.sock` or `~/.docker/run/docker.sock`)
+- Disable per creation: `DEV_ENV_DOCKER_ACCESS=0 dev-env new dev1`
+- Force specific socket path: `DEV_ENV_DOCKER_SOCK=/path/to/docker.sock dev-env new dev1`
 
 Run mounted automation scripts inside container:
 
@@ -251,3 +258,4 @@ Does not persist:
 - Sidecar iptables policy defaults to drop.
 - Only Xray upstream, loopback, established traffic, SSH ingress, and TUN path are allowed.
 - No private SSH keys are stored in dev containers.
+- Docker socket access (if enabled) grants high privilege on host Docker daemon. Disable with `DEV_ENV_DOCKER_ACCESS=0` when not needed.

@@ -98,6 +98,24 @@ resolve_automations_dir() {
   return 1
 }
 
+resolve_docker_socket() {
+  local sock
+  if [[ -n "${DEV_ENV_DOCKER_SOCK:-}" ]]; then
+    [[ -S "$DEV_ENV_DOCKER_SOCK" ]] || die "DEV_ENV_DOCKER_SOCK is not a unix socket: $DEV_ENV_DOCKER_SOCK"
+    printf '%s' "$DEV_ENV_DOCKER_SOCK"
+    return 0
+  fi
+
+  for sock in /var/run/docker.sock "${HOME}/.docker/run/docker.sock"; do
+    if [[ -S "$sock" ]]; then
+      printf '%s' "$sock"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 ensure_network_and_image() {
   docker network inspect "$NETWORK" >/dev/null 2>&1 || die "Network '$NETWORK' not found. Start vpn-gateway first."
   docker image inspect "$IMAGE" >/dev/null 2>&1 || die "Image '$IMAGE' not found. Build it first: docker build -t $IMAGE <path>"
@@ -886,20 +904,39 @@ case "$cmd" in
       AUTOMATIONS_ARGS=(-v "${AUTOMATIONS_HOST_DIR}:${AUTOMATIONS_MOUNT}:ro")
     fi
 
-    docker run -d \
-      --name "$name" \
-      --label "$LABEL_KEY=$LABEL_VAL" \
-      --label "$ROLE_KEY=$ROLE_DEV" \
-      --restart unless-stopped \
-      --network "container:${NET_NAME}" \
-      -e DEV_USER="$USER_NAME" \
-      -e REPO_DIR="$REPO_MOUNT" \
-      -e GIT_USER_NAME="$HOST_GIT_NAME" \
-      -e GIT_USER_EMAIL="$HOST_GIT_EMAIL" \
-      -v "${HOME_VOL}:/home/${USER_NAME}" \
-      -v "${REPO_VOL}:${REPO_MOUNT}" \
-      "${AUTOMATIONS_ARGS[@]}" \
-      "$IMAGE" >/dev/null
+    DOCKER_ACCESS_ENABLED="${DEV_ENV_DOCKER_ACCESS:-1}"
+    DOCKER_SOCK_HOST=""
+    DOCKER_SOCK_ARGS=()
+    if [[ "$DOCKER_ACCESS_ENABLED" != "0" ]]; then
+      DOCKER_SOCK_HOST="$(resolve_docker_socket || true)"
+      if [[ -n "$DOCKER_SOCK_HOST" ]]; then
+        DOCKER_SOCK_ARGS=(-v "${DOCKER_SOCK_HOST}:/var/run/docker.sock")
+      fi
+    fi
+
+    DEV_RUN_ARGS=(
+      -d
+      --name "$name"
+      --label "$LABEL_KEY=$LABEL_VAL"
+      --label "$ROLE_KEY=$ROLE_DEV"
+      --restart unless-stopped
+      --network "container:${NET_NAME}"
+      -e DEV_USER="$USER_NAME"
+      -e REPO_DIR="$REPO_MOUNT"
+      -e GIT_USER_NAME="$HOST_GIT_NAME"
+      -e GIT_USER_EMAIL="$HOST_GIT_EMAIL"
+      -v "${HOME_VOL}:/home/${USER_NAME}"
+      -v "${REPO_VOL}:${REPO_MOUNT}"
+    )
+    if [[ ${#AUTOMATIONS_ARGS[@]} -gt 0 ]]; then
+      DEV_RUN_ARGS+=("${AUTOMATIONS_ARGS[@]}")
+    fi
+    if [[ ${#DOCKER_SOCK_ARGS[@]} -gt 0 ]]; then
+      DEV_RUN_ARGS+=("${DOCKER_SOCK_ARGS[@]}")
+    fi
+    DEV_RUN_ARGS+=("$IMAGE")
+
+    docker run "${DEV_RUN_ARGS[@]}" >/dev/null
     created_dev="true"
 
     for _ in {1..50}; do
@@ -925,6 +962,13 @@ case "$cmd" in
       echo "  Automations: ${AUTOMATIONS_HOST_DIR} -> ${AUTOMATIONS_MOUNT} (ro)"
     else
       echo "  Automations: not mounted (set DEV_ENV_AUTOMATIONS_DIR or create dev-containers/automations)"
+    fi
+    if [[ "$DOCKER_ACCESS_ENABLED" == "0" ]]; then
+      echo "  Docker socket: disabled (DEV_ENV_DOCKER_ACCESS=0)"
+    elif [[ -n "$DOCKER_SOCK_HOST" ]]; then
+      echo "  Docker socket: ${DOCKER_SOCK_HOST} -> /var/run/docker.sock"
+    else
+      echo "  Docker socket: not mounted (socket not found; set DEV_ENV_DOCKER_SOCK if needed)"
     fi
     if [[ -n "$HOST_GIT_NAME" && -n "$HOST_GIT_EMAIL" ]]; then
       echo "  Git identity: ${HOST_GIT_NAME} <${HOST_GIT_EMAIL}>"

@@ -113,6 +113,19 @@ mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 chown -R "${DEV_USER}:${DEV_USER}" "$SSH_DIR"
 
+# If Docker socket is mounted, grant DEV_USER access via matching group GID.
+if [ -S /var/run/docker.sock ]; then
+  SOCK_GID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || true)"
+  if [ -n "$SOCK_GID" ]; then
+    SOCK_GROUP="$(getent group "$SOCK_GID" | cut -d: -f1 || true)"
+    if [ -z "$SOCK_GROUP" ]; then
+      SOCK_GROUP="docker-host"
+      groupadd -f -g "$SOCK_GID" "$SOCK_GROUP" >/dev/null 2>&1 || true
+    fi
+    usermod -aG "$SOCK_GROUP" "$DEV_USER" >/dev/null 2>&1 || true
+  fi
+fi
+
 # IMPORTANT: unlock account so SSH allows login
 usermod -U "$DEV_USER" 2>/dev/null || true
 passwd -u "$DEV_USER" 2>/dev/null || true
