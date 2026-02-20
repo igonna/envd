@@ -35,7 +35,10 @@ Management Commands:
   stop <name>                  Stop an environment
   restart <name>               Restart an environment
   rm <name>                    Remove an environment
+  backup <name> [archive]      Backup environment volumes
+  restore <name> <archive>     Restore environment volumes
   exec <name> [cmd...]         Run command / open shell in environment
+  doctor [name]                Check environment health and VPN routing
 
 Service Commands:
   service ls [env]                             List services
@@ -886,6 +889,53 @@ validate_name_and_user() {
   [[ "$n" =~ ^[a-z][a-z0-9]{0,31}$ ]] || die "Invalid name '$n'. Must match: ^[a-z][a-z0-9]{0,31}$ (example: dev1, alice2)."
 }
 
+DOCTOR_OK_COUNT=0
+DOCTOR_WARN_COUNT=0
+DOCTOR_FAIL_COUNT=0
+
+doctor_line() {
+  local level="$1"
+  shift
+  printf "%-6s %s\n" "$level" "$*"
+}
+
+doctor_ok() {
+  DOCTOR_OK_COUNT=$((DOCTOR_OK_COUNT + 1))
+  doctor_line "OK" "$*"
+}
+
+doctor_warn() {
+  DOCTOR_WARN_COUNT=$((DOCTOR_WARN_COUNT + 1))
+  doctor_line "WARN" "$*"
+}
+
+doctor_fail() {
+  DOCTOR_FAIL_COUNT=$((DOCTOR_FAIL_COUNT + 1))
+  doctor_line "FAIL" "$*"
+}
+
+env_volume_names_for_backup() {
+  local env_name="$1"
+  printf '%s\n' "${env_name}-home"
+  printf '%s\n' "${env_name}-repo"
+  docker volume ls -q \
+    --filter "label=$LABEL_KEY=$LABEL_VAL" \
+    --filter "label=$ROLE_KEY=$ROLE_SVC" \
+    --filter "label=envd.name=$env_name"
+}
+
+archive_top_dirs() {
+  local archive="$1"
+  tar -tzf "$archive" 2>/dev/null \
+    | awk '{
+        path=$0
+        sub(/^\.\//, "", path)
+        n=split(path, parts, "/")
+        if (n > 0 && parts[1] != "." && parts[1] != "") print parts[1]
+      }' \
+    | awk 'NF && !seen[$0]++ {print $0}'
+}
+
 case "$cmd" in
   help|-h|--help|"")
     usage
@@ -1064,6 +1114,103 @@ case "$cmd" in
     echo "  Deleted volumes: ${name}-home, ${name}-repo"
     ;;
 
+  backup)
+    [[ $# -lt 2 || $# -gt 3 ]] && die "Usage: ${CLI_NAME} backup <name> [archive]"
+    validate_name_and_user "$name"
+    docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
+
+    archive_input="${3:-${name}-backup-$(date +%Y%m%d-%H%M%S).tar.gz}"
+    archive_dir="$(dirname "$archive_input")"
+    archive_base="$(basename "$archive_input")"
+    mkdir -p "$archive_dir"
+    archive_dir_abs="$(cd "$archive_dir" && pwd)"
+    archive_abs="${archive_dir_abs}/${archive_base}"
+    [[ -e "$archive_abs" ]] && die "Archive already exists: $archive_abs"
+
+    env_state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+    if [[ "$env_state" == "running" ]]; then
+      echo "WARN: environment '$name' is running; backup may be crash-consistent for active databases."
+    fi
+
+    backup_volumes=()
+    while IFS= read -r vol; do
+      [[ -n "$vol" ]] || continue
+      if docker volume inspect "$vol" >/dev/null 2>&1; then
+        backup_volumes+=("$vol")
+      fi
+    done < <(env_volume_names_for_backup "$name")
+
+    [[ ${#backup_volumes[@]} -gt 0 ]] || die "No volumes found to backup for '$name'."
+
+    docker_args=(run --rm)
+    for vol in "${backup_volumes[@]}"; do
+      docker_args+=(-v "${vol}:/backup-volumes/${vol}:ro")
+    done
+    docker_args+=(-v "${archive_dir_abs}:/backup-out")
+    docker_args+=(alpine:3.20 sh -lc "set -eu; cd /backup-volumes; tar -czf \"/backup-out/${archive_base}\" .")
+    docker "${docker_args[@]}" >/dev/null
+
+    echo "Backup created: ${archive_abs}"
+    echo "  Volumes backed up: ${#backup_volumes[@]}"
+    for vol in "${backup_volumes[@]}"; do
+      echo "  - ${vol}"
+    done
+    ;;
+
+  restore)
+    [[ $# -ne 3 ]] && die "Usage: ${CLI_NAME} restore <name> <archive>"
+    validate_name_and_user "$name"
+
+    archive_input="$3"
+    archive_dir="$(dirname "$archive_input")"
+    archive_base="$(basename "$archive_input")"
+    archive_dir_abs="$(cd "$archive_dir" && pwd)"
+    archive_abs="${archive_dir_abs}/${archive_base}"
+    [[ -f "$archive_abs" ]] || die "Archive not found: $archive_abs"
+
+    if docker inspect "$name" >/dev/null 2>&1; then
+      env_state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+      [[ "$env_state" != "running" ]] || die "Environment '$name' is running. Stop it first: ${CLI_NAME} stop ${name}"
+    fi
+
+    running_svc_count="$(docker ps \
+      --filter "label=$LABEL_KEY=$LABEL_VAL" \
+      --filter "label=$ROLE_KEY=$ROLE_SVC" \
+      --filter "label=envd.name=$name" \
+      --format '{{.ID}}' | awk 'END{print NR+0}')"
+    (( running_svc_count == 0 )) || die "Running services detected for '${name}'. Stop them first."
+
+    restore_volumes=()
+    while IFS= read -r vol; do
+      [[ -n "$vol" ]] || continue
+      [[ "$vol" =~ ^[A-Za-z0-9_.-]+$ ]] || die "Archive contains invalid volume name: $vol"
+      [[ "$vol" == "${name}-"* ]] || die "Archive volume '${vol}' does not match target env prefix '${name}-'."
+      restore_volumes+=("$vol")
+    done < <(archive_top_dirs "$archive_abs")
+
+    [[ ${#restore_volumes[@]} -gt 0 ]] || die "Archive is empty or invalid: $archive_abs"
+
+    for vol in "${restore_volumes[@]}"; do
+      docker volume inspect "$vol" >/dev/null 2>&1 || docker volume create "$vol" >/dev/null
+    done
+
+    docker_args=(run --rm -v "${archive_dir_abs}:/backup-in:ro")
+    for vol in "${restore_volumes[@]}"; do
+      docker_args+=(-v "${vol}:/restore/${vol}")
+    done
+    docker_args+=(
+      alpine:3.20
+      sh -lc "set -eu; for d in /restore/*; do [ -d \"\$d\" ] || continue; find \"\$d\" -mindepth 1 -exec rm -rf {} +; done; tar -xzf \"/backup-in/${archive_base}\" -C /restore"
+    )
+    docker "${docker_args[@]}" >/dev/null
+
+    echo "Restore completed from: ${archive_abs}"
+    echo "  Volumes restored: ${#restore_volumes[@]}"
+    for vol in "${restore_volumes[@]}"; do
+      echo "  - ${vol}"
+    done
+    ;;
+
   exec)
     [[ $# -lt 2 ]] && die "Usage: ${CLI_NAME} exec <name> [cmd...]"
     validate_name_and_user "$name"
@@ -1151,6 +1298,157 @@ case "$cmd" in
   cd)
     [[ -z "$name" ]] && die "Usage: ${CLI_NAME} cd <name>"
     exec "$0" exec "$name"
+    ;;
+
+  doctor)
+    if [[ $# -gt 2 ]]; then
+      die "Usage: ${CLI_NAME} doctor [name]"
+    fi
+    if [[ $# -eq 2 ]]; then
+      validate_name_and_user "$name"
+    fi
+
+    DOCTOR_OK_COUNT=0
+    DOCTOR_WARN_COUNT=0
+    DOCTOR_FAIL_COUNT=0
+
+    echo "envd doctor"
+    echo "  network: ${NETWORK}"
+    if [[ $# -eq 2 ]]; then
+      echo "  target: ${name}"
+    else
+      echo "  target: all environments"
+    fi
+    echo
+
+    if docker info >/dev/null 2>&1; then
+      doctor_ok "Docker daemon reachable"
+    else
+      doctor_fail "Docker daemon not reachable"
+      echo
+      echo "Summary: ok=${DOCTOR_OK_COUNT} warn=${DOCTOR_WARN_COUNT} fail=${DOCTOR_FAIL_COUNT}"
+      exit 1
+    fi
+
+    if docker network inspect "$NETWORK" >/dev/null 2>&1; then
+      doctor_ok "Network '${NETWORK}' exists"
+    else
+      doctor_fail "Network '${NETWORK}' missing (start vpn-gateway first)"
+    fi
+
+    if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+      doctor_ok "Image '${IMAGE}' exists"
+    else
+      doctor_warn "Image '${IMAGE}' missing (build before creating new envs)"
+    fi
+    if docker image inspect "$NET_IMAGE" >/dev/null 2>&1; then
+      doctor_ok "Image '${NET_IMAGE}' exists"
+    else
+      doctor_warn "Image '${NET_IMAGE}' missing (build before creating new envs)"
+    fi
+
+    xray_name=""
+    if docker network inspect "$NETWORK" >/dev/null 2>&1; then
+      xray_name="$(docker network inspect -f '{{range .Containers}}{{println .Name}}{{end}}' "$NETWORK" 2>/dev/null | awk '/xray/{print; exit}')"
+    fi
+    if [[ -n "$xray_name" ]]; then
+      xray_state="$(docker inspect -f '{{.State.Status}}' "$xray_name" 2>/dev/null || true)"
+      if [[ "$xray_state" == "running" ]]; then
+        doctor_ok "Xray container '${xray_name}' is running"
+      else
+        doctor_fail "Xray container '${xray_name}' state is '${xray_state:-unknown}'"
+      fi
+    else
+      doctor_fail "Xray container not found on network '${NETWORK}'"
+    fi
+
+    if [[ $# -eq 2 ]]; then
+      env_names="$name"
+      if ! docker inspect "$name" >/dev/null 2>&1; then
+        doctor_fail "Environment '${name}' does not exist"
+        echo
+        echo "Summary: ok=${DOCTOR_OK_COUNT} warn=${DOCTOR_WARN_COUNT} fail=${DOCTOR_FAIL_COUNT}"
+        exit 1
+      fi
+    else
+      env_names="$(docker ps -a \
+        --filter "label=$LABEL_KEY=$LABEL_VAL" \
+        --filter "label=$ROLE_KEY=$ROLE_DEV" \
+        --format '{{.Names}}')"
+    fi
+
+    if [[ -z "${env_names:-}" ]]; then
+      doctor_warn "No environments found"
+    fi
+
+    for env_name in $env_names; do
+      echo
+      echo "[env ${env_name}]"
+      env_state="$(docker inspect -f '{{.State.Status}}' "$env_name" 2>/dev/null || true)"
+      if [[ "$env_state" == "running" ]]; then
+        doctor_ok "Dev container running"
+      elif [[ -n "$env_state" ]]; then
+        doctor_warn "Dev container state: ${env_state}"
+      else
+        doctor_fail "Dev container missing"
+        continue
+      fi
+
+      net_name="${env_name}-net"
+      if docker inspect "$net_name" >/dev/null 2>&1; then
+        net_state="$(docker inspect -f '{{.State.Status}}' "$net_name" 2>/dev/null || true)"
+        if [[ "$net_state" == "running" ]]; then
+          doctor_ok "Sidecar '${net_name}' running"
+        else
+          doctor_warn "Sidecar '${net_name}' state: ${net_state:-unknown}"
+        fi
+
+        net_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$net_name" 2>/dev/null || true)"
+        if [[ "$net_health" == "healthy" ]]; then
+          doctor_ok "Sidecar health: healthy"
+        elif [[ "$net_health" == "none" ]]; then
+          doctor_warn "Sidecar healthcheck missing"
+        else
+          doctor_fail "Sidecar health: ${net_health:-unknown}"
+        fi
+
+        if [[ "$net_state" == "running" ]]; then
+          if docker exec "$net_name" sh -lc 'nc -z -w 2 xray 1080' >/dev/null 2>&1; then
+            doctor_ok "Sidecar can reach xray:1080"
+          else
+            doctor_fail "Sidecar cannot reach xray:1080"
+          fi
+
+          default_dev="$(docker exec "$net_name" sh -lc "ip route 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if(\$i==\"dev\") {print \$(i+1); exit}}'" 2>/dev/null || true)"
+          if [[ "$default_dev" == "tun0" ]]; then
+            doctor_ok "Default route via tun0"
+          elif [[ -n "$default_dev" ]]; then
+            doctor_warn "Default route via '${default_dev}' (expected tun0)"
+          else
+            doctor_warn "Default route interface not detected"
+          fi
+        fi
+      else
+        doctor_fail "Sidecar '${net_name}' missing"
+      fi
+
+      docker_sock_source="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}{{.Source}}{{end}}{{end}}' "$env_name" 2>/dev/null || true)"
+      if [[ -n "$docker_sock_source" ]]; then
+        doctor_ok "Docker socket mounted (${docker_sock_source})"
+      else
+        doctor_warn "Docker socket not mounted"
+      fi
+
+      svc_count="$(docker ps -a --filter "label=$LABEL_KEY=$LABEL_VAL" --filter "label=$ROLE_KEY=$ROLE_SVC" --filter "label=envd.name=$env_name" --format '{{.ID}}' | awk 'END{print NR+0}')"
+      pf_count="$(docker ps -a --filter "label=$LABEL_KEY=$LABEL_VAL" --filter "label=$ROLE_KEY=$ROLE_PORT" --filter "label=envd.name=$env_name" --format '{{.ID}}' | awk 'END{print NR+0}')"
+      doctor_line "INFO" "Services: ${svc_count}  Port-forwards: ${pf_count}"
+    done
+
+    echo
+    echo "Summary: ok=${DOCTOR_OK_COUNT} warn=${DOCTOR_WARN_COUNT} fail=${DOCTOR_FAIL_COUNT}"
+    if (( DOCTOR_FAIL_COUNT > 0 )); then
+      exit 1
+    fi
     ;;
 
   svc-new|svc-start)

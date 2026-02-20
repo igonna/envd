@@ -175,6 +175,8 @@ Management Commands:
   stop <name>                  Stop an environment
   restart <name>               Restart an environment
   rm <name>                    Remove an environment
+  backup <name> [archive]      Backup environment volumes
+  restore <name> <archive>     Restore environment volumes
   exec <name> [cmd...]         Run command / open shell in environment
 
 Service Commands:
