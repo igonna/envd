@@ -54,6 +54,17 @@ if [ ! -f "$BASH_PROFILE" ]; then
   touch "$BASH_PROFILE"
 fi
 
+if ! grep -q "dev-env: source bashrc" "$BASH_PROFILE" 2>/dev/null; then
+  cat >> "$BASH_PROFILE" <<'EOF'
+
+# --- dev-env: source bashrc ---
+# SSH login shells read .bash_profile, not .bashrc, so source it explicitly.
+if [ -f ~/.bashrc ]; then
+  . ~/.bashrc
+fi
+EOF
+fi
+
 if ! grep -q "dev-env: auto-cd" "$BASH_PROFILE" 2>/dev/null; then
   cat >> "$BASH_PROFILE" <<'EOF'
 
