@@ -114,6 +114,13 @@ This creates:
 - Local SSH port mapping on `dev1-net`
 - SSH config entry for `dev1`
 - Git identity auto-propagated from host global Git config (if set)
+- Automations mount (read-only): `dev-containers/automations` -> `/automations`
+
+Run mounted automation scripts inside container:
+
+```bash
+/automations/example.sh
+```
 
 Connect:
 
