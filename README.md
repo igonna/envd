@@ -120,8 +120,8 @@ This creates:
 
 Docker daemon access controls:
 - Default: enabled (auto-detects socket from `/var/run/docker.sock` or `~/.docker/run/docker.sock`)
-- Disable per creation: `DEV_ENV_DOCKER_ACCESS=0 envd run dev1`
-- Force specific socket path: `DEV_ENV_DOCKER_SOCK=/path/to/docker.sock envd run dev1`
+- Disable per creation: `ENVD_DOCKER_ACCESS=0 envd run dev1`
+- Force specific socket path: `ENVD_DOCKER_SOCK=/path/to/docker.sock envd run dev1`
 
 Run mounted automation scripts inside container:
 
@@ -206,7 +206,7 @@ Service containers (share `<name>-net` namespace):
 ```bash
 envd service create dev1 postgres main
 envd service create dev1 postgres analytics
-DEV_ENV_SVC_PORT=5544 DEV_ENV_POSTGRES_USER=reporter DEV_ENV_POSTGRES_PASSWORD=reportpw DEV_ENV_POSTGRES_DB=reports envd service create dev1 postgres reporting
+ENVD_SVC_PORT=5544 ENVD_POSTGRES_USER=reporter ENVD_POSTGRES_PASSWORD=reportpw ENVD_POSTGRES_DB=reports envd service create dev1 postgres reporting
 envd service ls dev1
 envd service inspect dev1 postgres analytics
 envd service rm dev1 postgres reporting
@@ -263,4 +263,4 @@ Does not persist:
 - Sidecar iptables policy defaults to drop.
 - Only Xray upstream, loopback, established traffic, SSH ingress, and TUN path are allowed.
 - No private SSH keys are stored in dev containers.
-- Docker socket access (if enabled) grants high privilege on host Docker daemon. Disable with `DEV_ENV_DOCKER_ACCESS=0` when not needed.
+- Docker socket access (if enabled) grants high privilege on host Docker daemon. Disable with `ENVD_DOCKER_ACCESS=0` when not needed.

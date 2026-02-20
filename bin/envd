@@ -21,7 +21,7 @@ SSHCFG="${HOME}/.ssh/config"
 KNOWN_HOSTS_FILE="${HOME}/.ssh/known_hosts_envd"
 KEY_PRIV="${HOME}/.ssh/id_ed25519"
 KEY_PUB="${HOME}/.ssh/id_ed25519.pub"
-CLI_NAME="${DEV_ENV_CLI_NAME:-envd}"
+CLI_NAME="${ENVD_CLI_NAME:-envd}"
 
 usage() {
   cat <<EOT
@@ -133,17 +133,38 @@ ensure_ssh_key() {
 
 resolve_automations_dir() {
   local d repo_dir
-  if [[ -n "${DEV_ENV_AUTOMATIONS_DIR:-}" ]]; then
-    [[ -d "$DEV_ENV_AUTOMATIONS_DIR" ]] || die "DEV_ENV_AUTOMATIONS_DIR does not exist: $DEV_ENV_AUTOMATIONS_DIR"
-    printf '%s' "$DEV_ENV_AUTOMATIONS_DIR"
+  if [[ -n "${ENVD_AUTOMATIONS_DIR:-}" ]]; then
+    [[ -d "$ENVD_AUTOMATIONS_DIR" ]] || die "ENVD_AUTOMATIONS_DIR does not exist: $ENVD_AUTOMATIONS_DIR"
+    printf '%s' "$ENVD_AUTOMATIONS_DIR"
     return 0
   fi
 
-  local pwd_candidate script_candidate
+  local pwd_candidate script_candidate envd_home_candidate
   pwd_candidate="${PWD}/dev-containers/automations"
   script_candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../dev-containers/automations"
+  envd_home_candidate="${HOME}/repo/envd/dev-containers/automations"
 
-  for d in "$pwd_candidate" "$script_candidate"; do
+  # Prefer non-empty automation directories to avoid stale empty paths.
+  for d in "$pwd_candidate" "$script_candidate" "$envd_home_candidate"; do
+    if [[ -d "$d" ]] && find "$d" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done
+
+  if [[ -d "${HOME}/repo" ]]; then
+    for repo_dir in "${HOME}/repo"/*; do
+      [[ -d "$repo_dir" ]] || continue
+      d="${repo_dir}/dev-containers/automations"
+      if [[ -d "$d" ]] && find "$d" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        printf '%s' "$d"
+        return 0
+      fi
+    done
+  fi
+
+  # Fall back to existing dirs even if empty.
+  for d in "$pwd_candidate" "$script_candidate" "$envd_home_candidate"; do
     if [[ -d "$d" ]]; then
       printf '%s' "$d"
       return 0
@@ -166,9 +187,9 @@ resolve_automations_dir() {
 
 resolve_docker_socket() {
   local sock
-  if [[ -n "${DEV_ENV_DOCKER_SOCK:-}" ]]; then
-    [[ -S "$DEV_ENV_DOCKER_SOCK" ]] || die "DEV_ENV_DOCKER_SOCK is not a unix socket: $DEV_ENV_DOCKER_SOCK"
-    printf '%s' "$DEV_ENV_DOCKER_SOCK"
+  if [[ -n "${ENVD_DOCKER_SOCK:-}" ]]; then
+    [[ -S "$ENVD_DOCKER_SOCK" ]] || die "ENVD_DOCKER_SOCK is not a unix socket: $ENVD_DOCKER_SOCK"
+    printf '%s' "$ENVD_DOCKER_SOCK"
     return 0
   fi
 
@@ -317,11 +338,11 @@ Instances:
   If port is not specified, the next free port is auto-selected from BASE_PORT upward.
 
 Override defaults with env vars before ${CLI_NAME} service create:
-  DEV_ENV_SVC_PORT
-  DEV_ENV_POSTGRES_VERSION DEV_ENV_POSTGRES_USER DEV_ENV_POSTGRES_PASSWORD DEV_ENV_POSTGRES_DB
-  DEV_ENV_REDIS_VERSION DEV_ENV_REDIS_PASSWORD
-  DEV_ENV_MONGO_VERSION DEV_ENV_MONGO_INITDB_ROOT_USERNAME DEV_ENV_MONGO_INITDB_ROOT_PASSWORD
-  DEV_ENV_ELASTIC_VERSION DEV_ENV_ELASTIC_JAVA_OPTS
+  ENVD_SVC_PORT
+  ENVD_POSTGRES_VERSION ENVD_POSTGRES_USER ENVD_POSTGRES_PASSWORD ENVD_POSTGRES_DB
+  ENVD_REDIS_VERSION ENVD_REDIS_PASSWORD
+  ENVD_MONGO_VERSION ENVD_MONGO_INITDB_ROOT_USERNAME ENVD_MONGO_INITDB_ROOT_PASSWORD
+  ENVD_ELASTIC_VERSION ENVD_ELASTIC_JAVA_OPTS
 
 Interactive setup:
   ${CLI_NAME} service create-custom <name> <service> [instance]   (legacy alias: svc-start-custom)
@@ -424,48 +445,48 @@ service_collect_custom_env() {
   instance="$(service_instance_value "$instance")"
   SVC_CUSTOM_EXPORTS=()
 
-  suggested_port="$(service_pick_port "$env_name" "$service" "${DEV_ENV_SVC_PORT:-}")"
+  suggested_port="$(service_pick_port "$env_name" "$service" "${ENVD_SVC_PORT:-}")"
   svc_port="$(prompt_default "Internal port for ${service}/${instance}" "$suggested_port")"
-  SVC_CUSTOM_EXPORTS+=("DEV_ENV_SVC_PORT=${svc_port}")
+  SVC_CUSTOM_EXPORTS+=("ENVD_SVC_PORT=${svc_port}")
 
   case "$service" in
     postgres)
       local pg_ver pg_user pg_pass pg_db
-      pg_ver="$(prompt_default "Postgres version" "${DEV_ENV_POSTGRES_VERSION:-16}")"
-      pg_user="$(prompt_default "Postgres user" "${DEV_ENV_POSTGRES_USER:-dev}")"
-      pg_pass="$(prompt_secret_default "Postgres password" "${DEV_ENV_POSTGRES_PASSWORD:-dev}")"
-      pg_db="$(prompt_default "Postgres database" "${DEV_ENV_POSTGRES_DB:-app}")"
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_POSTGRES_VERSION=${pg_ver}")
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_POSTGRES_USER=${pg_user}")
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_POSTGRES_PASSWORD=${pg_pass}")
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_POSTGRES_DB=${pg_db}")
+      pg_ver="$(prompt_default "Postgres version" "${ENVD_POSTGRES_VERSION:-16}")"
+      pg_user="$(prompt_default "Postgres user" "${ENVD_POSTGRES_USER:-dev}")"
+      pg_pass="$(prompt_secret_default "Postgres password" "${ENVD_POSTGRES_PASSWORD:-dev}")"
+      pg_db="$(prompt_default "Postgres database" "${ENVD_POSTGRES_DB:-app}")"
+      SVC_CUSTOM_EXPORTS+=("ENVD_POSTGRES_VERSION=${pg_ver}")
+      SVC_CUSTOM_EXPORTS+=("ENVD_POSTGRES_USER=${pg_user}")
+      SVC_CUSTOM_EXPORTS+=("ENVD_POSTGRES_PASSWORD=${pg_pass}")
+      SVC_CUSTOM_EXPORTS+=("ENVD_POSTGRES_DB=${pg_db}")
       ;;
     redis)
       local redis_ver redis_pass
-      redis_ver="$(prompt_default "Redis version" "${DEV_ENV_REDIS_VERSION:-7-alpine}")"
-      redis_pass="$(prompt_secret_default "Redis password (empty = no auth)" "${DEV_ENV_REDIS_PASSWORD:-}")"
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_REDIS_VERSION=${redis_ver}")
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_REDIS_PASSWORD=${redis_pass}")
+      redis_ver="$(prompt_default "Redis version" "${ENVD_REDIS_VERSION:-7-alpine}")"
+      redis_pass="$(prompt_secret_default "Redis password (empty = no auth)" "${ENVD_REDIS_PASSWORD:-}")"
+      SVC_CUSTOM_EXPORTS+=("ENVD_REDIS_VERSION=${redis_ver}")
+      SVC_CUSTOM_EXPORTS+=("ENVD_REDIS_PASSWORD=${redis_pass}")
       ;;
     mongo)
       local mongo_ver mongo_user mongo_pass
-      mongo_ver="$(prompt_default "Mongo version" "${DEV_ENV_MONGO_VERSION:-7}")"
-      mongo_user="$(prompt_default "Mongo root username (empty = no auth)" "${DEV_ENV_MONGO_INITDB_ROOT_USERNAME:-}")"
+      mongo_ver="$(prompt_default "Mongo version" "${ENVD_MONGO_VERSION:-7}")"
+      mongo_user="$(prompt_default "Mongo root username (empty = no auth)" "${ENVD_MONGO_INITDB_ROOT_USERNAME:-}")"
       mongo_pass=""
       if [[ -n "$mongo_user" ]]; then
-        mongo_pass="$(prompt_secret_default "Mongo root password" "${DEV_ENV_MONGO_INITDB_ROOT_PASSWORD:-}")"
+        mongo_pass="$(prompt_secret_default "Mongo root password" "${ENVD_MONGO_INITDB_ROOT_PASSWORD:-}")"
         [[ -n "$mongo_pass" ]] || die "Mongo root password cannot be empty when username is set."
       fi
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_MONGO_VERSION=${mongo_ver}")
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_MONGO_INITDB_ROOT_USERNAME=${mongo_user}")
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_MONGO_INITDB_ROOT_PASSWORD=${mongo_pass}")
+      SVC_CUSTOM_EXPORTS+=("ENVD_MONGO_VERSION=${mongo_ver}")
+      SVC_CUSTOM_EXPORTS+=("ENVD_MONGO_INITDB_ROOT_USERNAME=${mongo_user}")
+      SVC_CUSTOM_EXPORTS+=("ENVD_MONGO_INITDB_ROOT_PASSWORD=${mongo_pass}")
       ;;
     elasticsearch)
       local es_ver es_java_opts
-      es_ver="$(prompt_default "Elasticsearch version" "${DEV_ENV_ELASTIC_VERSION:-8.13.4}")"
-      es_java_opts="$(prompt_default "Elasticsearch ES_JAVA_OPTS" "${DEV_ENV_ELASTIC_JAVA_OPTS:--Xms512m -Xmx512m}")"
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_ELASTIC_VERSION=${es_ver}")
-      SVC_CUSTOM_EXPORTS+=("DEV_ENV_ELASTIC_JAVA_OPTS=${es_java_opts}")
+      es_ver="$(prompt_default "Elasticsearch version" "${ENVD_ELASTIC_VERSION:-8.13.4}")"
+      es_java_opts="$(prompt_default "Elasticsearch ES_JAVA_OPTS" "${ENVD_ELASTIC_JAVA_OPTS:--Xms512m -Xmx512m}")"
+      SVC_CUSTOM_EXPORTS+=("ENVD_ELASTIC_VERSION=${es_ver}")
+      SVC_CUSTOM_EXPORTS+=("ENVD_ELASTIC_JAVA_OPTS=${es_java_opts}")
       ;;
   esac
 }
@@ -514,9 +535,9 @@ service_info() {
   case "$canonical" in
     postgres)
       local pg_user pg_pass pg_db v
-      pg_user="${DEV_ENV_POSTGRES_USER:-dev}"
-      pg_pass="${DEV_ENV_POSTGRES_PASSWORD:-dev}"
-      pg_db="${DEV_ENV_POSTGRES_DB:-app}"
+      pg_user="${ENVD_POSTGRES_USER:-dev}"
+      pg_pass="${ENVD_POSTGRES_PASSWORD:-dev}"
+      pg_db="${ENVD_POSTGRES_DB:-app}"
 
       if docker inspect "$svc_name" >/dev/null 2>&1; then
         v="$(docker_env_value "$svc_name" "POSTGRES_USER" 2>/dev/null || true)"; [[ -n "$v" ]] && pg_user="$v"
@@ -529,7 +550,7 @@ service_info() {
       ;;
     redis)
       local redis_pass v
-      redis_pass="${DEV_ENV_REDIS_PASSWORD:-}"
+      redis_pass="${ENVD_REDIS_PASSWORD:-}"
       if docker inspect "$svc_name" >/dev/null 2>&1; then
         v="$(docker_env_value "$svc_name" "REDIS_PASSWORD" 2>/dev/null || true)"; [[ -n "$v" ]] && redis_pass="$v"
       fi
@@ -543,8 +564,8 @@ service_info() {
       ;;
     mongo)
       local mongo_user mongo_pass v
-      mongo_user="${DEV_ENV_MONGO_INITDB_ROOT_USERNAME:-}"
-      mongo_pass="${DEV_ENV_MONGO_INITDB_ROOT_PASSWORD:-}"
+      mongo_user="${ENVD_MONGO_INITDB_ROOT_USERNAME:-}"
+      mongo_pass="${ENVD_MONGO_INITDB_ROOT_PASSWORD:-}"
       if docker inspect "$svc_name" >/dev/null 2>&1; then
         v="$(docker_env_value "$svc_name" "MONGO_INITDB_ROOT_USERNAME" 2>/dev/null || true)"; [[ -n "$v" ]] && mongo_user="$v"
         v="$(docker_env_value "$svc_name" "MONGO_INITDB_ROOT_PASSWORD" 2>/dev/null || true)"; [[ -n "$v" ]] && mongo_pass="$v"
@@ -611,10 +632,10 @@ service_spec() {
   case "$service" in
     postgres)
       local pg_ver pg_user pg_pass pg_db
-      pg_ver="${DEV_ENV_POSTGRES_VERSION:-16}"
-      pg_user="${DEV_ENV_POSTGRES_USER:-dev}"
-      pg_pass="${DEV_ENV_POSTGRES_PASSWORD:-dev}"
-      pg_db="${DEV_ENV_POSTGRES_DB:-app}"
+      pg_ver="${ENVD_POSTGRES_VERSION:-16}"
+      pg_user="${ENVD_POSTGRES_USER:-dev}"
+      pg_pass="${ENVD_POSTGRES_PASSWORD:-dev}"
+      pg_db="${ENVD_POSTGRES_DB:-app}"
       SVC_IMAGE="postgres:${pg_ver}"
       SVC_VOL_MOUNT="/var/lib/postgresql/data"
       SVC_ENV_ARGS=(-e "POSTGRES_USER=${pg_user}" -e "POSTGRES_PASSWORD=${pg_pass}" -e "POSTGRES_DB=${pg_db}")
@@ -622,8 +643,8 @@ service_spec() {
       ;;
     redis)
       local redis_ver redis_pass
-      redis_ver="${DEV_ENV_REDIS_VERSION:-7-alpine}"
-      redis_pass="${DEV_ENV_REDIS_PASSWORD:-}"
+      redis_ver="${ENVD_REDIS_VERSION:-7-alpine}"
+      redis_pass="${ENVD_REDIS_PASSWORD:-}"
       SVC_IMAGE="redis:${redis_ver}"
       SVC_VOL_MOUNT="/data"
       if [[ -n "$redis_pass" ]]; then
@@ -635,14 +656,14 @@ service_spec() {
       ;;
     mongo)
       local mongo_ver mongo_user mongo_pass
-      mongo_ver="${DEV_ENV_MONGO_VERSION:-7}"
-      mongo_user="${DEV_ENV_MONGO_INITDB_ROOT_USERNAME:-}"
-      mongo_pass="${DEV_ENV_MONGO_INITDB_ROOT_PASSWORD:-}"
+      mongo_ver="${ENVD_MONGO_VERSION:-7}"
+      mongo_user="${ENVD_MONGO_INITDB_ROOT_USERNAME:-}"
+      mongo_pass="${ENVD_MONGO_INITDB_ROOT_PASSWORD:-}"
       if [[ -n "$mongo_user" && -z "$mongo_pass" ]]; then
-        die "Mongo root password is required when DEV_ENV_MONGO_INITDB_ROOT_USERNAME is set."
+        die "Mongo root password is required when ENVD_MONGO_INITDB_ROOT_USERNAME is set."
       fi
       if [[ -z "$mongo_user" && -n "$mongo_pass" ]]; then
-        die "Mongo root username is required when DEV_ENV_MONGO_INITDB_ROOT_PASSWORD is set."
+        die "Mongo root username is required when ENVD_MONGO_INITDB_ROOT_PASSWORD is set."
       fi
       SVC_IMAGE="mongo:${mongo_ver}"
       SVC_VOL_MOUNT="/data/db"
@@ -653,8 +674,8 @@ service_spec() {
       ;;
     elasticsearch)
       local es_ver es_java_opts
-      es_ver="${DEV_ENV_ELASTIC_VERSION:-8.13.4}"
-      es_java_opts="${DEV_ENV_ELASTIC_JAVA_OPTS:--Xms512m -Xmx512m}"
+      es_ver="${ENVD_ELASTIC_VERSION:-8.13.4}"
+      es_java_opts="${ENVD_ELASTIC_JAVA_OPTS:--Xms512m -Xmx512m}"
       transport_port=$((svc_port + 100))
       if (( transport_port > 65535 )); then
         transport_port=$((svc_port + 1))
@@ -1017,7 +1038,7 @@ case "$cmd" in
       AUTOMATIONS_ARGS=(-v "${AUTOMATIONS_HOST_DIR}:${AUTOMATIONS_MOUNT}:ro")
     fi
 
-    DOCKER_ACCESS_ENABLED="${DEV_ENV_DOCKER_ACCESS:-1}"
+    DOCKER_ACCESS_ENABLED="${ENVD_DOCKER_ACCESS:-1}"
     DOCKER_SOCK_HOST=""
     DOCKER_SOCK_ARGS=()
     if [[ "$DOCKER_ACCESS_ENABLED" != "0" ]]; then
@@ -1075,14 +1096,14 @@ case "$cmd" in
     if [[ -n "$AUTOMATIONS_HOST_DIR" ]]; then
       echo "  Automations: ${AUTOMATIONS_HOST_DIR} -> ${AUTOMATIONS_MOUNT} (ro)"
     else
-      echo "  Automations: not mounted (set DEV_ENV_AUTOMATIONS_DIR or create dev-containers/automations)"
+      echo "  Automations: not mounted (set ENVD_AUTOMATIONS_DIR or create dev-containers/automations)"
     fi
     if [[ "$DOCKER_ACCESS_ENABLED" == "0" ]]; then
-      echo "  Docker socket: disabled (DEV_ENV_DOCKER_ACCESS=0)"
+      echo "  Docker socket: disabled (ENVD_DOCKER_ACCESS=0)"
     elif [[ -n "$DOCKER_SOCK_HOST" ]]; then
       echo "  Docker socket: ${DOCKER_SOCK_HOST} -> /var/run/docker.sock"
     else
-      echo "  Docker socket: not mounted (socket not found; set DEV_ENV_DOCKER_SOCK if needed)"
+      echo "  Docker socket: not mounted (socket not found; set ENVD_DOCKER_SOCK if needed)"
     fi
     if [[ -n "$HOST_GIT_NAME" && -n "$HOST_GIT_EMAIL" ]]; then
       echo "  Git identity: ${HOST_GIT_NAME} <${HOST_GIT_EMAIL}>"
@@ -1457,7 +1478,7 @@ case "$cmd" in
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     svc_service="$(service_canonical "$3")"
     svc_instance="$(service_instance_value "${4:-default}")"
-    service_start_one "$name" "$svc_service" "$svc_instance" "${DEV_ENV_SVC_PORT:-}"
+    service_start_one "$name" "$svc_service" "$svc_instance" "${ENVD_SVC_PORT:-}"
     echo "Service ${SVC_LAST_ACTION}: ${name}/${svc_service}/${svc_instance} (port ${SVC_LAST_PORT})"
     if [[ "$cmd" == "svc-start" ]]; then
       echo "  Note: svc-start is an alias of svc-new."
@@ -1480,7 +1501,7 @@ case "$cmd" in
       for kv in "${SVC_CUSTOM_EXPORTS[@]}"; do
         export "$kv"
       done
-      service_start_one "$name" "$svc_service" "$svc_instance" "${DEV_ENV_SVC_PORT:-}"
+      service_start_one "$name" "$svc_service" "$svc_instance" "${ENVD_SVC_PORT:-}"
     )
     echo "Service created with custom config: ${name}/${svc_service}/${svc_instance}"
     service_info "$name" "$svc_service" "$svc_instance"
