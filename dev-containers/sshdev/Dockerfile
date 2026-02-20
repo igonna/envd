@@ -3,7 +3,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssh-server sudo git curl ca-certificates bash \
+    openssh-server sudo git curl ca-certificates bash vim \
     build-essential pkg-config python3 python3-pip \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /var/run/sshd \

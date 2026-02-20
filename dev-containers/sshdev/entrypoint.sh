@@ -5,6 +5,8 @@ DEV_USER="${DEV_USER:-dev}"
 HOME_DIR="/home/${DEV_USER}"
 SSH_DIR="${HOME_DIR}/.ssh"
 REPO_DIR="${REPO_DIR:-${HOME_DIR}/repo}"
+GIT_USER_NAME="${GIT_USER_NAME:-}"
+GIT_USER_EMAIL="${GIT_USER_EMAIL:-}"
 
 if ! id -u "$DEV_USER" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$DEV_USER"
@@ -74,6 +76,21 @@ if [ -n "${SSH_TTY:-}" ] && [ -t 1 ] && [ -d /repo ]; then
   cd /repo 2>/dev/null || true
 fi
 EOF
+fi
+
+# Seed Git identity from host values for brand-new environments.
+# Do not overwrite user-set values already present in ~/.gitconfig.
+if [ -n "$GIT_USER_NAME" ] || [ -n "$GIT_USER_EMAIL" ]; then
+  GITCFG="${HOME_DIR}/.gitconfig"
+  CUR_GIT_NAME="$(git config --file "$GITCFG" --get user.name 2>/dev/null || true)"
+  CUR_GIT_EMAIL="$(git config --file "$GITCFG" --get user.email 2>/dev/null || true)"
+
+  if [ -n "$GIT_USER_NAME" ] && [ -z "$CUR_GIT_NAME" ]; then
+    git config --file "$GITCFG" user.name "$GIT_USER_NAME"
+  fi
+  if [ -n "$GIT_USER_EMAIL" ] && [ -z "$CUR_GIT_EMAIL" ]; then
+    git config --file "$GITCFG" user.email "$GIT_USER_EMAIL"
+  fi
 fi
 
 # fix perms for mounted home volume (includes .bashrc/.bash_profile)
