@@ -8,9 +8,9 @@ PORT_FWD_IMAGE="alpine/socat:latest"
 PORT_BASE=2223
 PORT_MAX=2299
 
-LABEL_KEY="dev-env.managed"
+LABEL_KEY="envd.managed"
 LABEL_VAL="true"
-ROLE_KEY="dev-env.role"
+ROLE_KEY="envd.role"
 ROLE_DEV="dev"
 ROLE_NET="net"
 ROLE_PORT="port"
@@ -18,33 +18,42 @@ ROLE_SVC="svc"
 AUTOMATIONS_MOUNT="/automations"
 
 SSHCFG="${HOME}/.ssh/config"
-KNOWN_HOSTS_DEV="${HOME}/.ssh/known_hosts_dev_env"
+KNOWN_HOSTS_FILE="${HOME}/.ssh/known_hosts_envd"
 KEY_PRIV="${HOME}/.ssh/id_ed25519"
 KEY_PUB="${HOME}/.ssh/id_ed25519.pub"
+CLI_NAME="${DEV_ENV_CLI_NAME:-envd}"
 
 usage() {
-  cat <<'EOT'
+  cat <<EOT
 Usage:
-  dev-env help
-  dev-env list
-  dev-env new <name>
-  dev-env rm <name>
-  dev-env ssh <name>
-  dev-env start <name>
-  dev-env stop <name>
-  dev-env restart <name>
-  dev-env cd <name>
-  dev-env svc-new <name> <service> [instance]
-  dev-env svc-new-custom <name> <service> [instance]
-  dev-env svc-start <name> <service> [instance]
-  dev-env svc-stop <name> <service> [instance]
-  dev-env svc-rm <name> <service> [instance]
-  dev-env svc-list [name]
-  dev-env svc-catalog
-  dev-env svc-info <name> <service> [instance]
-  dev-env port-open <name> <container-port> [host-port]
-  dev-env port-close <name> <container-port> [host-port]
-  dev-env port-list [name]
+  ${CLI_NAME} [command]
+
+Management Commands:
+  ps                           List environments
+  run <name>                   Create a new environment
+  start <name>                 Start an environment
+  stop <name>                  Stop an environment
+  restart <name>               Restart an environment
+  rm <name>                    Remove an environment
+  exec <name> [cmd...]         Run command / open shell in environment
+
+Service Commands:
+  service ls [env]                             List services
+  service catalog                              List available service types
+  service create <env> <service> [instance]    Add/start a service instance
+  service create-custom <env> <service> [instance]
+                                                Add a custom service instance
+  service start <env> <service> [instance]     Alias of service create
+  service stop <env> <service> [instance]
+  service rm <env> <service> [instance]
+  service inspect <env> <service|container> [instance]
+
+Port Commands:
+  port ls [env]                                List port mappings
+  port open <env> <container-port> [host-port] Open/map a port
+  port close <env> <container-port> [host-port] Close/unmap a port
+
+Legacy aliases still supported: list/new/ssh/cd/svc-*/port-*
 
 Naming rule (enforced):
 - <name> is also the Linux username inside the container.
@@ -63,6 +72,50 @@ need ssh
 need ssh-keygen
 need awk
 
+normalize_cli_args() {
+  NORMALIZED_ARGS=("$@")
+  if [[ ${#NORMALIZED_ARGS[@]} -eq 0 ]]; then
+    NORMALIZED_ARGS=(help)
+    return 0
+  fi
+
+  case "${NORMALIZED_ARGS[0]}" in
+    ps)
+      NORMALIZED_ARGS=(list "${NORMALIZED_ARGS[@]:1}")
+      ;;
+    run)
+      NORMALIZED_ARGS=(new "${NORMALIZED_ARGS[@]:1}")
+      ;;
+    service)
+      sub="${NORMALIZED_ARGS[1]:-}"
+      case "$sub" in
+        ls) NORMALIZED_ARGS=(svc-list "${NORMALIZED_ARGS[@]:2}") ;;
+        catalog) NORMALIZED_ARGS=(svc-catalog "${NORMALIZED_ARGS[@]:2}") ;;
+        create) NORMALIZED_ARGS=(svc-new "${NORMALIZED_ARGS[@]:2}") ;;
+        create-custom) NORMALIZED_ARGS=(svc-new-custom "${NORMALIZED_ARGS[@]:2}") ;;
+        start) NORMALIZED_ARGS=(svc-start "${NORMALIZED_ARGS[@]:2}") ;;
+        stop) NORMALIZED_ARGS=(svc-stop "${NORMALIZED_ARGS[@]:2}") ;;
+        rm) NORMALIZED_ARGS=(svc-rm "${NORMALIZED_ARGS[@]:2}") ;;
+        inspect) NORMALIZED_ARGS=(svc-info "${NORMALIZED_ARGS[@]:2}") ;;
+        help|-h|--help|"") NORMALIZED_ARGS=(help) ;;
+        *) die "Unknown service subcommand: ${sub}. Use: ${CLI_NAME} help" ;;
+      esac
+      ;;
+    port)
+      sub="${NORMALIZED_ARGS[1]:-}"
+      case "$sub" in
+        ls) NORMALIZED_ARGS=(port-list "${NORMALIZED_ARGS[@]:2}") ;;
+        open) NORMALIZED_ARGS=(port-open "${NORMALIZED_ARGS[@]:2}") ;;
+        close) NORMALIZED_ARGS=(port-close "${NORMALIZED_ARGS[@]:2}") ;;
+        help|-h|--help|"") NORMALIZED_ARGS=(help) ;;
+        *) die "Unknown port subcommand: ${sub}. Use: ${CLI_NAME} port ls|open|close" ;;
+      esac
+      ;;
+  esac
+}
+
+normalize_cli_args "$@"
+set -- "${NORMALIZED_ARGS[@]}"
 cmd="${1:-help}"
 name="${2:-}"
 
@@ -76,24 +129,34 @@ ensure_ssh_key() {
 }
 
 resolve_automations_dir() {
-  local d
+  local d repo_dir
   if [[ -n "${DEV_ENV_AUTOMATIONS_DIR:-}" ]]; then
     [[ -d "$DEV_ENV_AUTOMATIONS_DIR" ]] || die "DEV_ENV_AUTOMATIONS_DIR does not exist: $DEV_ENV_AUTOMATIONS_DIR"
     printf '%s' "$DEV_ENV_AUTOMATIONS_DIR"
     return 0
   fi
 
-  local pwd_candidate script_candidate home_candidate
+  local pwd_candidate script_candidate
   pwd_candidate="${PWD}/dev-containers/automations"
   script_candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../dev-containers/automations"
-  home_candidate="${HOME}/repo/dev-env/dev-containers/automations"
 
-  for d in "$pwd_candidate" "$script_candidate" "$home_candidate"; do
+  for d in "$pwd_candidate" "$script_candidate"; do
     if [[ -d "$d" ]]; then
       printf '%s' "$d"
       return 0
     fi
   done
+
+  if [[ -d "${HOME}/repo" ]]; then
+    for repo_dir in "${HOME}/repo"/*; do
+      [[ -d "$repo_dir" ]] || continue
+      d="${repo_dir}/dev-containers/automations"
+      if [[ -d "$d" ]]; then
+        printf '%s' "$d"
+        return 0
+      fi
+    done
+  fi
 
   return 1
 }
@@ -165,7 +228,7 @@ port_forward_ids_for_env() {
   docker ps -a \
     --filter "label=$LABEL_KEY=$LABEL_VAL" \
     --filter "label=$ROLE_KEY=$ROLE_PORT" \
-    --filter "label=dev-env.name=$env_name" \
+    --filter "label=envd.name=$env_name" \
     --format '{{.ID}}'
 }
 
@@ -243,14 +306,14 @@ service_catalog() {
   printf "%-14s %-20s %-10s %s\n" "redis" "redis" "6379" "optional password"
   printf "%-14s %-20s %-10s %s\n" "mongo" "mongo, mongodb" "27017" "optional root auth"
   printf "%-14s %-20s %-10s %s\n" "elasticsearch" "elasticsearch, es" "9200" "xpack.security=false"
-  cat <<'EOT'
+  cat <<EOT
 
 Instances:
   You can run multiple instances per service:
-    dev-env svc-new <name> <service> [instance]
+    ${CLI_NAME} service create <name> <service> [instance]
   If port is not specified, the next free port is auto-selected from BASE_PORT upward.
 
-Override defaults with env vars before `svc-new`:
+Override defaults with env vars before ${CLI_NAME} service create:
   DEV_ENV_SVC_PORT
   DEV_ENV_POSTGRES_VERSION DEV_ENV_POSTGRES_USER DEV_ENV_POSTGRES_PASSWORD DEV_ENV_POSTGRES_DB
   DEV_ENV_REDIS_VERSION DEV_ENV_REDIS_PASSWORD
@@ -258,7 +321,7 @@ Override defaults with env vars before `svc-new`:
   DEV_ENV_ELASTIC_VERSION DEV_ENV_ELASTIC_JAVA_OPTS
 
 Interactive setup:
-  dev-env svc-new-custom <name> <service> [instance]   (alias: svc-start-custom)
+  ${CLI_NAME} service create-custom <name> <service> [instance]   (legacy alias: svc-start-custom)
 EOT
 }
 
@@ -300,14 +363,14 @@ service_ids_for_env() {
   docker ps -a \
     --filter "label=$LABEL_KEY=$LABEL_VAL" \
     --filter "label=$ROLE_KEY=$ROLE_SVC" \
-    --filter "label=dev-env.name=$env_name" \
+    --filter "label=envd.name=$env_name" \
     --format '{{.ID}}'
 }
 
 service_port_for_container() {
   local svc_name="$1" service="$2"
   local svc_port
-  svc_port="$(docker inspect -f '{{ index .Config.Labels "dev-env.port" }}' "$svc_name" 2>/dev/null || true)"
+  svc_port="$(docker inspect -f '{{ index .Config.Labels "envd.port" }}' "$svc_name" 2>/dev/null || true)"
   if [[ -z "$svc_port" ]]; then
     svc_port="$(service_default_port "$service")"
   fi
@@ -321,8 +384,8 @@ service_port_in_use() {
   [[ -n "$svc_ids" ]] || return 1
 
   for id in $svc_ids; do
-    current_port="$(docker inspect -f '{{ index .Config.Labels "dev-env.port" }}' "$id" 2>/dev/null || true)"
-    current_service="$(docker inspect -f '{{ index .Config.Labels "dev-env.service" }}' "$id" 2>/dev/null || true)"
+    current_port="$(docker inspect -f '{{ index .Config.Labels "envd.port" }}' "$id" 2>/dev/null || true)"
+    current_service="$(docker inspect -f '{{ index .Config.Labels "envd.service" }}' "$id" 2>/dev/null || true)"
     if [[ -z "$current_port" && -n "$current_service" ]]; then
       current_port="$(service_default_port "$current_service")"
     fi
@@ -409,9 +472,9 @@ port_forward_host_ports_for_target() {
   docker ps -a \
     --filter "label=$LABEL_KEY=$LABEL_VAL" \
     --filter "label=$ROLE_KEY=$ROLE_PORT" \
-    --filter "label=dev-env.name=$env_name" \
-    --filter "label=dev-env.target_port=$target_port" \
-    --format '{{.Label "dev-env.host_port"}}'
+    --filter "label=envd.name=$env_name" \
+    --filter "label=envd.target_port=$target_port" \
+    --format '{{.Label "envd.host_port"}}'
 }
 
 service_info() {
@@ -434,7 +497,7 @@ service_info() {
   if [[ -n "$host_ports" ]]; then
     host_line="$(echo "$host_ports" | awk 'NF{printf "%s127.0.0.1:%s", (sep? ", ":""), $0; sep=1} END{if(!sep) printf "not exposed"}')"
   else
-    host_line="not exposed (use: dev-env port-open ${env_name} ${port})"
+    host_line="not exposed (use: ${CLI_NAME} port open ${env_name} ${port})"
   fi
 
   echo "Service: ${canonical} (requested: ${service})"
@@ -510,10 +573,10 @@ service_resolve_ref() {
   local role resolved_env resolved_service resolved_instance
 
   if docker inspect "$ref" >/dev/null 2>&1; then
-    role="$(docker inspect -f '{{ index .Config.Labels "dev-env.role" }}' "$ref" 2>/dev/null || true)"
-    resolved_env="$(docker inspect -f '{{ index .Config.Labels "dev-env.name" }}' "$ref" 2>/dev/null || true)"
-    resolved_service="$(docker inspect -f '{{ index .Config.Labels "dev-env.service" }}' "$ref" 2>/dev/null || true)"
-    resolved_instance="$(docker inspect -f '{{ index .Config.Labels "dev-env.instance" }}' "$ref" 2>/dev/null || true)"
+    role="$(docker inspect -f '{{ index .Config.Labels "envd.role" }}' "$ref" 2>/dev/null || true)"
+    resolved_env="$(docker inspect -f '{{ index .Config.Labels "envd.name" }}' "$ref" 2>/dev/null || true)"
+    resolved_service="$(docker inspect -f '{{ index .Config.Labels "envd.service" }}' "$ref" 2>/dev/null || true)"
+    resolved_instance="$(docker inspect -f '{{ index .Config.Labels "envd.instance" }}' "$ref" 2>/dev/null || true)"
 
     [[ "$role" == "$ROLE_SVC" ]] || die "Container '${ref}' is not a managed service."
     [[ "$resolved_env" == "$env_name" ]] || die "Service container '${ref}' belongs to env '${resolved_env}', not '${env_name}'."
@@ -612,9 +675,9 @@ service_ensure_volume() {
     docker volume create \
       --label "$LABEL_KEY=$LABEL_VAL" \
       --label "$ROLE_KEY=$ROLE_SVC" \
-      --label "dev-env.name=$env_name" \
-      --label "dev-env.service=$service" \
-      --label "dev-env.instance=$instance" \
+      --label "envd.name=$env_name" \
+      --label "envd.service=$service" \
+      --label "envd.instance=$instance" \
       "$SVC_VOL_NAME" >/dev/null
 }
 
@@ -650,10 +713,10 @@ service_start_one() {
     --name "$svc_name"
     --label "$LABEL_KEY=$LABEL_VAL"
     --label "$ROLE_KEY=$ROLE_SVC"
-    --label "dev-env.name=$env_name"
-    --label "dev-env.service=$service"
-    --label "dev-env.instance=$instance"
-    --label "dev-env.port=$svc_port"
+    --label "envd.name=$env_name"
+    --label "envd.service=$service"
+    --label "envd.instance=$instance"
+    --label "envd.port=$svc_port"
     --restart unless-stopped
     --network "container:${env_name}-net"
   )
@@ -729,7 +792,7 @@ service_rm_all_for_env() {
   svc_vol_ids="$(docker volume ls -q \
     --filter "label=$LABEL_KEY=$LABEL_VAL" \
     --filter "label=$ROLE_KEY=$ROLE_SVC" \
-    --filter "label=dev-env.name=$env_name")"
+    --filter "label=envd.name=$env_name")"
   if [[ -n "$svc_vol_ids" ]]; then
     docker volume rm $svc_vol_ids >/dev/null 2>&1 || true
   fi
@@ -740,8 +803,8 @@ port_target_ports_for_env() {
   docker ps -a \
     --filter "label=$LABEL_KEY=$LABEL_VAL" \
     --filter "label=$ROLE_KEY=$ROLE_PORT" \
-    --filter "label=dev-env.name=$env_name" \
-    --format '{{.Label "dev-env.target_port"}}'
+    --filter "label=envd.name=$env_name" \
+    --format '{{.Label "envd.target_port"}}'
 }
 
 allow_sidecar_ports_for_env() {
@@ -787,9 +850,9 @@ remove_ssh_config_host() {
 remove_known_host_entry() {
   local host="$1" port="$2"
   mkdir -p "${HOME}/.ssh"
-  touch "$KNOWN_HOSTS_DEV"
-  chmod 600 "$KNOWN_HOSTS_DEV"
-  ssh-keygen -R "[${host}]:${port}" -f "$KNOWN_HOSTS_DEV" >/dev/null 2>&1 || true
+  touch "$KNOWN_HOSTS_FILE"
+  chmod 600 "$KNOWN_HOSTS_FILE"
+  ssh-keygen -R "[${host}]:${port}" -f "$KNOWN_HOSTS_FILE" >/dev/null 2>&1 || true
 }
 
 set_ssh_config_host() {
@@ -812,7 +875,7 @@ Host ${host}
   IdentityFile ${KEY_PRIV}
   IdentitiesOnly yes
   ForwardAgent yes
-  UserKnownHostsFile ~/.ssh/known_hosts_dev_env
+  UserKnownHostsFile ${KNOWN_HOSTS_FILE}
   StrictHostKeyChecking accept-new
 
 EOCFG
@@ -841,7 +904,7 @@ case "$cmd" in
     ;;
 
   new)
-    [[ -z "$name" ]] && die "Usage: dev-env new <name>"
+    [[ -z "$name" ]] && die "Usage: ${CLI_NAME} run <name>"
     validate_name_and_user "$name"
     ensure_network_and_image
     ensure_ssh_key
@@ -955,7 +1018,8 @@ case "$cmd" in
     echo "Created: $name"
     echo "  Network sidecar: $NET_NAME"
     echo "  Linux user: $USER_NAME"
-    echo "  SSH: dev-env ssh $name   (or: ssh $name)"
+    echo "  Exec: ${CLI_NAME} exec $name"
+    echo "  Legacy SSH alias: ${CLI_NAME} ssh $name   (or: ssh $name)"
     echo "  Repo: /repo -> ${REPO_MOUNT} (volume: ${REPO_VOL})"
     echo "  Home: /home/${USER_NAME} (volume: ${HOME_VOL})"
     if [[ -n "$AUTOMATIONS_HOST_DIR" ]]; then
@@ -979,7 +1043,7 @@ case "$cmd" in
     ;;
 
   rm)
-    [[ -z "$name" ]] && die "Usage: dev-env rm <name>"
+    [[ -z "$name" ]] && die "Usage: ${CLI_NAME} rm <name>"
     validate_name_and_user "$name"
 
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
@@ -1000,15 +1064,29 @@ case "$cmd" in
     echo "  Deleted volumes: ${name}-home, ${name}-repo"
     ;;
 
-  ssh)
-    [[ -z "$name" ]] && die "Usage: dev-env ssh <name>"
+  exec)
+    [[ $# -lt 2 ]] && die "Usage: ${CLI_NAME} exec <name> [cmd...]"
     validate_name_and_user "$name"
-    ssh-add --apple-use-keychain ~/.ssh/ghub_key >/dev/null 2>&1 || true
-    exec ssh -A "$name"
+    docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
+    if [[ $# -eq 2 ]]; then
+      exec docker exec -it -u "$name" "$name" bash -lc 'cd /repo && exec bash'
+    fi
+    shift 2
+    if [[ -t 0 && -t 1 ]]; then
+      exec docker exec -it -u "$name" "$name" bash -lc 'cd /repo && exec "$@"' bash "$@"
+    else
+      exec docker exec -i -u "$name" "$name" bash -lc 'cd /repo && exec "$@"' bash "$@"
+    fi
+    ;;
+
+  ssh)
+    [[ -z "$name" ]] && die "Usage: ${CLI_NAME} ssh <name>"
+    validate_name_and_user "$name"
+    exec "$0" exec "$name"
     ;;
 
   start)
-    [[ -z "$name" ]] && die "Usage: dev-env start <name>"
+    [[ -z "$name" ]] && die "Usage: ${CLI_NAME} start <name>"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
 
@@ -1034,7 +1112,7 @@ case "$cmd" in
     ;;
 
   stop)
-    [[ -z "$name" ]] && die "Usage: dev-env stop <name>"
+    [[ -z "$name" ]] && die "Usage: ${CLI_NAME} stop <name>"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
 
@@ -1054,7 +1132,7 @@ case "$cmd" in
     ;;
 
   restart)
-    [[ -z "$name" ]] && die "Usage: dev-env restart <name>"
+    [[ -z "$name" ]] && die "Usage: ${CLI_NAME} restart <name>"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     if docker inspect "${name}-net" >/dev/null 2>&1; then
@@ -1071,14 +1149,12 @@ case "$cmd" in
     ;;
 
   cd)
-    [[ -z "$name" ]] && die "Usage: dev-env cd <name>"
-    validate_name_and_user "$name"
-    docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
-    exec docker exec -it -u "$name" "$name" bash -lc 'cd /repo && exec bash'
+    [[ -z "$name" ]] && die "Usage: ${CLI_NAME} cd <name>"
+    exec "$0" exec "$name"
     ;;
 
   svc-new|svc-start)
-    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env svc-new <name> <service> [instance]"
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: ${CLI_NAME} service create <name> <service> [instance]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     svc_service="$(service_canonical "$3")"
@@ -1091,7 +1167,7 @@ case "$cmd" in
     ;;
 
   svc-new-custom|svc-start-custom)
-    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env svc-new-custom <name> <service> [instance]"
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: ${CLI_NAME} service create-custom <name> <service> [instance]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     [[ -t 0 ]] || die "svc-new-custom requires an interactive terminal."
@@ -1099,7 +1175,7 @@ case "$cmd" in
     svc_instance="$(service_instance_value "${4:-default}")"
     if service_exists "$name" "$svc_service" "$svc_instance"; then
       svc_name="$(service_container_name "$name" "$svc_service" "$svc_instance")"
-      die "Service already exists: ${svc_name}. Recreate it to change config: dev-env svc-rm ${name} ${svc_service} ${svc_instance} && dev-env svc-new-custom ${name} ${svc_service} ${svc_instance}"
+      die "Service already exists: ${svc_name}. Recreate it to change config: ${CLI_NAME} service rm ${name} ${svc_service} ${svc_instance} && ${CLI_NAME} service create-custom ${name} ${svc_service} ${svc_instance}"
     fi
     service_collect_custom_env "$name" "$svc_service" "$svc_instance"
     (
@@ -1116,7 +1192,7 @@ case "$cmd" in
     ;;
 
   svc-stop)
-    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env svc-stop <name> <service> [instance]"
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: ${CLI_NAME} service stop <name> <service> [instance]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     svc_service="$(service_canonical "$3")"
@@ -1126,7 +1202,7 @@ case "$cmd" in
     ;;
 
   svc-rm)
-    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env svc-rm <name> <service> [instance]"
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: ${CLI_NAME} service rm <name> <service> [instance]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     svc_service="$(service_canonical "$3")"
@@ -1137,7 +1213,7 @@ case "$cmd" in
 
   svc-list)
     if [[ $# -gt 2 ]]; then
-      die "Usage: dev-env svc-list [name]"
+      die "Usage: ${CLI_NAME} service ls [name]"
     fi
     echo -e "NAME\tSTATE\tSTATUS\tENV\tSERVICE\tINSTANCE\tPORT\tIMAGE"
     if [[ $# -eq 2 ]]; then
@@ -1145,8 +1221,8 @@ case "$cmd" in
       docker ps -a \
         --filter "label=$LABEL_KEY=$LABEL_VAL" \
         --filter "label=$ROLE_KEY=$ROLE_SVC" \
-        --filter "label=dev-env.name=$name" \
-        --format "{{.Names}}\t{{.Status}}\t{{.Label \"dev-env.name\"}}\t{{.Label \"dev-env.service\"}}\t{{.Label \"dev-env.instance\"}}\t{{.Label \"dev-env.port\"}}\t{{.Image}}" \
+        --filter "label=envd.name=$name" \
+        --format "{{.Names}}\t{{.Status}}\t{{.Label \"envd.name\"}}\t{{.Label \"envd.service\"}}\t{{.Label \"envd.instance\"}}\t{{.Label \"envd.port\"}}\t{{.Image}}" \
         | awk -F '\t' 'BEGIN{OFS="\t"} {
             state = "stopped";
             if ($2 ~ /^Up( |$)/ || $2 ~ /^Restarting( |$)/) state = "active";
@@ -1165,7 +1241,7 @@ case "$cmd" in
       docker ps -a \
         --filter "label=$LABEL_KEY=$LABEL_VAL" \
         --filter "label=$ROLE_KEY=$ROLE_SVC" \
-        --format "{{.Names}}\t{{.Status}}\t{{.Label \"dev-env.name\"}}\t{{.Label \"dev-env.service\"}}\t{{.Label \"dev-env.instance\"}}\t{{.Label \"dev-env.port\"}}\t{{.Image}}" \
+        --format "{{.Names}}\t{{.Status}}\t{{.Label \"envd.name\"}}\t{{.Label \"envd.service\"}}\t{{.Label \"envd.instance\"}}\t{{.Label \"envd.port\"}}\t{{.Image}}" \
         | awk -F '\t' 'BEGIN{OFS="\t"} {
             state = "stopped";
             if ($2 ~ /^Up( |$)/ || $2 ~ /^Restarting( |$)/) state = "active";
@@ -1184,12 +1260,12 @@ case "$cmd" in
     ;;
 
   svc-catalog)
-    [[ $# -ne 1 ]] && die "Usage: dev-env svc-catalog"
+    [[ $# -ne 1 ]] && die "Usage: ${CLI_NAME} service catalog"
     service_catalog
     ;;
 
   svc-info)
-    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env svc-info <name> <service> [instance]"
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: ${CLI_NAME} service inspect <name> <service|container> [instance]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     if [[ $# -eq 4 ]]; then
@@ -1204,7 +1280,7 @@ case "$cmd" in
     ;;
 
   port-open)
-    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env port-open <name> <container-port> [host-port]"
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: ${CLI_NAME} port open <name> <container-port> [host-port]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     docker inspect "${name}-net" >/dev/null 2>&1 || die "No such sidecar: ${name}-net"
@@ -1224,9 +1300,9 @@ case "$cmd" in
       --name "$PF_NAME" \
       --label "$LABEL_KEY=$LABEL_VAL" \
       --label "$ROLE_KEY=$ROLE_PORT" \
-      --label "dev-env.name=$name" \
-      --label "dev-env.host_port=$HOST_PORT" \
-      --label "dev-env.target_port=$CONTAINER_PORT" \
+      --label "envd.name=$name" \
+      --label "envd.host_port=$HOST_PORT" \
+      --label "envd.target_port=$CONTAINER_PORT" \
       --restart unless-stopped \
       --network "$NETWORK" \
       -p "127.0.0.1:${HOST_PORT}:${HOST_PORT}" \
@@ -1244,7 +1320,7 @@ case "$cmd" in
     ;;
 
   port-close)
-    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env port-close <name> <container-port> [host-port]"
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: ${CLI_NAME} port close <name> <container-port> [host-port]"
     validate_name_and_user "$name"
 
     CONTAINER_PORT="$3"
@@ -1258,8 +1334,8 @@ case "$cmd" in
     remaining_same_target="$(docker ps -a \
       --filter "label=$LABEL_KEY=$LABEL_VAL" \
       --filter "label=$ROLE_KEY=$ROLE_PORT" \
-      --filter "label=dev-env.name=$name" \
-      --filter "label=dev-env.target_port=$CONTAINER_PORT" \
+      --filter "label=envd.name=$name" \
+      --filter "label=envd.target_port=$CONTAINER_PORT" \
       --format '{{.ID}}')"
     if [[ -z "$remaining_same_target" ]]; then
       deny_sidecar_port "$name" "$CONTAINER_PORT"
@@ -1269,7 +1345,7 @@ case "$cmd" in
 
   port-list)
     if [[ $# -gt 2 ]]; then
-      die "Usage: dev-env port-list [name]"
+      die "Usage: ${CLI_NAME} port ls [name]"
     fi
 
     echo -e "NAME\tSTATUS\tENV\tHOST_PORT\tTARGET_PORT"
@@ -1278,13 +1354,13 @@ case "$cmd" in
       docker ps -a \
         --filter "label=$LABEL_KEY=$LABEL_VAL" \
         --filter "label=$ROLE_KEY=$ROLE_PORT" \
-        --filter "label=dev-env.name=$name" \
-        --format "{{.Names}}\t{{.Status}}\t{{.Label \"dev-env.name\"}}\t{{.Label \"dev-env.host_port\"}}\t{{.Label \"dev-env.target_port\"}}"
+        --filter "label=envd.name=$name" \
+        --format "{{.Names}}\t{{.Status}}\t{{.Label \"envd.name\"}}\t{{.Label \"envd.host_port\"}}\t{{.Label \"envd.target_port\"}}"
     else
       docker ps -a \
         --filter "label=$LABEL_KEY=$LABEL_VAL" \
         --filter "label=$ROLE_KEY=$ROLE_PORT" \
-        --format "{{.Names}}\t{{.Status}}\t{{.Label \"dev-env.name\"}}\t{{.Label \"dev-env.host_port\"}}\t{{.Label \"dev-env.target_port\"}}"
+        --format "{{.Names}}\t{{.Status}}\t{{.Label \"envd.name\"}}\t{{.Label \"envd.host_port\"}}\t{{.Label \"envd.target_port\"}}"
     fi
     ;;
 

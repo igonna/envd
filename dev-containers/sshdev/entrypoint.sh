@@ -33,10 +33,10 @@ if [ ! -e /repo ]; then
 fi
 
 # Ensure colored prompt even if skel was minimal
-if ! grep -q "dev-env: ensure colored prompt" "${HOME_DIR}/.bashrc" 2>/dev/null; then
+if ! grep -q "envd: ensure colored prompt" "${HOME_DIR}/.bashrc" 2>/dev/null; then
   cat >> "${HOME_DIR}/.bashrc" <<'EOF'
 
-# --- dev-env: ensure colored prompt ---
+# --- envd: ensure colored prompt ---
 force_color_prompt=yes
 if [ -n "$force_color_prompt" ] && [ -x /usr/bin/tput ] && tput setaf 1 >/dev/null 2>&1; then
   color_prompt=yes
@@ -56,10 +56,10 @@ if [ ! -f "$BASH_PROFILE" ]; then
   touch "$BASH_PROFILE"
 fi
 
-if ! grep -q "dev-env: source bashrc" "$BASH_PROFILE" 2>/dev/null; then
+if ! grep -q "envd: source bashrc" "$BASH_PROFILE" 2>/dev/null; then
   cat >> "$BASH_PROFILE" <<'EOF'
 
-# --- dev-env: source bashrc ---
+# --- envd: source bashrc ---
 # SSH login shells read .bash_profile, not .bashrc, so source it explicitly.
 if [ -f ~/.bashrc ]; then
   . ~/.bashrc
@@ -67,10 +67,10 @@ fi
 EOF
 fi
 
-if ! grep -q "dev-env: clear screen" "$BASH_PROFILE" 2>/dev/null; then
+if ! grep -q "envd: clear screen" "$BASH_PROFILE" 2>/dev/null; then
   cat >> "$BASH_PROFILE" <<'EOF'
 
-# --- dev-env: clear screen ---
+# --- envd: clear screen ---
 # Keep SSH entry clean by clearing terminal before showing the prompt.
 if [ -n "${SSH_TTY:-}" ] && [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ]; then
   clear 2>/dev/null || true
@@ -78,10 +78,10 @@ fi
 EOF
 fi
 
-if ! grep -q "dev-env: auto-cd" "$BASH_PROFILE" 2>/dev/null; then
+if ! grep -q "envd: auto-cd" "$BASH_PROFILE" 2>/dev/null; then
   cat >> "$BASH_PROFILE" <<'EOF'
 
-# --- dev-env: auto-cd ---
+# --- envd: auto-cd ---
 # Only for interactive SSH login shells. Avoids breaking VS Code bootstrap.
 if [ -n "${SSH_TTY:-}" ] && [ -t 1 ] && [ -d /repo ]; then
   cd /repo 2>/dev/null || true

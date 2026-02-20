@@ -14,9 +14,9 @@ Self-contained Docker development environments behind Xray (VLESS + Reality), wi
 ## Repository structure
 
 ```text
-dev-env/
-├── bin-dev-env/
-│   └── dev-env                    # CLI tool for managing dev containers
+envd/
+├── bin/
+│   └── envd                    # CLI tool for managing dev containers
 ├── dev-containers/
 │   ├── net-sidecar/
 │   │   ├── Dockerfile             # sidecar image (sing-box + kill-switch)
@@ -86,23 +86,23 @@ cd dev-containers/net-sidecar
 docker build -t devnet-sidecar:1 .
 ```
 
-## 3) Install `dev-env` CLI
+## 3) Install `envd` CLI
 
 ```bash
-sudo mv bin-dev-env/dev-env /opt/homebrew/bin/dev-env
-sudo chmod +x /opt/homebrew/bin/dev-env
+sudo cp bin/envd /opt/homebrew/bin/envd
+sudo chmod +x /opt/homebrew/bin/envd
 ```
 
 Verify:
 
 ```bash
-dev-env help
+envd help
 ```
 
 ## 4) Create and use a dev environment
 
 ```bash
-dev-env new dev1
+envd run dev1
 ```
 
 This creates:
@@ -120,8 +120,8 @@ This creates:
 
 Docker daemon access controls:
 - Default: enabled (auto-detects socket from `/var/run/docker.sock` or `~/.docker/run/docker.sock`)
-- Disable per creation: `DEV_ENV_DOCKER_ACCESS=0 dev-env new dev1`
-- Force specific socket path: `DEV_ENV_DOCKER_SOCK=/path/to/docker.sock dev-env new dev1`
+- Disable per creation: `DEV_ENV_DOCKER_ACCESS=0 envd run dev1`
+- Force specific socket path: `DEV_ENV_DOCKER_SOCK=/path/to/docker.sock envd run dev1`
 
 Run mounted automation scripts inside container:
 
@@ -132,7 +132,7 @@ Run mounted automation scripts inside container:
 Connect:
 
 ```bash
-dev-env ssh dev1
+envd exec dev1
 ```
 
 or:
@@ -146,7 +146,7 @@ ssh dev1
 Inside container:
 
 ```bash
-dev-env ssh dev1
+envd exec dev1
 env | grep -Ei 'proxy|all_proxy' || true
 curl -s https://api.ipify.org
 ```
@@ -165,46 +165,49 @@ Expected: request fails (no direct leak).
 ## 6) CLI commands
 
 ```text
-dev-env new <name>
-dev-env rm <name>
-dev-env list
-dev-env start <name>
-dev-env stop <name>
-dev-env restart <name>
-dev-env ssh <name>
-dev-env cd <name>
-dev-env svc-new <name> <service> [instance]
-dev-env svc-new-custom <name> <service> [instance]
-dev-env svc-start <name> <service> [instance]
-dev-env svc-stop <name> <service> [instance]
-dev-env svc-rm <name> <service> [instance]
-dev-env svc-list [name]
-dev-env svc-catalog
-dev-env svc-info <name> <service> [instance]
-dev-env port-open <name> <container-port> [host-port]
-dev-env port-close <name> <container-port> [host-port]
-dev-env port-list [name]
-dev-env help
+Usage:
+  envd [command]
+
+Management Commands:
+  ps                           List environments
+  run <name>                   Create a new environment
+  start <name>                 Start an environment
+  stop <name>                  Stop an environment
+  restart <name>               Restart an environment
+  rm <name>                    Remove an environment
+  exec <name> [cmd...]         Run command / open shell in environment
+
+Service Commands:
+  service ls [env]                             List services
+  service catalog                              List available service types
+  service create <env> <service> [instance]    Add/start a service instance
+  service create-custom <env> <service> [instance]
+  service start <env> <service> [instance]     Alias of service create
+  service stop <env> <service> [instance]
+  service rm <env> <service> [instance]
+  service inspect <env> <service|container> [instance]
+
+Port Commands:
+  port ls [env]                                List port mappings
+  port open <env> <container-port> [host-port] Open/map a port
+  port close <env> <container-port> [host-port] Close/unmap a port
 ```
 
-`dev-env start/stop/restart <name>` manage both `<name>` and `<name>-net`.
-`dev-env list` includes `STATE` as `active` or `stopped`.
-For services, most workflows only need:
-- `svc-new` (create-or-start)
-- `svc-rm` (remove instance + its data volume)
-
-Use `[instance]` to run multiple services of the same type in one dev environment.
-`svc-start` and `svc-start-custom` are compatibility aliases.
+`envd start/stop/restart <name>` manage both `<name>` and `<name>-net`.
+`envd ps` includes `STATE` as `active` or `stopped`.
+For services, most workflows only need `service create` and `service rm`.
+Use `[instance]` to run multiple services of the same type in one environment.
+Legacy aliases still work (`list/new/ssh/cd/svc-*/port-*`).
 
 Service containers (share `<name>-net` namespace):
 
 ```bash
-dev-env svc-new dev1 postgres main
-dev-env svc-new dev1 postgres analytics
-DEV_ENV_SVC_PORT=5544 DEV_ENV_POSTGRES_USER=reporter DEV_ENV_POSTGRES_PASSWORD=reportpw DEV_ENV_POSTGRES_DB=reports dev-env svc-new dev1 postgres reporting
-dev-env svc-list dev1
-dev-env svc-info dev1 postgres analytics
-dev-env svc-rm dev1 postgres reporting
+envd service create dev1 postgres main
+envd service create dev1 postgres analytics
+DEV_ENV_SVC_PORT=5544 DEV_ENV_POSTGRES_USER=reporter DEV_ENV_POSTGRES_PASSWORD=reportpw DEV_ENV_POSTGRES_DB=reports envd service create dev1 postgres reporting
+envd service ls dev1
+envd service inspect dev1 postgres analytics
+envd service rm dev1 postgres reporting
 ```
 
 Supported service names:
@@ -216,27 +219,27 @@ Supported service names:
 Discover options and connection details:
 
 ```bash
-dev-env svc-catalog
-dev-env svc-new-custom dev1 postgres reporting
-dev-env svc-info dev1 postgres reporting
-# also works with container name from svc-list output:
-dev-env svc-info dev1 dev1-svc-postgres-reporting
+envd service catalog
+envd service create-custom dev1 postgres reporting
+envd service inspect dev1 postgres reporting
+# also works with container name from service ls output:
+envd service inspect dev1 dev1-svc-postgres-reporting
 ```
 
 To change credentials/version of an existing service, recreate it:
 
 ```bash
-dev-env svc-rm dev1 postgres reporting
-dev-env svc-new-custom dev1 postgres reporting
+envd service rm dev1 postgres reporting
+envd service create-custom dev1 postgres reporting
 ```
 
 Expose app ports to macOS on demand:
 
 ```bash
-dev-env port-open dev1 3000
+envd port open dev1 3000
 # then open http://127.0.0.1:3000 on macOS
-dev-env port-list dev1
-dev-env port-close dev1 3000
+envd port ls dev1
+envd port close dev1 3000
 ```
 
 ## 7) Persistence model
@@ -248,8 +251,8 @@ Persists:
 - Container restart on macOS reboot (`--restart unless-stopped`)
 
 Does not persist:
-- Container after `dev-env rm <name>`
-- Volumes after `dev-env rm <name>`
+- Container after `envd rm <name>`
+- Volumes after `envd rm <name>`
 
 ## 8) Security model
 
