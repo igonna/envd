@@ -166,6 +166,13 @@ dev-env stop <name>
 dev-env restart <name>
 dev-env ssh <name>
 dev-env cd <name>
+dev-env svc-start <name> <service>
+dev-env svc-start-custom <name> <service>
+dev-env svc-stop <name> <service>
+dev-env svc-rm <name> <service>
+dev-env svc-list [name]
+dev-env svc-catalog
+dev-env svc-info <name> <service>
 dev-env port-open <name> <container-port> [host-port]
 dev-env port-close <name> <container-port> [host-port]
 dev-env port-list [name]
@@ -174,6 +181,38 @@ dev-env help
 
 `dev-env start/stop/restart <name>` manage both `<name>` and `<name>-net`.
 `dev-env list` includes `STATE` as `active` or `stopped`.
+
+Service containers (share `<name>-net` namespace):
+
+```bash
+dev-env svc-start dev1 postgres
+dev-env svc-start-custom dev1 postgres
+dev-env svc-start dev1 redis
+dev-env svc-list dev1
+dev-env svc-stop dev1 redis
+dev-env svc-rm dev1 postgres
+```
+
+Supported service names:
+- `postgres`
+- `redis`
+- `mongodb` (or `mongo`)
+- `elasticsearch` (or `es`)
+
+Discover options and connection details:
+
+```bash
+dev-env svc-catalog
+dev-env svc-start-custom dev1 postgres
+dev-env svc-info dev1 postgres
+```
+
+To change credentials/version of an existing service, recreate it:
+
+```bash
+dev-env svc-rm dev1 postgres
+dev-env svc-start-custom dev1 postgres
+```
 
 Expose app ports to macOS on demand:
 
