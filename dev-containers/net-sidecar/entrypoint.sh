@@ -6,22 +6,10 @@ XRAY_PORT="${XRAY_PORT:-1080}"
 SSH_PORT="${SSH_PORT:-22}"
 TUN_IFACE="${TUN_IFACE:-tun0}"
 SINGBOX_CONFIG="/etc/sing-box/config.json"
-
-resolve_xray_ip() {
-  local ip=""
-  for _ in {1..30}; do
-    ip="$(getent hosts "$XRAY_HOST" | awk 'NR==1{print $1}')"
-    if [[ -n "$ip" ]]; then
-      echo "$ip"
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
+UPLINK_GW=""
+UPLINK_DEV=""
 
 write_config() {
-  local xray_server_ip="$1"
   mkdir -p /etc/sing-box
   cat >"$SINGBOX_CONFIG" <<EOF
 {
@@ -45,7 +33,7 @@ write_config() {
     {
       "type": "socks",
       "tag": "xray",
-      "server": "${xray_server_ip}",
+      "server": "${XRAY_HOST}",
       "server_port": ${XRAY_PORT},
       "version": "5"
     }
@@ -58,8 +46,27 @@ write_config() {
 EOF
 }
 
+detect_uplink_route() {
+  UPLINK_GW="$(ip route show default | awk 'NR==1{print $3}')"
+  UPLINK_DEV="$(ip route show default | awk 'NR==1{print $5}')"
+  if [[ -z "${UPLINK_GW}" || -z "${UPLINK_DEV}" ]]; then
+    echo "Failed to detect default route before switching to ${TUN_IFACE}" >&2
+    return 1
+  fi
+}
+
+wait_for_xray_upstream() {
+  for _ in {1..60}; do
+    if nc -z -w 2 "${XRAY_HOST}" "${XRAY_PORT}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 apply_killswitch() {
-  local xray_ip="$1"
+  local uplink_dev="$1"
 
   iptables -F
   iptables -X
@@ -78,7 +85,9 @@ apply_killswitch() {
   iptables -A INPUT -i "${TUN_IFACE}" -j ACCEPT
   iptables -A OUTPUT -o "${TUN_IFACE}" -j ACCEPT
 
-  iptables -A OUTPUT -d "${xray_ip}" -p tcp --dport "${XRAY_PORT}" -j ACCEPT
+  # Allow only upstream SOCKS connection on the pre-tunnel interface.
+  # Matching by interface+port avoids pinning to a single xray container IP.
+  iptables -A OUTPUT -o "${uplink_dev}" -p tcp --dport "${XRAY_PORT}" -j ACCEPT
 }
 
 wait_for_tun_iface() {
@@ -92,29 +101,20 @@ wait_for_tun_iface() {
 }
 
 route_default_via_tun() {
-  local xray_ip="$1"
-  local default_gw default_dev
-
-  default_gw="$(ip route show default | awk 'NR==1{print $3}')"
-  default_dev="$(ip route show default | awk 'NR==1{print $5}')"
-
-  if [[ -z "${default_gw}" || -z "${default_dev}" ]]; then
-    echo "Failed to detect default route before switching to ${TUN_IFACE}" >&2
-    return 1
-  fi
-
-  ip route replace "${xray_ip}/32" via "${default_gw}" dev "${default_dev}"
+  # Keep upstream gateway reachable outside tun and route the rest through tun.
+  ip route replace default via "${UPLINK_GW}" dev "${UPLINK_DEV}" metric 200
   ip route replace default dev "${TUN_IFACE}"
 }
 
-XRAY_IP="$(resolve_xray_ip || true)"
-if [[ -z "$XRAY_IP" ]]; then
-  echo "Failed to resolve upstream host: ${XRAY_HOST}" >&2
+detect_uplink_route || exit 1
+
+if ! wait_for_xray_upstream; then
+  echo "Upstream not reachable: ${XRAY_HOST}:${XRAY_PORT}" >&2
   exit 1
 fi
 
-write_config "$XRAY_IP"
-apply_killswitch "$XRAY_IP"
+write_config
+apply_killswitch "$UPLINK_DEV"
 
 sing-box run -c "$SINGBOX_CONFIG" &
 sb_pid=$!
@@ -126,5 +126,5 @@ wait_for_tun_iface || {
   exit 1
 }
 
-route_default_via_tun "$XRAY_IP"
+route_default_via_tun
 wait "$sb_pid"

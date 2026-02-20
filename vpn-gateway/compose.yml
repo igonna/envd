@@ -27,8 +27,22 @@ services:
       - "127.0.0.1:1081:1081"
     volumes:
       - xray_config:/etc/xray:ro
-    command: xray -config /etc/xray/config.json
-    networks: [inside, outside]
+    command: >
+      sh -lc "
+        for i in \$(seq 1 60); do
+          [ -s /etc/xray/config.json ] && break;
+          sleep 1;
+        done;
+        test -s /etc/xray/config.json &&
+        exec xray -config /etc/xray/config.json
+      "
+    networks:
+      outside:
+        priority: 1000
+        gw_priority: 1
+      inside:
+        priority: 100
+        gw_priority: 0
 
 networks:
   inside:

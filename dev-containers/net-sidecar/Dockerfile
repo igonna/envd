@@ -8,6 +8,7 @@ RUN apk add --no-cache \
     iptables \
     iproute2 \
     libc-utils \
+    netcat-openbsd \
     wget
 
 RUN set -eux; \
