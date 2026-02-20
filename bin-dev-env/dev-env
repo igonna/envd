@@ -34,13 +34,14 @@ Usage:
   dev-env stop <name>
   dev-env restart <name>
   dev-env cd <name>
-  dev-env svc-start <name> <service>
-  dev-env svc-start-custom <name> <service>
-  dev-env svc-stop <name> <service>
-  dev-env svc-rm <name> <service>
+  dev-env svc-new <name> <service> [instance]
+  dev-env svc-new-custom <name> <service> [instance]
+  dev-env svc-start <name> <service> [instance]
+  dev-env svc-stop <name> <service> [instance]
+  dev-env svc-rm <name> <service> [instance]
   dev-env svc-list [name]
   dev-env svc-catalog
-  dev-env svc-info <name> <service>
+  dev-env svc-info <name> <service> [instance]
   dev-env port-open <name> <container-port> [host-port]
   dev-env port-close <name> <container-port> [host-port]
   dev-env port-list [name]
@@ -150,12 +151,6 @@ port_forward_ids_for_env() {
     --format '{{.ID}}'
 }
 
-service_container_name() {
-  local env_name="$1" service="$2"
-  service="$(service_canonical "$service")"
-  echo "${env_name}-svc-${service}"
-}
-
 service_canonical() {
   local service="$1"
   case "$service" in
@@ -167,6 +162,39 @@ service_canonical() {
       die "Unsupported service '${service}'. Supported: postgres, redis, mongo|mongodb, elasticsearch|es"
       ;;
   esac
+}
+
+validate_service_instance() {
+  local instance="$1"
+  [[ "$instance" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die "Invalid service instance '${instance}'. Use lowercase letters, digits, hyphen (max 32 chars)."
+}
+
+service_instance_value() {
+  local instance="${1:-default}"
+  validate_service_instance "$instance"
+  echo "$instance"
+}
+
+service_container_name() {
+  local env_name="$1" service="$2" instance="${3:-default}"
+  service="$(service_canonical "$service")"
+  instance="$(service_instance_value "$instance")"
+  if [[ "$instance" == "default" ]]; then
+    echo "${env_name}-svc-${service}"
+  else
+    echo "${env_name}-svc-${service}-${instance}"
+  fi
+}
+
+service_volume_name() {
+  local env_name="$1" service="$2" instance="${3:-default}"
+  service="$(service_canonical "$service")"
+  instance="$(service_instance_value "$instance")"
+  if [[ "$instance" == "default" ]]; then
+    echo "${env_name}-svc-${service}-data"
+  else
+    echo "${env_name}-svc-${service}-${instance}-data"
+  fi
 }
 
 service_default_port() {
@@ -192,21 +220,27 @@ service_aliases() {
 }
 
 service_catalog() {
-  printf "%-14s %-20s %-6s %s\n" "SERVICE" "ALIASES" "PORT" "DEFAULTS"
-  printf "%-14s %-20s %-6s %s\n" "postgres" "postgres" "5432" "user=dev db=app pass=dev"
-  printf "%-14s %-20s %-6s %s\n" "redis" "redis" "6379" "optional password"
-  printf "%-14s %-20s %-6s %s\n" "mongo" "mongo, mongodb" "27017" "optional root auth"
-  printf "%-14s %-20s %-6s %s\n" "elasticsearch" "elasticsearch, es" "9200" "xpack.security=false"
+  printf "%-14s %-20s %-10s %s\n" "SERVICE" "ALIASES" "BASE_PORT" "DEFAULTS"
+  printf "%-14s %-20s %-10s %s\n" "postgres" "postgres" "5432" "user=dev db=app pass=dev"
+  printf "%-14s %-20s %-10s %s\n" "redis" "redis" "6379" "optional password"
+  printf "%-14s %-20s %-10s %s\n" "mongo" "mongo, mongodb" "27017" "optional root auth"
+  printf "%-14s %-20s %-10s %s\n" "elasticsearch" "elasticsearch, es" "9200" "xpack.security=false"
   cat <<'EOT'
 
-Override defaults with env vars before `svc-start`:
+Instances:
+  You can run multiple instances per service:
+    dev-env svc-new <name> <service> [instance]
+  If port is not specified, the next free port is auto-selected from BASE_PORT upward.
+
+Override defaults with env vars before `svc-new`:
+  DEV_ENV_SVC_PORT
   DEV_ENV_POSTGRES_VERSION DEV_ENV_POSTGRES_USER DEV_ENV_POSTGRES_PASSWORD DEV_ENV_POSTGRES_DB
   DEV_ENV_REDIS_VERSION DEV_ENV_REDIS_PASSWORD
   DEV_ENV_MONGO_VERSION DEV_ENV_MONGO_INITDB_ROOT_USERNAME DEV_ENV_MONGO_INITDB_ROOT_PASSWORD
   DEV_ENV_ELASTIC_VERSION DEV_ENV_ELASTIC_JAVA_OPTS
 
 Interactive setup:
-  dev-env svc-start-custom <name> <service>
+  dev-env svc-new-custom <name> <service> [instance]   (alias: svc-start-custom)
 EOT
 }
 
@@ -234,10 +268,81 @@ prompt_secret_default() {
   fi
 }
 
+docker_env_value() {
+  local container="$1" key="$2"
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+    | awk -v k="$key" '
+      index($0, k "=") == 1 { print substr($0, length(k) + 2); found=1; exit }
+      END { if (!found) exit 1 }
+    '
+}
+
+service_ids_for_env() {
+  local env_name="$1"
+  docker ps -a \
+    --filter "label=$LABEL_KEY=$LABEL_VAL" \
+    --filter "label=$ROLE_KEY=$ROLE_SVC" \
+    --filter "label=dev-env.name=$env_name" \
+    --format '{{.ID}}'
+}
+
+service_port_for_container() {
+  local svc_name="$1" service="$2"
+  local svc_port
+  svc_port="$(docker inspect -f '{{ index .Config.Labels "dev-env.port" }}' "$svc_name" 2>/dev/null || true)"
+  if [[ -z "$svc_port" ]]; then
+    svc_port="$(service_default_port "$service")"
+  fi
+  printf '%s' "$svc_port"
+}
+
+service_port_in_use() {
+  local env_name="$1" target_port="$2"
+  local svc_ids id current_port current_service
+  svc_ids="$(service_ids_for_env "$env_name")"
+  [[ -n "$svc_ids" ]] || return 1
+
+  for id in $svc_ids; do
+    current_port="$(docker inspect -f '{{ index .Config.Labels "dev-env.port" }}' "$id" 2>/dev/null || true)"
+    current_service="$(docker inspect -f '{{ index .Config.Labels "dev-env.service" }}' "$id" 2>/dev/null || true)"
+    if [[ -z "$current_port" && -n "$current_service" ]]; then
+      current_port="$(service_default_port "$current_service")"
+    fi
+    [[ "$current_port" == "$target_port" ]] && return 0
+  done
+
+  return 1
+}
+
+service_pick_port() {
+  local env_name="$1" service="$2" requested_port="${3:-}"
+  local candidate
+
+  if [[ -n "$requested_port" ]]; then
+    ensure_port_number "$requested_port" "service-port"
+    service_port_in_use "$env_name" "$requested_port" && die "Service port ${requested_port} is already in use in ${env_name}."
+    printf '%s' "$requested_port"
+    return 0
+  fi
+
+  candidate="$(service_default_port "$service")"
+  while service_port_in_use "$env_name" "$candidate"; do
+    candidate=$((candidate + 1))
+    (( candidate <= 65535 )) || die "No free service ports left for ${service} in ${env_name}."
+  done
+  printf '%s' "$candidate"
+}
+
 service_collect_custom_env() {
-  local service="$1"
+  local env_name="$1" service="$2" instance="$3"
+  local suggested_port svc_port
   service="$(service_canonical "$service")"
+  instance="$(service_instance_value "$instance")"
   SVC_CUSTOM_EXPORTS=()
+
+  suggested_port="$(service_pick_port "$env_name" "$service" "${DEV_ENV_SVC_PORT:-}")"
+  svc_port="$(prompt_default "Internal port for ${service}/${instance}" "$suggested_port")"
+  SVC_CUSTOM_EXPORTS+=("DEV_ENV_SVC_PORT=${svc_port}")
 
   case "$service" in
     postgres)
@@ -281,15 +386,6 @@ service_collect_custom_env() {
   esac
 }
 
-docker_env_value() {
-  local container="$1" key="$2"
-  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
-    | awk -v k="$key" '
-      index($0, k "=") == 1 { print substr($0, length(k) + 2); found=1; exit }
-      END { if (!found) exit 1 }
-    '
-}
-
 port_forward_host_ports_for_target() {
   local env_name="$1" target_port="$2"
   docker ps -a \
@@ -301,18 +397,19 @@ port_forward_host_ports_for_target() {
 }
 
 service_info() {
-  local env_name="$1" service="$2"
-  local canonical svc_name port status host_ports
-  local host_line
+  local env_name="$1" service="$2" instance="${3:-default}"
+  local canonical svc_name port status host_ports host_line
 
   canonical="$(service_canonical "$service")"
-  svc_name="$(service_container_name "$env_name" "$canonical")"
-  port="$(service_default_port "$canonical")"
+  instance="$(service_instance_value "$instance")"
+  svc_name="$(service_container_name "$env_name" "$canonical" "$instance")"
 
   if docker inspect "$svc_name" >/dev/null 2>&1; then
     status="$(docker inspect -f '{{.State.Status}}' "$svc_name" 2>/dev/null || echo "unknown")"
+    port="$(service_port_for_container "$svc_name" "$canonical")"
   else
     status="not-created"
+    port="$(service_default_port "$canonical")"
   fi
 
   host_ports="$(port_forward_host_ports_for_target "$env_name" "$port")"
@@ -323,6 +420,7 @@ service_info() {
   fi
 
   echo "Service: ${canonical} (requested: ${service})"
+  echo "Instance: ${instance}"
   echo "Container: ${svc_name}"
   echo "Aliases: $(service_aliases "$canonical")"
   echo "Status: ${status}"
@@ -331,13 +429,12 @@ service_info() {
 
   case "$canonical" in
     postgres)
-      local pg_user pg_pass pg_db
+      local pg_user pg_pass pg_db v
       pg_user="${DEV_ENV_POSTGRES_USER:-dev}"
       pg_pass="${DEV_ENV_POSTGRES_PASSWORD:-dev}"
       pg_db="${DEV_ENV_POSTGRES_DB:-app}"
 
       if docker inspect "$svc_name" >/dev/null 2>&1; then
-        local v
         v="$(docker_env_value "$svc_name" "POSTGRES_USER" 2>/dev/null || true)"; [[ -n "$v" ]] && pg_user="$v"
         v="$(docker_env_value "$svc_name" "POSTGRES_PASSWORD" 2>/dev/null || true)"; [[ -n "$v" ]] && pg_pass="$v"
         v="$(docker_env_value "$svc_name" "POSTGRES_DB" 2>/dev/null || true)"; [[ -n "$v" ]] && pg_db="$v"
@@ -347,10 +444,9 @@ service_info() {
       echo "URI (inside ${env_name}): postgres://${pg_user}:${pg_pass}@127.0.0.1:${port}/${pg_db}"
       ;;
     redis)
-      local redis_pass
+      local redis_pass v
       redis_pass="${DEV_ENV_REDIS_PASSWORD:-}"
       if docker inspect "$svc_name" >/dev/null 2>&1; then
-        local v
         v="$(docker_env_value "$svc_name" "REDIS_PASSWORD" 2>/dev/null || true)"; [[ -n "$v" ]] && redis_pass="$v"
       fi
       if [[ -n "$redis_pass" ]]; then
@@ -362,11 +458,10 @@ service_info() {
       fi
       ;;
     mongo)
-      local mongo_user mongo_pass
+      local mongo_user mongo_pass v
       mongo_user="${DEV_ENV_MONGO_INITDB_ROOT_USERNAME:-}"
       mongo_pass="${DEV_ENV_MONGO_INITDB_ROOT_PASSWORD:-}"
       if docker inspect "$svc_name" >/dev/null 2>&1; then
-        local v
         v="$(docker_env_value "$svc_name" "MONGO_INITDB_ROOT_USERNAME" 2>/dev/null || true)"; [[ -n "$v" ]] && mongo_user="$v"
         v="$(docker_env_value "$svc_name" "MONGO_INITDB_ROOT_PASSWORD" 2>/dev/null || true)"; [[ -n "$v" ]] && mongo_pass="$v"
       fi
@@ -385,11 +480,45 @@ service_info() {
   esac
 }
 
+service_exists() {
+  local env_name="$1" service="$2" instance="${3:-default}"
+  local svc_name
+  svc_name="$(service_container_name "$env_name" "$service" "$instance")"
+  docker inspect "$svc_name" >/dev/null 2>&1
+}
+
+service_resolve_ref() {
+  local env_name="$1" ref="$2"
+  local role resolved_env resolved_service resolved_instance
+
+  if docker inspect "$ref" >/dev/null 2>&1; then
+    role="$(docker inspect -f '{{ index .Config.Labels "dev-env.role" }}' "$ref" 2>/dev/null || true)"
+    resolved_env="$(docker inspect -f '{{ index .Config.Labels "dev-env.name" }}' "$ref" 2>/dev/null || true)"
+    resolved_service="$(docker inspect -f '{{ index .Config.Labels "dev-env.service" }}' "$ref" 2>/dev/null || true)"
+    resolved_instance="$(docker inspect -f '{{ index .Config.Labels "dev-env.instance" }}' "$ref" 2>/dev/null || true)"
+
+    [[ "$role" == "$ROLE_SVC" ]] || die "Container '${ref}' is not a managed service."
+    [[ "$resolved_env" == "$env_name" ]] || die "Service container '${ref}' belongs to env '${resolved_env}', not '${env_name}'."
+    [[ -n "$resolved_service" ]] || die "Service container '${ref}' is missing service metadata."
+    [[ -n "$resolved_instance" ]] || resolved_instance="default"
+
+    SVC_RESOLVED_SERVICE="$resolved_service"
+    SVC_RESOLVED_INSTANCE="$resolved_instance"
+    return 0
+  fi
+
+  SVC_RESOLVED_SERVICE="$(service_canonical "$ref")"
+  SVC_RESOLVED_INSTANCE="default"
+}
+
 service_spec() {
-  local env_name="$1" service="$2"
+  local env_name="$1" service="$2" instance="$3" svc_port="$4"
+  local transport_port
   service="$(service_canonical "$service")"
+  instance="$(service_instance_value "$instance")"
+  ensure_port_number "$svc_port" "service-port"
   SVC_IMAGE=""
-  SVC_VOL_NAME=""
+  SVC_VOL_NAME="$(service_volume_name "$env_name" "$service" "$instance")"
   SVC_VOL_MOUNT=""
   SVC_ENV_ARGS=()
   SVC_CMD_ARGS=()
@@ -403,22 +532,21 @@ service_spec() {
       pg_pass="${DEV_ENV_POSTGRES_PASSWORD:-dev}"
       pg_db="${DEV_ENV_POSTGRES_DB:-app}"
       SVC_IMAGE="postgres:${pg_ver}"
-      SVC_VOL_NAME="${env_name}-svc-postgres-data"
       SVC_VOL_MOUNT="/var/lib/postgresql/data"
       SVC_ENV_ARGS=(-e "POSTGRES_USER=${pg_user}" -e "POSTGRES_PASSWORD=${pg_pass}" -e "POSTGRES_DB=${pg_db}")
+      SVC_CMD_ARGS=("postgres" "-p" "$svc_port")
       ;;
     redis)
       local redis_ver redis_pass
       redis_ver="${DEV_ENV_REDIS_VERSION:-7-alpine}"
       redis_pass="${DEV_ENV_REDIS_PASSWORD:-}"
       SVC_IMAGE="redis:${redis_ver}"
-      SVC_VOL_NAME="${env_name}-svc-redis-data"
       SVC_VOL_MOUNT="/data"
       if [[ -n "$redis_pass" ]]; then
-        SVC_ENV_ARGS=(-e "REDIS_PASSWORD=${redis_pass}")
-        SVC_CMD_ARGS=("sh" "-lc" 'exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"')
+        SVC_ENV_ARGS=(-e "REDIS_PASSWORD=${redis_pass}" -e "REDIS_PORT=${svc_port}")
+        SVC_CMD_ARGS=("sh" "-lc" 'exec redis-server --appendonly yes --port "$REDIS_PORT" --requirepass "$REDIS_PASSWORD"')
       else
-        SVC_CMD_ARGS=("redis-server" "--appendonly" "yes")
+        SVC_CMD_ARGS=("redis-server" "--appendonly" "yes" "--port" "$svc_port")
       fi
       ;;
     mongo)
@@ -433,55 +561,51 @@ service_spec() {
         die "Mongo root username is required when DEV_ENV_MONGO_INITDB_ROOT_PASSWORD is set."
       fi
       SVC_IMAGE="mongo:${mongo_ver}"
-      SVC_VOL_NAME="${env_name}-svc-mongo-data"
       SVC_VOL_MOUNT="/data/db"
       if [[ -n "$mongo_user" ]]; then
         SVC_ENV_ARGS=(-e "MONGO_INITDB_ROOT_USERNAME=${mongo_user}" -e "MONGO_INITDB_ROOT_PASSWORD=${mongo_pass}")
       fi
+      SVC_CMD_ARGS=("mongod" "--bind_ip_all" "--port" "$svc_port")
       ;;
     elasticsearch)
       local es_ver es_java_opts
       es_ver="${DEV_ENV_ELASTIC_VERSION:-8.13.4}"
       es_java_opts="${DEV_ENV_ELASTIC_JAVA_OPTS:--Xms512m -Xmx512m}"
+      transport_port=$((svc_port + 100))
+      if (( transport_port > 65535 )); then
+        transport_port=$((svc_port + 1))
+      fi
+      (( transport_port <= 65535 )) || die "Could not allocate elasticsearch transport port for service-port ${svc_port}."
+
       SVC_IMAGE="docker.elastic.co/elasticsearch/elasticsearch:${es_ver}"
-      SVC_VOL_NAME="${env_name}-svc-elasticsearch-data"
       SVC_VOL_MOUNT="/usr/share/elasticsearch/data"
-      SVC_ENV_ARGS=(-e "discovery.type=single-node" -e "xpack.security.enabled=false" -e "ES_JAVA_OPTS=${es_java_opts}")
+      SVC_ENV_ARGS=(-e "discovery.type=single-node" -e "xpack.security.enabled=false" -e "ES_JAVA_OPTS=${es_java_opts}" -e "http.port=${svc_port}" -e "transport.port=${transport_port}")
       SVC_RUN_ARGS=(--ulimit "memlock=-1:-1")
       ;;
   esac
 }
 
-service_ids_for_env() {
-  local env_name="$1"
-  docker ps -a \
-    --filter "label=$LABEL_KEY=$LABEL_VAL" \
-    --filter "label=$ROLE_KEY=$ROLE_SVC" \
-    --filter "label=dev-env.name=$env_name" \
-    --format '{{.ID}}'
-}
-
 service_ensure_volume() {
-  local env_name="$1" service="$2"
+  local env_name="$1" service="$2" instance="$3"
   service="$(service_canonical "$service")"
-  service_spec "$env_name" "$service"
-  if [[ -n "$SVC_VOL_NAME" ]]; then
-    docker volume inspect "$SVC_VOL_NAME" >/dev/null 2>&1 || \
-      docker volume create \
-        --label "$LABEL_KEY=$LABEL_VAL" \
-        --label "$ROLE_KEY=$ROLE_SVC" \
-        --label "dev-env.name=$env_name" \
-        --label "dev-env.service=$service" \
-        "$SVC_VOL_NAME" >/dev/null
-  fi
+  instance="$(service_instance_value "$instance")"
+  SVC_VOL_NAME="$(service_volume_name "$env_name" "$service" "$instance")"
+  docker volume inspect "$SVC_VOL_NAME" >/dev/null 2>&1 || \
+    docker volume create \
+      --label "$LABEL_KEY=$LABEL_VAL" \
+      --label "$ROLE_KEY=$ROLE_SVC" \
+      --label "dev-env.name=$env_name" \
+      --label "dev-env.service=$service" \
+      --label "dev-env.instance=$instance" \
+      "$SVC_VOL_NAME" >/dev/null
 }
 
 service_start_one() {
-  local env_name="$1" service="$2"
+  local env_name="$1" service="$2" instance="${3:-default}" requested_port="${4:-}"
+  local svc_name svc_port
   service="$(service_canonical "$service")"
-  local svc_name
-  svc_name="$(service_container_name "$env_name" "$service")"
-  service_spec "$env_name" "$service"
+  instance="$(service_instance_value "$instance")"
+  svc_name="$(service_container_name "$env_name" "$service" "$instance")"
 
   docker inspect "${env_name}-net" >/dev/null 2>&1 || die "No such sidecar: ${env_name}-net"
   docker start "${env_name}-net" >/dev/null 2>&1 || true
@@ -489,10 +613,14 @@ service_start_one() {
 
   if docker inspect "$svc_name" >/dev/null 2>&1; then
     docker start "$svc_name" >/dev/null 2>&1 || true
+    SVC_LAST_ACTION="started"
+    SVC_LAST_PORT="$(service_port_for_container "$svc_name" "$service")"
     return 0
   fi
 
-  service_ensure_volume "$env_name" "$service"
+  svc_port="$(service_pick_port "$env_name" "$service" "$requested_port")"
+  service_spec "$env_name" "$service" "$instance" "$svc_port"
+  service_ensure_volume "$env_name" "$service" "$instance"
 
   local vol_args=()
   if [[ -n "$SVC_VOL_NAME" && -n "$SVC_VOL_MOUNT" ]]; then
@@ -506,6 +634,8 @@ service_start_one() {
     --label "$ROLE_KEY=$ROLE_SVC"
     --label "dev-env.name=$env_name"
     --label "dev-env.service=$service"
+    --label "dev-env.instance=$instance"
+    --label "dev-env.port=$svc_port"
     --restart unless-stopped
     --network "container:${env_name}-net"
   )
@@ -524,29 +654,31 @@ service_start_one() {
   fi
 
   docker run "${docker_args[@]}" >/dev/null
+  SVC_LAST_ACTION="created"
+  SVC_LAST_PORT="$svc_port"
 }
 
 service_stop_one() {
-  local env_name="$1" service="$2"
-  service="$(service_canonical "$service")"
+  local env_name="$1" service="$2" instance="${3:-default}"
   local svc_name
-  svc_name="$(service_container_name "$env_name" "$service")"
+  service="$(service_canonical "$service")"
+  instance="$(service_instance_value "$instance")"
+  svc_name="$(service_container_name "$env_name" "$service" "$instance")"
   docker inspect "$svc_name" >/dev/null 2>&1 || die "No such service container: $svc_name"
   docker stop "$svc_name" >/dev/null 2>&1 || true
 }
 
 service_rm_one() {
-  local env_name="$1" service="$2"
+  local env_name="$1" service="$2" instance="${3:-default}"
+  local svc_name svc_vol_name
   service="$(service_canonical "$service")"
-  local svc_name
-  svc_name="$(service_container_name "$env_name" "$service")"
-  service_spec "$env_name" "$service"
+  instance="$(service_instance_value "$instance")"
+  svc_name="$(service_container_name "$env_name" "$service" "$instance")"
+  svc_vol_name="$(service_volume_name "$env_name" "$service" "$instance")"
 
   docker inspect "$svc_name" >/dev/null 2>&1 || die "No such service container: $svc_name"
   docker rm -f "$svc_name" >/dev/null
-  if [[ -n "$SVC_VOL_NAME" ]]; then
-    docker volume rm "$SVC_VOL_NAME" >/dev/null 2>&1 || true
-  fi
+  docker volume rm "$svc_vol_name" >/dev/null 2>&1 || true
 }
 
 service_start_all_for_env() {
@@ -901,76 +1033,108 @@ case "$cmd" in
     exec docker exec -it -u "$name" "$name" bash -lc 'cd /repo && exec bash'
     ;;
 
-  svc-start)
-    [[ $# -ne 3 ]] && die "Usage: dev-env svc-start <name> <service>"
+  svc-new|svc-start)
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env svc-new <name> <service> [instance]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
-    service_start_one "$name" "$3"
-    echo "Service started: ${name}/$3"
+    svc_service="$(service_canonical "$3")"
+    svc_instance="$(service_instance_value "${4:-default}")"
+    service_start_one "$name" "$svc_service" "$svc_instance" "${DEV_ENV_SVC_PORT:-}"
+    echo "Service ${SVC_LAST_ACTION}: ${name}/${svc_service}/${svc_instance} (port ${SVC_LAST_PORT})"
+    if [[ "$cmd" == "svc-start" ]]; then
+      echo "  Note: svc-start is an alias of svc-new."
+    fi
     ;;
 
-  svc-start-custom)
-    [[ $# -ne 3 ]] && die "Usage: dev-env svc-start-custom <name> <service>"
+  svc-new-custom|svc-start-custom)
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env svc-new-custom <name> <service> [instance]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
-    [[ -t 0 ]] || die "svc-start-custom requires an interactive terminal."
-    svc_name="$(service_container_name "$name" "$3")"
-    if docker inspect "$svc_name" >/dev/null 2>&1; then
-      die "Service already exists: ${svc_name}. Recreate it to change config: dev-env svc-rm ${name} $3 && dev-env svc-start-custom ${name} $3"
+    [[ -t 0 ]] || die "svc-new-custom requires an interactive terminal."
+    svc_service="$(service_canonical "$3")"
+    svc_instance="$(service_instance_value "${4:-default}")"
+    if service_exists "$name" "$svc_service" "$svc_instance"; then
+      svc_name="$(service_container_name "$name" "$svc_service" "$svc_instance")"
+      die "Service already exists: ${svc_name}. Recreate it to change config: dev-env svc-rm ${name} ${svc_service} ${svc_instance} && dev-env svc-new-custom ${name} ${svc_service} ${svc_instance}"
     fi
-    service_collect_custom_env "$3"
+    service_collect_custom_env "$name" "$svc_service" "$svc_instance"
     (
       for kv in "${SVC_CUSTOM_EXPORTS[@]}"; do
         export "$kv"
       done
-      service_start_one "$name" "$3"
+      service_start_one "$name" "$svc_service" "$svc_instance" "${DEV_ENV_SVC_PORT:-}"
     )
-    echo "Service started with custom config: ${name}/$3"
-    service_info "$name" "$3"
+    echo "Service created with custom config: ${name}/${svc_service}/${svc_instance}"
+    service_info "$name" "$svc_service" "$svc_instance"
+    if [[ "$cmd" == "svc-start-custom" ]]; then
+      echo "  Note: svc-start-custom is an alias of svc-new-custom."
+    fi
     ;;
 
   svc-stop)
-    [[ $# -ne 3 ]] && die "Usage: dev-env svc-stop <name> <service>"
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env svc-stop <name> <service> [instance]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
-    service_stop_one "$name" "$3"
-    echo "Service stopped: ${name}/$3"
+    svc_service="$(service_canonical "$3")"
+    svc_instance="$(service_instance_value "${4:-default}")"
+    service_stop_one "$name" "$svc_service" "$svc_instance"
+    echo "Service stopped: ${name}/${svc_service}/${svc_instance}"
     ;;
 
   svc-rm)
-    [[ $# -ne 3 ]] && die "Usage: dev-env svc-rm <name> <service>"
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env svc-rm <name> <service> [instance]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
-    service_rm_one "$name" "$3"
-    echo "Service removed: ${name}/$3"
+    svc_service="$(service_canonical "$3")"
+    svc_instance="$(service_instance_value "${4:-default}")"
+    service_rm_one "$name" "$svc_service" "$svc_instance"
+    echo "Service removed: ${name}/${svc_service}/${svc_instance}"
     ;;
 
   svc-list)
     if [[ $# -gt 2 ]]; then
       die "Usage: dev-env svc-list [name]"
     fi
-    echo -e "NAME\tSTATE\tSTATUS\tENV\tSERVICE\tIMAGE"
+    echo -e "NAME\tSTATE\tSTATUS\tENV\tSERVICE\tINSTANCE\tPORT\tIMAGE"
     if [[ $# -eq 2 ]]; then
       validate_name_and_user "$name"
       docker ps -a \
         --filter "label=$LABEL_KEY=$LABEL_VAL" \
         --filter "label=$ROLE_KEY=$ROLE_SVC" \
         --filter "label=dev-env.name=$name" \
-        --format "{{.Names}}\t{{.Status}}\t{{.Label \"dev-env.name\"}}\t{{.Label \"dev-env.service\"}}\t{{.Image}}" \
+        --format "{{.Names}}\t{{.Status}}\t{{.Label \"dev-env.name\"}}\t{{.Label \"dev-env.service\"}}\t{{.Label \"dev-env.instance\"}}\t{{.Label \"dev-env.port\"}}\t{{.Image}}" \
         | awk -F '\t' 'BEGIN{OFS="\t"} {
             state = "stopped";
             if ($2 ~ /^Up( |$)/ || $2 ~ /^Restarting( |$)/) state = "active";
-            print $1, state, $2, $3, $4, $5
+            instance = $5;
+            if (instance == "") instance = "default";
+            port = $6;
+            if (port == "") {
+              if ($4 == "postgres") port = "5432";
+              else if ($4 == "redis") port = "6379";
+              else if ($4 == "mongo") port = "27017";
+              else if ($4 == "elasticsearch") port = "9200";
+            }
+            print $1, state, $2, $3, $4, instance, port, $7
           }'
     else
       docker ps -a \
         --filter "label=$LABEL_KEY=$LABEL_VAL" \
         --filter "label=$ROLE_KEY=$ROLE_SVC" \
-        --format "{{.Names}}\t{{.Status}}\t{{.Label \"dev-env.name\"}}\t{{.Label \"dev-env.service\"}}\t{{.Image}}" \
+        --format "{{.Names}}\t{{.Status}}\t{{.Label \"dev-env.name\"}}\t{{.Label \"dev-env.service\"}}\t{{.Label \"dev-env.instance\"}}\t{{.Label \"dev-env.port\"}}\t{{.Image}}" \
         | awk -F '\t' 'BEGIN{OFS="\t"} {
             state = "stopped";
             if ($2 ~ /^Up( |$)/ || $2 ~ /^Restarting( |$)/) state = "active";
-            print $1, state, $2, $3, $4, $5
+            instance = $5;
+            if (instance == "") instance = "default";
+            port = $6;
+            if (port == "") {
+              if ($4 == "postgres") port = "5432";
+              else if ($4 == "redis") port = "6379";
+              else if ($4 == "mongo") port = "27017";
+              else if ($4 == "elasticsearch") port = "9200";
+            }
+            print $1, state, $2, $3, $4, instance, port, $7
           }'
     fi
     ;;
@@ -981,10 +1145,18 @@ case "$cmd" in
     ;;
 
   svc-info)
-    [[ $# -ne 3 ]] && die "Usage: dev-env svc-info <name> <service>"
+    [[ $# -lt 3 || $# -gt 4 ]] && die "Usage: dev-env svc-info <name> <service> [instance]"
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
-    service_info "$name" "$3"
+    if [[ $# -eq 4 ]]; then
+      svc_service="$(service_canonical "$3")"
+      svc_instance="$(service_instance_value "$4")"
+    else
+      service_resolve_ref "$name" "$3"
+      svc_service="$SVC_RESOLVED_SERVICE"
+      svc_instance="$SVC_RESOLVED_INSTANCE"
+    fi
+    service_info "$name" "$svc_service" "$svc_instance"
     ;;
 
   port-open)

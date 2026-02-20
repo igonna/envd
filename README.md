@@ -166,13 +166,14 @@ dev-env stop <name>
 dev-env restart <name>
 dev-env ssh <name>
 dev-env cd <name>
-dev-env svc-start <name> <service>
-dev-env svc-start-custom <name> <service>
-dev-env svc-stop <name> <service>
-dev-env svc-rm <name> <service>
+dev-env svc-new <name> <service> [instance]
+dev-env svc-new-custom <name> <service> [instance]
+dev-env svc-start <name> <service> [instance]
+dev-env svc-stop <name> <service> [instance]
+dev-env svc-rm <name> <service> [instance]
 dev-env svc-list [name]
 dev-env svc-catalog
-dev-env svc-info <name> <service>
+dev-env svc-info <name> <service> [instance]
 dev-env port-open <name> <container-port> [host-port]
 dev-env port-close <name> <container-port> [host-port]
 dev-env port-list [name]
@@ -181,16 +182,22 @@ dev-env help
 
 `dev-env start/stop/restart <name>` manage both `<name>` and `<name>-net`.
 `dev-env list` includes `STATE` as `active` or `stopped`.
+For services, most workflows only need:
+- `svc-new` (create-or-start)
+- `svc-rm` (remove instance + its data volume)
+
+Use `[instance]` to run multiple services of the same type in one dev environment.
+`svc-start` and `svc-start-custom` are compatibility aliases.
 
 Service containers (share `<name>-net` namespace):
 
 ```bash
-dev-env svc-start dev1 postgres
-dev-env svc-start-custom dev1 postgres
-dev-env svc-start dev1 redis
+dev-env svc-new dev1 postgres main
+dev-env svc-new dev1 postgres analytics
+DEV_ENV_SVC_PORT=5544 DEV_ENV_POSTGRES_USER=reporter DEV_ENV_POSTGRES_PASSWORD=reportpw DEV_ENV_POSTGRES_DB=reports dev-env svc-new dev1 postgres reporting
 dev-env svc-list dev1
-dev-env svc-stop dev1 redis
-dev-env svc-rm dev1 postgres
+dev-env svc-info dev1 postgres analytics
+dev-env svc-rm dev1 postgres reporting
 ```
 
 Supported service names:
@@ -203,15 +210,17 @@ Discover options and connection details:
 
 ```bash
 dev-env svc-catalog
-dev-env svc-start-custom dev1 postgres
-dev-env svc-info dev1 postgres
+dev-env svc-new-custom dev1 postgres reporting
+dev-env svc-info dev1 postgres reporting
+# also works with container name from svc-list output:
+dev-env svc-info dev1 dev1-svc-postgres-reporting
 ```
 
 To change credentials/version of an existing service, recreate it:
 
 ```bash
-dev-env svc-rm dev1 postgres
-dev-env svc-start-custom dev1 postgres
+dev-env svc-rm dev1 postgres reporting
+dev-env svc-new-custom dev1 postgres reporting
 ```
 
 Expose app ports to macOS on demand:
