@@ -113,6 +113,7 @@ This creates:
 - Repo path mapping: `/repo` symlink to `/home/dev1/repo` (for better tool compatibility)
 - Local SSH port mapping on `dev1-net`
 - SSH config entry for `dev1`
+- Git identity auto-propagated from host global Git config (if set)
 
 Connect:
 

@@ -63,6 +63,14 @@ ensure_ssh_key() {
   fi
 }
 
+set_container_git_identity() {
+  local container="$1" user="$2" n="$3" e="$4"
+  [[ -n "$n" ]] || return 0
+  [[ -n "$e" ]] || return 0
+  docker exec -u "$user" "$container" git config --global user.name "$n" >/dev/null
+  docker exec -u "$user" "$container" git config --global user.email "$e" >/dev/null
+}
+
 ensure_network_and_image() {
   docker network inspect "$NETWORK" >/dev/null 2>&1 || die "Network '$NETWORK' not found. Start vpn-gateway first."
   docker image inspect "$IMAGE" >/dev/null 2>&1 || die "Image '$IMAGE' not found. Build it first: docker build -t $IMAGE <path>"
@@ -196,6 +204,8 @@ case "$cmd" in
 
     USER_NAME="$name"
     NET_NAME="${name}-net"
+    HOST_GIT_NAME="$(git config --global --get user.name 2>/dev/null || true)"
+    HOST_GIT_EMAIL="$(git config --global --get user.email 2>/dev/null || true)"
     PORT="$(pick_port)" || die "No free port in ${PORT_BASE}-${PORT_MAX}"
 
     HOME_VOL="${name}-home"
@@ -266,6 +276,7 @@ case "$cmd" in
     docker cp "$KEY_PUB" "${name}:/home/${USER_NAME}/.ssh/authorized_keys"
     docker exec -u root "$name" bash -lc "chown ${USER_NAME}:${USER_NAME} /home/${USER_NAME}/.ssh/authorized_keys && chmod 600 /home/${USER_NAME}/.ssh/authorized_keys" >/dev/null
 
+    set_container_git_identity "$name" "$USER_NAME" "$HOST_GIT_NAME" "$HOST_GIT_EMAIL"
     set_ssh_config_host "$name" "$PORT" "$USER_NAME"
     trap - EXIT
 
@@ -275,6 +286,11 @@ case "$cmd" in
     echo "  SSH: dev-env ssh $name   (or: ssh $name)"
     echo "  Repo: /repo -> ${REPO_MOUNT} (volume: ${REPO_VOL})"
     echo "  Home: /home/${USER_NAME} (volume: ${HOME_VOL})"
+    if [[ -n "$HOST_GIT_NAME" && -n "$HOST_GIT_EMAIL" ]]; then
+      echo "  Git identity: ${HOST_GIT_NAME} <${HOST_GIT_EMAIL}>"
+    else
+      echo "  Git identity: not set on host (run: git config --global user.name/user.email)"
+    fi
     echo "  Port: 127.0.0.1:${PORT}"
     ;;
 
