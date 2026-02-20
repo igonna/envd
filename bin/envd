@@ -1069,13 +1069,13 @@ case "$cmd" in
     validate_name_and_user "$name"
     docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
     if [[ $# -eq 2 ]]; then
-      exec docker exec -it -u "$name" "$name" bash -lc 'cd /repo && exec bash'
+      exec env DOCKER_CLI_HINTS=false docker exec -it -u "$name" "$name" bash -lc 'cd /repo && exec bash'
     fi
     shift 2
     if [[ -t 0 && -t 1 ]]; then
-      exec docker exec -it -u "$name" "$name" bash -lc 'cd /repo && exec "$@"' bash "$@"
+      exec env DOCKER_CLI_HINTS=false docker exec -it -u "$name" "$name" bash -lc 'cd /repo && exec "$@"' bash "$@"
     else
-      exec docker exec -i -u "$name" "$name" bash -lc 'cd /repo && exec "$@"' bash "$@"
+      exec env DOCKER_CLI_HINTS=false docker exec -i -u "$name" "$name" bash -lc 'cd /repo && exec "$@"' bash "$@"
     fi
     ;;
 
