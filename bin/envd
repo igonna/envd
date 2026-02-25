@@ -40,6 +40,9 @@ Management Commands:
   exec <name> [cmd...]         Run command / open shell in environment
   doctor [name]                Check environment health and VPN routing
 
+Key Commands:
+  key sync <name> [key-path]   Refresh GitHub SSH key inside environment
+
 Service Commands:
   service ls [env]                             List services
   service catalog                              List available service types
@@ -56,7 +59,7 @@ Port Commands:
   port open <env> <container-port> [host-port] Open/map a port
   port close <env> <container-port> [host-port] Close/unmap a port
 
-Legacy aliases still supported: list/new/ssh/cd/svc-*/port-*
+Legacy aliases still supported: list/new/ssh/cd/sync-key/refresh-key/svc-*/port-*
 
 Naming rule (enforced):
 - <name> is also the Linux username inside the container.
@@ -88,6 +91,17 @@ normalize_cli_args() {
       ;;
     run)
       NORMALIZED_ARGS=(new "${NORMALIZED_ARGS[@]:1}")
+      ;;
+    sync-key|refresh-key)
+      NORMALIZED_ARGS=(key-sync "${NORMALIZED_ARGS[@]:1}")
+      ;;
+    key)
+      sub="${NORMALIZED_ARGS[1]:-}"
+      case "$sub" in
+        sync|refresh) NORMALIZED_ARGS=(key-sync "${NORMALIZED_ARGS[@]:2}") ;;
+        help|-h|--help|"") NORMALIZED_ARGS=(help) ;;
+        *) die "Unknown key subcommand: ${sub}. Use: ${CLI_NAME} key sync <name> [key-path]" ;;
+      esac
       ;;
     service)
       sub="${NORMALIZED_ARGS[1]:-}"
@@ -207,6 +221,11 @@ if [[ -f /home/${user}/.ssh/github_key.pub ]]; then
   chown ${user}:${user} /home/${user}/.ssh/github_key.pub
   chmod 644 /home/${user}/.ssh/github_key.pub
 fi"
+}
+
+ensure_env_ssh_dir() {
+  local container="$1" user="$2"
+  docker exec -u root "$container" bash -lc "mkdir -p /home/${user}/.ssh && chmod 700 /home/${user}/.ssh && chown -R ${user}:${user} /home/${user}/.ssh" >/dev/null
 }
 
 resolve_automations_dir() {
@@ -1157,7 +1176,7 @@ case "$cmd" in
     done
     nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1 || die "SSH port ${PORT} did not open for '$name'."
 
-    docker exec -u root "$name" bash -lc "mkdir -p /home/${USER_NAME}/.ssh && chmod 700 /home/${USER_NAME}/.ssh && chown -R ${USER_NAME}:${USER_NAME} /home/${USER_NAME}/.ssh" >/dev/null
+    ensure_env_ssh_dir "$name" "$USER_NAME"
     docker cp "$KEY_PUB" "${name}:/home/${USER_NAME}/.ssh/authorized_keys"
     docker exec -u root "$name" bash -lc "chown ${USER_NAME}:${USER_NAME} /home/${USER_NAME}/.ssh/authorized_keys && chmod 600 /home/${USER_NAME}/.ssh/authorized_keys" >/dev/null
 
@@ -1562,6 +1581,27 @@ case "$cmd" in
     if (( DOCTOR_FAIL_COUNT > 0 )); then
       exit 1
     fi
+    ;;
+
+  key-sync)
+    [[ $# -lt 2 || $# -gt 3 ]] && die "Usage: ${CLI_NAME} key sync <name> [key-path]"
+    validate_name_and_user "$name"
+    docker inspect "$name" >/dev/null 2>&1 || die "No such container: $name"
+    env_state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+    [[ "$env_state" == "running" ]] || die "Environment '$name' is not running. Start it first: ${CLI_NAME} start ${name}"
+
+    if [[ $# -eq 3 ]]; then
+      key_input="$3"
+      host_key_path="$(expand_home_path "$key_input")"
+      [[ -f "$host_key_path" ]] || die "Key file not found: ${key_input}"
+    else
+      host_key_path="$(resolve_github_key_path || true)"
+      [[ -n "$host_key_path" ]] || die "Could not resolve GitHub key from host. Set ENVD_GITHUB_KEY=/path/to/key or pass key-path."
+    fi
+
+    ensure_env_ssh_dir "$name" "$name"
+    install_github_key_in_env "$name" "$name" "$host_key_path"
+    echo "GitHub key synced for ${name}: ${host_key_path} -> /home/${name}/.ssh/github_key"
     ;;
 
   svc-new|svc-start)

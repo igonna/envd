@@ -128,6 +128,8 @@ GitHub SSH key controls:
 - Default: enabled (`ENVD_COPY_GITHUB_KEY=1`) and auto-detects from `ssh -G github.com` identity files
 - Disable per creation: `ENVD_COPY_GITHUB_KEY=0 envd run dev1`
 - Force specific key path: `ENVD_GITHUB_KEY=~/.ssh/github_key envd run dev1`
+- Refresh for an existing environment: `envd key sync dev1`
+- Refresh using a specific key file: `envd key sync dev1 ~/.ssh/another_github_key`
 
 Run mounted automation scripts inside container:
 
@@ -185,6 +187,9 @@ Management Commands:
   restore <name> <archive>     Restore environment volumes
   exec <name> [cmd...]         Run command / open shell in environment
 
+Key Commands:
+  key sync <name> [key-path]   Refresh GitHub SSH key inside environment
+
 Service Commands:
   service ls [env]                             List services
   service catalog                              List available service types
@@ -205,7 +210,7 @@ Port Commands:
 `envd ps` includes `STATE` as `active` or `stopped`.
 For services, most workflows only need `service create` and `service rm`.
 Use `[instance]` to run multiple services of the same type in one environment.
-Legacy aliases still work (`list/new/ssh/cd/svc-*/port-*`).
+Legacy aliases still work (`list/new/ssh/cd/sync-key/refresh-key/svc-*/port-*`).
 
 Service containers (share `<name>-net` namespace):
 
