@@ -131,6 +131,84 @@ ensure_ssh_key() {
   fi
 }
 
+expand_home_path() {
+  local p="$1"
+  if [[ "$p" == "~" ]]; then
+    printf '%s' "$HOME"
+  elif [[ "$p" == "~/"* ]]; then
+    printf '%s/%s' "$HOME" "${p#~/}"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+resolve_github_key_path() {
+  local cand
+  if [[ "${ENVD_COPY_GITHUB_KEY:-1}" == "0" ]]; then
+    return 1
+  fi
+
+  if [[ -n "${ENVD_GITHUB_KEY:-}" ]]; then
+    cand="$(expand_home_path "${ENVD_GITHUB_KEY}")"
+    [[ -f "$cand" ]] || die "ENVD_GITHUB_KEY file not found: ${ENVD_GITHUB_KEY}"
+    printf '%s' "$cand"
+    return 0
+  fi
+
+  while IFS= read -r cand; do
+    cand="$(expand_home_path "$cand")"
+    if [[ -f "$cand" ]]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done < <(ssh -G github.com 2>/dev/null | awk '/^identityfile / {print $2}')
+
+  for cand in "${HOME}/.ssh/github_key" "${HOME}/.ssh/id_ed25519"; do
+    if [[ -f "$cand" ]]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+install_github_key_in_env() {
+  local container="$1" user="$2" host_key="$3" host_key_pub
+  host_key_pub="${host_key}.pub"
+
+  docker cp "$host_key" "${container}:/home/${user}/.ssh/github_key"
+  if [[ -f "$host_key_pub" ]]; then
+    docker cp "$host_key_pub" "${container}:/home/${user}/.ssh/github_key.pub"
+  fi
+
+  docker exec -u root "$container" bash -lc "cfg=/home/${user}/.ssh/config
+touch \"\$cfg\"
+chmod 600 \"\$cfg\"
+awk '
+BEGIN{skip=0}
+/^# >>> envd github >>>$/ {skip=1; next}
+/^# <<< envd github <<<$/{skip=0; next}
+skip==0 {print}
+' \"\$cfg\" > \"\${cfg}.tmp\"
+mv \"\${cfg}.tmp\" \"\$cfg\"
+cat >>\"\$cfg\" <<'EOF'
+# >>> envd github >>>
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/github_key
+  IdentitiesOnly yes
+# <<< envd github <<<
+EOF
+chown ${user}:${user} /home/${user}/.ssh/config /home/${user}/.ssh/github_key 2>/dev/null || true
+chmod 600 /home/${user}/.ssh/config /home/${user}/.ssh/github_key
+if [[ -f /home/${user}/.ssh/github_key.pub ]]; then
+  chown ${user}:${user} /home/${user}/.ssh/github_key.pub
+  chmod 644 /home/${user}/.ssh/github_key.pub
+fi"
+}
+
 resolve_automations_dir() {
   local d repo_dir
   if [[ -n "${ENVD_AUTOMATIONS_DIR:-}" ]]; then
@@ -1083,6 +1161,13 @@ case "$cmd" in
     docker cp "$KEY_PUB" "${name}:/home/${USER_NAME}/.ssh/authorized_keys"
     docker exec -u root "$name" bash -lc "chown ${USER_NAME}:${USER_NAME} /home/${USER_NAME}/.ssh/authorized_keys && chmod 600 /home/${USER_NAME}/.ssh/authorized_keys" >/dev/null
 
+    GITHUB_KEY_PATH="$(resolve_github_key_path || true)"
+    GITHUB_KEY_COPIED="false"
+    if [[ -n "$GITHUB_KEY_PATH" ]]; then
+      install_github_key_in_env "$name" "$USER_NAME" "$GITHUB_KEY_PATH"
+      GITHUB_KEY_COPIED="true"
+    fi
+
     set_ssh_config_host "$name" "$PORT" "$USER_NAME"
     trap - EXIT
 
@@ -1109,6 +1194,13 @@ case "$cmd" in
       echo "  Git identity: ${HOST_GIT_NAME} <${HOST_GIT_EMAIL}>"
     else
       echo "  Git identity: not set on host (run: git config --global user.name/user.email)"
+    fi
+    if [[ "$GITHUB_KEY_COPIED" == "true" ]]; then
+      echo "  GitHub key: copied from host (${GITHUB_KEY_PATH}) to /home/${USER_NAME}/.ssh/github_key"
+    elif [[ "${ENVD_COPY_GITHUB_KEY:-1}" == "0" ]]; then
+      echo "  GitHub key: disabled (ENVD_COPY_GITHUB_KEY=0)"
+    else
+      echo "  GitHub key: not copied (set ENVD_GITHUB_KEY=/path/to/key to force)"
     fi
     echo "  Port: 127.0.0.1:${PORT}"
     ;;

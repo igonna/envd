@@ -115,6 +115,7 @@ This creates:
 - Local SSH port mapping on `dev1-net`
 - SSH config entry for `dev1`
 - Git identity auto-propagated from host global Git config (if set)
+- GitHub SSH key auto-copied from host into container `~/.ssh/github_key` (if detected)
 - Automations mount (read-only): `dev-containers/automations` -> `/automations`
 - Docker socket mount (if found): host socket -> `/var/run/docker.sock` (for Docker CLI access)
 
@@ -122,6 +123,11 @@ Docker daemon access controls:
 - Default: enabled (auto-detects socket from `/var/run/docker.sock` or `~/.docker/run/docker.sock`)
 - Disable per creation: `ENVD_DOCKER_ACCESS=0 envd run dev1`
 - Force specific socket path: `ENVD_DOCKER_SOCK=/path/to/docker.sock envd run dev1`
+
+GitHub SSH key controls:
+- Default: enabled (`ENVD_COPY_GITHUB_KEY=1`) and auto-detects from `ssh -G github.com` identity files
+- Disable per creation: `ENVD_COPY_GITHUB_KEY=0 envd run dev1`
+- Force specific key path: `ENVD_GITHUB_KEY=~/.ssh/github_key envd run dev1`
 
 Run mounted automation scripts inside container:
 
