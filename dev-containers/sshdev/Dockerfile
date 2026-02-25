@@ -10,6 +10,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && mkdir -p /var/run/sshd \
   && ssh-keygen -A
 
+# Install Docker Compose v2 CLI plugin (aarch64) system-wide
+RUN mkdir -p /usr/local/lib/docker/cli-plugins \
+ && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
+    https://github.com/docker/compose/releases/download/v2.27.1/docker-compose-linux-aarch64 \
+ && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
 # Enable colored prompt
 RUN sed -i 's/^#force_color_prompt=yes/force_color_prompt=yes/' /etc/skel/.bashrc
 
