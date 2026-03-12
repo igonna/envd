@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-if ! node -v 2>/dev/null | grep -q '^v20'; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-  sudo apt-get install -y nodejs
+export NVM_DIR="$HOME/.nvm"
+
+if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/master/install.sh | bash
 fi
 
-sudo npm install -g @openai/codex
+# load nvm in this shell
+. "$NVM_DIR/nvm.sh"
+
+# install/use Node 20 for this user
+nvm install 20
+nvm use 20
+
+# install Codex globally for this user, not system-wide
+npm install -g @openai/codex
 
 codex --version
 
