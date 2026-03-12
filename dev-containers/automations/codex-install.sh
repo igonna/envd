@@ -23,5 +23,10 @@ echo
 echo "Run outside container:"
 echo "ssh -L 1455:localhost:1455 $(whoami)"
 echo
+echo "Run in current shell (activate nvm):"
+echo 'export NVM_DIR="$HOME/.nvm"'
+echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+echo 'nvm use 20'
+echo
 echo "Then run:"
 echo "codex login"

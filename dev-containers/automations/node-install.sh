@@ -16,3 +16,9 @@ nvm use 20
 
 node -v
 npm -v
+
+echo
+echo "Run in current shell (activate nvm):"
+echo 'export NVM_DIR="${XDG_CONFIG_HOME:-$HOME/.nvm}"'
+echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"'
+echo 'nvm use 20'
