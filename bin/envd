@@ -300,6 +300,16 @@ resolve_docker_socket() {
   return 1
 }
 
+resolve_dev_security_opt() {
+  local security_opt="${ENVD_DEV_SECURITY_OPT:-seccomp=unconfined}"
+  if [[ -z "$security_opt" || "$security_opt" == "none" ]]; then
+    return 1
+  fi
+
+  printf '%s' "$security_opt"
+  return 0
+}
+
 ensure_network_and_image() {
   docker network inspect "$NETWORK" >/dev/null 2>&1 || die "Network '$NETWORK' not found. Start vpn-gateway first."
   docker image inspect "$IMAGE" >/dev/null 2>&1 || die "Image '$IMAGE' not found. Build it first: docker build -t $IMAGE <path>"
@@ -1145,6 +1155,8 @@ case "$cmd" in
       fi
     fi
 
+    DEV_SECURITY_OPT="$(resolve_dev_security_opt || true)"
+
     DEV_RUN_ARGS=(
       -d
       --name "$name"
@@ -1159,6 +1171,9 @@ case "$cmd" in
       -v "${HOME_VOL}:/home/${USER_NAME}"
       -v "${REPO_VOL}:${REPO_MOUNT}"
     )
+    if [[ -n "$DEV_SECURITY_OPT" ]]; then
+      DEV_RUN_ARGS+=(--security-opt "$DEV_SECURITY_OPT")
+    fi
     if [[ ${#AUTOMATIONS_ARGS[@]} -gt 0 ]]; then
       DEV_RUN_ARGS+=("${AUTOMATIONS_ARGS[@]}")
     fi
@@ -1208,6 +1223,9 @@ case "$cmd" in
       echo "  Docker socket: ${DOCKER_SOCK_HOST} -> /var/run/docker.sock"
     else
       echo "  Docker socket: not mounted (socket not found; set ENVD_DOCKER_SOCK if needed)"
+    fi
+    if [[ -n "$DEV_SECURITY_OPT" ]]; then
+      echo "  Security profile: --security-opt ${DEV_SECURITY_OPT}"
     fi
     if [[ -n "$HOST_GIT_NAME" && -n "$HOST_GIT_EMAIL" ]]; then
       echo "  Git identity: ${HOST_GIT_NAME} <${HOST_GIT_EMAIL}>"

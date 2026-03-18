@@ -119,6 +119,20 @@ This creates:
 - Automations mount (read-only): `dev-containers/automations` -> `/automations`
 - Docker socket mount (if found): host socket -> `/var/run/docker.sock` (for Docker CLI access)
 
+New dev environments now default to a looser seccomp profile so current Codex editing behavior works out of the box:
+
+```bash
+envd run dev1
+```
+
+Notes:
+- Default applied at create time: `--security-opt seccomp=unconfined`
+- This only affects newly created environments.
+- Existing containers need to be recreated because Docker security options are fixed at container creation time.
+- To override the default for a new env: `ENVD_DEV_SECURITY_OPT='seccomp=profile.json' envd run dev1`
+- To disable the override entirely for a new env: `ENVD_DEV_SECURITY_OPT=none envd run dev1`
+- If you installed `envd` to `/opt/homebrew/bin/envd`, recopy `bin/envd` after updating this repo.
+
 Docker daemon access controls:
 - Default: enabled (auto-detects socket from `/var/run/docker.sock` or `~/.docker/run/docker.sock`)
 - Disable per creation: `ENVD_DOCKER_ACCESS=0 envd run dev1`
