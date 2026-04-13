@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server sudo git curl ca-certificates bash vim cloc \
     docker.io \
     build-essential pkg-config python3 python3-pip \
+    bubblewrap \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /var/run/sshd \
   && ssh-keygen -A
