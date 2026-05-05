@@ -54,6 +54,7 @@ XRAY_SHORT_ID=YOUR_SHORT_ID
 Notes:
 - `XRAY_HTTP_PROXY_PORT` is optional unless you need HTTP proxy inbound for host apps.
 - `compose.yml` keeps backward compatibility with the old typoed variable name `XRAY_HTTP_RPOXY_PORT`.
+- `XRAY_BIND_IP=127.0.0.1` exposes the proxy to the host only. Use `XRAY_BIND_IP=0.0.0.0` only when containers or other machines must reach the HTTP proxy through the host.
 
 Start gateway:
 
@@ -69,6 +70,37 @@ curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
 ```
 
 Expected: remote server IP (not your local ISP IP).
+
+If a Docker build already has direct internet, do not pass host HTTP proxy
+build args by default:
+
+```bash
+docker compose build
+```
+
+Only add these after the HTTP proxy path is verified from a container:
+
+```bash
+curl -Iv --proxy http://host.docker.internal:1081 https://registry-1.docker.io/v2/
+```
+
+Expected for Docker Hub is a real HTTP response such as `401 Unauthorized`.
+A timeout after `CONNECT registry-1.docker.io:443` means Xray accepted the HTTP
+proxy connection but did not complete the tunnel, so `HTTP_PROXY` or
+`HTTPS_PROXY` build args can make `RUN apk add`, `go mod download`, or
+`npm install` hang even when direct networking works.
+
+Inside an `envd` dev container, prefer the sidecar path instead of
+`host.docker.internal`:
+
+```bash
+curl -Iv --socks5-hostname xray:1080 https://registry-1.docker.io/v2/
+curl -Iv --proxy http://xray:1081 https://registry-1.docker.io/v2/
+```
+
+`host.docker.internal` is a host-Docker address. From an `envd` container it is
+also subject to the full-tunnel sidecar routing, which can create confusing
+proxy loops or timeouts.
 
 ## 2) Build images
 

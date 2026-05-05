@@ -3,6 +3,7 @@ set -euo pipefail
 
 XRAY_HOST="${XRAY_HOST:-xray}"
 XRAY_PORT="${XRAY_PORT:-1080}"
+XRAY_HTTP_PORT="${XRAY_HTTP_PORT:-1081}"
 SSH_PORT="${SSH_PORT:-22}"
 TUN_IFACE="${TUN_IFACE:-tun0}"
 SINGBOX_CONFIG="/etc/sing-box/config.json"
@@ -88,6 +89,9 @@ apply_killswitch() {
   # Allow only upstream SOCKS connection on the pre-tunnel interface.
   # Matching by interface+port avoids pinning to a single xray container IP.
   iptables -A OUTPUT -o "${uplink_dev}" -p tcp --dport "${XRAY_PORT}" -j ACCEPT
+  if [[ -n "${XRAY_HTTP_PORT}" && "${XRAY_HTTP_PORT}" != "${XRAY_PORT}" ]]; then
+    iptables -A OUTPUT -o "${uplink_dev}" -p tcp --dport "${XRAY_HTTP_PORT}" -j ACCEPT
+  fi
 }
 
 wait_for_tun_iface() {

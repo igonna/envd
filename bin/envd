@@ -1132,6 +1132,7 @@ case "$cmd" in
       --device /dev/net/tun \
       -e XRAY_HOST="xray" \
       -e XRAY_PORT="1080" \
+      -e XRAY_HTTP_PORT="1081" \
       -p "127.0.0.1:${PORT}:22" \
       "$NET_IMAGE" >/dev/null
     created_net="true"
