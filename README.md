@@ -32,9 +32,10 @@ envd/
 
 ## Requirements
 
-- macOS
-- Docker Desktop
+- macOS with Docker Desktop, or Linux with Docker Engine and the Docker Compose plugin
+- `bash`, `ssh`, `ssh-keygen`, `nc`, `awk`
 - SSH key for GitHub (`~/.ssh/ghub_key` recommended)
+- Linux hosts need permission to use Docker, usually by running as root or adding your user to the `docker` group.
 
 ## 1) Configure VPN gateway
 
@@ -120,9 +121,18 @@ docker build -t devnet-sidecar:1 .
 
 ## 3) Install `envd` CLI
 
+macOS with Homebrew on Apple Silicon:
+
 ```bash
 sudo cp bin/envd /opt/homebrew/bin/envd
 sudo chmod +x /opt/homebrew/bin/envd
+```
+
+Linux, or Intel macOS with Homebrew/default local bin:
+
+```bash
+sudo cp bin/envd /usr/local/bin/envd
+sudo chmod +x /usr/local/bin/envd
 ```
 
 Verify:
@@ -163,7 +173,7 @@ Notes:
 - Existing containers need to be recreated because Docker security options are fixed at container creation time.
 - To override the default for a new env: `ENVD_DEV_SECURITY_OPT='seccomp=profile.json' envd run dev1`
 - To disable the override entirely for a new env: `ENVD_DEV_SECURITY_OPT=none envd run dev1`
-- If you installed `envd` to `/opt/homebrew/bin/envd`, recopy `bin/envd` after updating this repo.
+- If you installed `envd` to `/opt/homebrew/bin/envd` or `/usr/local/bin/envd`, recopy `bin/envd` after updating this repo.
 
 Docker daemon access controls:
 - Default: enabled (auto-detects socket from `/var/run/docker.sock` or `~/.docker/run/docker.sock`)
@@ -292,11 +302,11 @@ envd service rm dev1 postgres reporting
 envd service create-custom dev1 postgres reporting
 ```
 
-Expose app ports to macOS on demand:
+Expose app ports to the host on demand:
 
 ```bash
 envd port open dev1 3000
-# then open http://127.0.0.1:3000 on macOS
+# then open http://127.0.0.1:3000 on the host
 envd port ls dev1
 envd port close dev1 3000
 ```
@@ -307,7 +317,7 @@ Persists:
 - Installed packages in container writable layer
 - `/home/<user>` named volume
 - `/repo` named volume
-- Container restart on macOS reboot (`--restart unless-stopped`)
+- Container restart on host reboot when Docker starts containers with `--restart unless-stopped`
 
 Does not persist:
 - Container after `envd rm <name>`

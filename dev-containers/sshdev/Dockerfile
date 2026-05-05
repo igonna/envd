@@ -1,5 +1,7 @@
 FROM ubuntu:24.04
 
+ARG DOCKER_COMPOSE_VERSION=v2.27.1
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -11,10 +13,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && mkdir -p /var/run/sshd \
   && ssh-keygen -A
 
-# Install Docker Compose v2 CLI plugin (aarch64) system-wide
+# Install Docker Compose v2 CLI plugin system-wide.
 RUN mkdir -p /usr/local/lib/docker/cli-plugins \
+ && arch="$(uname -m)" \
+ && case "$arch" in \
+      x86_64) compose_arch="x86_64" ;; \
+      aarch64|arm64) compose_arch="aarch64" ;; \
+      *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac \
  && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
-    https://github.com/docker/compose/releases/download/v2.27.1/docker-compose-linux-aarch64 \
+    "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-linux-${compose_arch}" \
  && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
 # Enable colored prompt
