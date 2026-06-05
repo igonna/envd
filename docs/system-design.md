@@ -46,10 +46,11 @@ Core user promises:
 - Docker image purges are repairable for envd-owned images.
 - Secrets are remembered in an encrypted envd store.
 - Developer identities and account credentials are protected by network policy.
-- A maintained hosting catalog helps users get a replacement gateway quickly
-  instead of researching providers from zero during an outage.
-- Secure-by-default behavior protects envd state, identities, and environment
-  data when envd is locked.
+- A signed hosting catalog and local reachability history help users get a
+  replacement gateway quickly instead of researching providers from zero during
+  an outage.
+- Secure-by-default behavior protects envd state, secrets, identities, and
+  network posture. Environment storage encryption is explicit.
 - Every stateful envd command uses secure encrypted state; plaintext state is not
   a fallback mode.
 - Projects can declare non-secret envd intent in the repo when useful.
@@ -85,12 +86,16 @@ repair, it should be questioned.
 - Long-lived account credentials must not be copied into containers as plain
   files in the protected identity path. Access goes through envd-controlled
   brokers or short-lived material.
-- envd secrets and environment data must be encrypted at rest by default.
+- envd secrets must be encrypted at rest by default.
+- Environment/workspace storage is plain by default for normal development and
+  encrypted only when the user explicitly selects protected storage.
 - envd operational state must be encrypted by default. Plain host/Docker
   metadata must be minimal, non-sensitive, and use opaque identifiers where
   possible.
 - Offline/no-internet networking must be explicit: `--network offline`.
-- Docker is the only required host runtime dependency.
+- Docker is the only required third-party host runtime for default usage. envd
+  also requires OS-native networking capabilities for sealed mode. Encrypted
+  storage backends are required only when protected storage is requested.
 - Xray and sing-box versions must be pinned, not `latest`.
 - Required runtime images must be restorable by `envd` even if the user purges
   normal Docker images.
@@ -342,10 +347,11 @@ Provider ASN reputation:   warning, many failures in local history
 
 Provider/hosting catalog:
 
-- Large built-in researched catalog of VPS providers and regions.
+- Signed catalog schema with a conservative built-in provider set for v1.
 - Optional remote catalog updates signed or checksum-verified by envd releases.
 - Catalog data lives in the repository as maintained data, not hardcoded logic.
-- Local private catalog overlay is an escape hatch, not the normal workflow.
+- Local private catalog overlay is supported because provider/payment reality is
+  regional and changes over time.
 - Store provider country, ASN, pricing notes, API endpoint, and historical local
   success rate.
 - Store payment notes, including whether cards, crypto, PayPal, bank transfer,
@@ -356,15 +362,16 @@ Provider/hosting catalog:
 - Do not recommend a provider solely because it is cheap.
 - Prefer provider diversity: country, ASN, upstream network, and payment/account
   separation when possible.
-- Do not only list the most famous providers. Well-known providers may be
-  targeted first, so the catalog should include a broad, maintained spread of
+- Do not only list the most famous providers long term. Well-known providers may
+  be targeted first, so catalog expansion should include a broad spread of
   smaller reputable providers too.
 - Catalog entries should be versioned and refreshed through envd's signed
   catalog update path.
 - Catalog entries should have confidence levels: `verified`, `community`,
   `user`, `stale`, `unknown`.
-- The default catalog should be good enough that most users never manually add a
-  provider.
+- v1 should not promise a complete payment-aware VPS directory. The initial
+  promise is a signed schema, a small conservative catalog, local private
+  overrides, and local reachability history.
 
 Catalog sources:
 
@@ -628,7 +635,8 @@ Rules:
 - `envd` must never switch a running sealed environment to direct networking.
 - `envd` must clearly show if ports/services may become reachable after a mode
   change.
-- Mode changes may recreate the dev container while preserving volumes.
+- Mode changes may recreate the dev container while preserving the environment's
+  declared storage.
 - `envd inspect <env>` must show the current mode and why.
 
 ## Command Model
@@ -721,8 +729,8 @@ envd code <name>
   Open the environment in VS Code through an envd-controlled local SSH proxy.
 
 envd lock
-  Stop envd-owned work, revoke identities/secrets, close protected storage, and
-  then clean up registered Docker artifacts asynchronously.
+  Stop envd-owned work, revoke identities/secrets, close protected storage when
+  present, and then clean up registered Docker artifacts asynchronously.
 
 --network direct
   Explicitly use normal Docker networking. This can expose traffic outside the
@@ -931,7 +939,7 @@ environments:
 3. Check whether each sidecar is connected to the active gateway generation.
 4. Hot-reload or restart the sidecar tunnel process when possible.
 5. If hot reload is not safe, perform a controlled recreate of the sidecar/dev
-   container pair while preserving volumes.
+   container pair while preserving the environment's declared storage.
 6. Reinstall kill-switch rules before allowing egress.
 7. Verify DNS, TCP, TLS, Docker Hub, leak check, and egress policy.
 8. Mark the environment healthy only after validation passes.
@@ -1120,16 +1128,18 @@ envd network set dev1 sealed
 `envd ps` should expose operational state, not just container names:
 
 ```text
-NAME      STATE    NET      VPN     EGRESS     IDENTITY  PROFILE  ISSUE
-dev1      running  sealed   ok      NL x.x.x.x work      default  -
-dev2      stopped  direct   n/a     host       blocked   web      identity requires sealed
-dev4      running  sealed   ok      NL x.x.x.x risky     default  raw credential mount
-dev3      running  offline  n/a     none       none      default  -
+NAME      STATE    NET      VPN     STORAGE    EGRESS     IDENTITY  PROFILE  ISSUE
+dev1      running  sealed   ok      plain      NL x.x.x.x work      default  -
+dev2      stopped  direct   n/a     plain      host       blocked   web      identity requires sealed
+dev4      running  sealed   ok      plain      NL x.x.x.x risky     default  raw credential mount
+safe      stopped  sealed   ok      protected  NL x.x.x.x work      default  -
 ```
 
 The `NET` column is required. A user should always know whether an environment is
 sealed, direct, or offline. For sealed environments, `EGRESS` should show the
-last verified gateway egress identity when available.
+last verified gateway egress identity when available. The `STORAGE` column is
+also required so plain storage is never confused with encrypted protected
+storage.
 
 `envd ps` must not show anonymous image IDs as the primary identity. If Docker
 only has an image ID, that is a recovery signal, not a normal state. The source
@@ -1196,7 +1206,7 @@ When auto-stop happens:
 
 - Stop the dev environment.
 - Stop its sidecar and sealed project Docker engine if present.
-- Close protected storage.
+- Close protected storage if the environment uses it.
 - Keep envd state, recovery points, and profile images intact.
 - Record the reason in events.
 - Show the stop reason in `envd ps` and `envd why <env>`.
@@ -1205,9 +1215,9 @@ Expected status:
 
 ```text
 NAME   STATE    IDLE       STORAGE    ISSUE
-books  stopped  idle 3h    protected  auto-stopped, envd start books
-api    running  active     protected  VS Code attached
-db     running  keep-alive protected  service postgres
+books  stopped  idle 3h    plain      auto-stopped, envd start books
+api    running  active     plain      VS Code attached
+safe   stopped  idle 3h    protected  protected storage closed
 ```
 
 Configuration should stay simple:
@@ -1234,7 +1244,8 @@ Rules:
   active, leave the environment running and explain why.
 - Auto-stop should not apply to raw host Docker containers except for registered
   cleanup on explicit `envd lock`.
-- `envd start <env>` should restore the environment from protected storage.
+- `envd start <env>` should restore the environment from its declared storage
+  mode.
 - `envd code <env>` or `envd shell <env>` should start a stopped environment
   lazily when safe.
 - Users should not need to keep a terminal open just to prevent stop; declared
@@ -1289,8 +1300,12 @@ envd run books
 ```
 
 If the command is run inside a Git repo or normal project directory, envd should
-mount that directory as the environment workspace and remember it. The user
-should not need to repeat mount flags for ordinary projects.
+remember that source path and use it as the environment workspace by default. The
+user should not need to repeat mount flags for ordinary projects.
+
+Default workspace storage is plain. This is intentional for normal development:
+it is fast, simple, compatible with existing editors/tools, and does not pretend
+that `envd lock` can hide files already present on the host filesystem.
 
 Useful commands:
 
@@ -1306,8 +1321,20 @@ envd code books
 Workspace: /Users/c/repo/books -> /workspace/books
 Profile:   web
 Network:   sealed
+Storage:   plain
 Manifest:  .envd.yaml
 ```
+
+Workspace sync rules:
+
+- Default creation bind-mounts or otherwise exposes the remembered project path as
+  plain workspace storage.
+- Git remotes and identity operations go through envd-managed policy.
+- `envd inspect` shows the remembered host source path, mount path, and storage
+  mode.
+- Protected storage is explicit, for example `envd run books --storage protected`.
+- envd must never label a raw host workspace or normal Docker volume as protected
+  storage.
 
 Optional repo-local manifest:
 
@@ -1359,8 +1386,8 @@ Rules:
 - Recovery points should not include envd secrets unless they are part of the
   encrypted envd state required for that environment's recovery.
 - `envd rm <env>` is the explicit removal action. After confirmation, it should
-  remove the environment, protected storage, env-owned recovery points, and env
-  state together.
+  remove the environment, envd-managed storage, env-owned recovery points, and
+  env state together.
 - `envd ps`, `envd inspect`, and `envd why` may mention that an automatic
   recovery point exists when it is relevant, but users should not manage recovery
   points during normal use.
@@ -1379,7 +1406,7 @@ Default lifecycle:
 keep the latest recovery point per active environment
 keep recent pre-change recovery points for a short rollback window
 delete recovery points for envs removed by envd rm
-prune only after the current protected storage is verified
+prune only after the current environment storage is verified
 ```
 
 Rules:
@@ -1437,6 +1464,10 @@ security boundary because users and tools can bypass them.
 
 The safe model is a Docker-compatible project engine managed by envd.
 
+This is a major post-v1 subsystem, not a casual follow-on feature. It should ship
+only after sealed single-container environments, gateway switching, protected
+storage, and identity denial are already reliable and release-gated.
+
 User experience:
 
 ```bash
@@ -1457,7 +1488,8 @@ Project engine rules:
 - The project engine is created lazily on first Docker use.
 - The project engine runs under envd control and uses the sealed gateway route.
 - Images, Compose networks, Compose volumes, and build cache for the project
-  engine live in envd-managed protected storage.
+  engine live in envd-managed storage using the environment's declared storage
+  mode.
 - If the sealed route is unhealthy, project Docker operations fail closed.
 - DNS, IPv4, and IPv6 for project containers must follow the sealed network
   policy.
@@ -1636,27 +1668,39 @@ Principle:
 
 ```text
 envd unlocked      -> access allowed only when policy passes
-envd locked        -> access killed, envd workloads stopped, storage closed
-envd stopped       -> storage closed and encrypted at rest
+envd locked        -> access killed, envd workloads stopped, protected storage closed
+envd stopped       -> work stopped; protected storage encrypted if selected
 host compromised while active -> outside envd's full guarantee
 ```
 
 Locking envd is a deterministic shutdown posture for envd-owned work. It kills
 envd-managed access sessions, stops accepting new shell/SSH access, prevents new
 secret/identity grants, stops envd-managed workloads, and closes protected
-storage. The behavior should be simple and predictable.
+storage when present. Plain storage remains plain host/Docker data. The behavior
+should be simple and predictable.
 
 Important limit: a process killed by lock can only preserve work it already
 wrote to storage. Arbitrary in-memory state is not recoverable unless the tool
 itself saved it.
 
+UX cost:
+
+- `envd lock` is intentionally disruptive.
+- Help text and confirmation output must say that active envd shells, editor/SSH
+  sessions, service/app runtimes, and unsaved in-memory work will be terminated.
+- The command should be fast and deterministic, but it should not pretend to be a
+  pause/resume feature.
+- Users who need long-running work should commit/save state or use an explicit
+  keep-running workflow that does not weaken lock semantics.
+
 ```text
-envd lock       kill access, stop envd-owned workloads, close storage
-envd stop <env> stop one environment and close encrypted storage
+envd lock       kill access, stop envd-owned workloads, close protected storage
+envd stop <env> stop one environment; protected storage closes if selected
 ```
 
-Full at-rest closure happens when the environment is stopped, `envd lock` stops
-it, or envd performs a full shutdown.
+Full encrypted at-rest closure exists only for protected storage and happens when
+the protected environment is stopped, `envd lock` stops it, or envd performs a
+full shutdown.
 
 ### Secure State Boundary
 
@@ -1731,9 +1775,9 @@ Rules:
 - Lock does not create new decrypted mounts.
 - Lock does not expose envd secrets, identity material, or decrypted storage
   through new access paths.
-- Stopping an environment closes its protected storage.
+- Stopping an environment closes protected storage when the environment uses it.
 - `envd lock` stops envd-managed environments and service/app runtimes, then
-  closes their protected storage.
+  closes protected storage where present.
 - If an operation cannot be made safe while locked, it must fail closed.
 - There is no required `unlock` command in normal use. The next stateful command
   prompts for the master password and reopens only the state it needs.
@@ -1782,8 +1826,8 @@ Rules:
 - Generated SSH targets should use opaque aliases by default. Human env names
   stay in encrypted envd state.
 - The proxy must require envd to be unlocked.
-- The proxy must verify the target environment is running, protected storage is
-  mounted, network policy is valid, and the caller is local.
+- The proxy must verify the target environment is running, required storage
+  policy is satisfied, network policy is valid, and the caller is local.
 - No password login.
 - No container-owned reusable login key as the security boundary.
 - Any client key or certificate material must be envd-managed, encrypted at
@@ -1836,12 +1880,12 @@ remains closed.
 
 Active tool behavior:
 
-- During normal unlocked use, encrypted storage appears as a normal filesystem to
-  tools such as editors, Git, Codex, Claude Code, package managers, and language
-  servers.
+- During normal unlocked use, environment storage appears as a normal filesystem
+  to tools such as editors, Git, Codex, Claude Code, package managers, and
+  language servers.
 - On lock, tools running under envd-managed shell, SSH, or one-shot command
   sessions are terminated.
-- Files already written to encrypted storage are preserved.
+- Files already written to environment storage are preserved.
 - Arbitrary in-memory tool state is preserved only if the tool saved it.
 - This is intentionally simple: lock means envd-owned work stops.
 
@@ -1901,44 +1945,62 @@ optionally combined with something the user has.
 User-facing contract:
 
 ```text
-envd run <env>   -> creates safe encrypted container storage automatically
-envd lock        -> stops envd workloads and closes protected storage
-envd stop <env>  -> stops work and leaves storage encrypted at rest
+envd run <env>                     -> creates normal plain workspace storage
+envd run <env> --storage protected -> creates encrypted protected storage
+envd lock                          -> stops envd workloads and revokes access
+envd stop <env>                    -> stops one environment
 ```
 
-The user should not need to think about Docker volumes, mount points, or crypto
-plumbing during normal use. envd owns that complexity.
+The user should not need to think about Docker volumes and mount points during
+normal use. Crypto plumbing exists only when protected storage is explicitly
+selected.
 
 What the user can trust:
 
-- Persistent environment data is stored in envd-managed encrypted storage.
-- Normal Docker volumes are not used for persistent env data.
-- When an environment is stopped, its data is encrypted at rest.
+- Default persistent environment data is plain and should be treated like normal
+  local development files.
+- Plain storage is compatible, fast, and easy to inspect with normal host tools.
+- envd must label plain storage honestly and never describe it as encrypted.
+- When protected storage is selected, environment data is stored in envd-managed
+  encrypted storage.
+- When a protected environment is stopped, its data is encrypted at rest.
 - When an environment is running, tools see a normal filesystem.
-- `envd lock` stops envd-managed environments and closes their storage.
-- `envd stop <env>` is the full "put it away encrypted" action.
+- `envd lock` stops envd-managed environments, revokes secrets/identity grants,
+  and closes protected storage when present.
 - `envd ps` and `envd inspect` show storage state plainly.
 
 Visible storage states:
 
 ```text
-active      environment running, storage available while unlocked
-locked      envd workloads stopped, storage encrypted at rest, access blocked
-stopped     environment stopped, storage encrypted at rest
+plain-active       environment running with normal unencrypted storage
+plain-stopped      environment stopped, data remains plain on host/Docker storage
+protected-active   environment running with encrypted backend mounted
+protected-closed   environment stopped/locked, encrypted at rest
 ```
 
 Implementation detail:
 
-Docker volumes are not encrypted by Docker by default, so envd must not put
-persistent environment data in normal Docker volumes. Internally, envd can use
-encrypted APFS/LUKS-backed storage and mount it only for the environment that
-needs it.
+Docker volumes and host bind mounts are not encrypted by Docker. They are valid
+for default plain storage, but envd must label them as plain. When protected
+storage is selected, envd uses encrypted APFS/LUKS-backed storage and mounts it
+only for the environment that needs it.
 
-Mode:
+Modes:
 
 ```text
+plain      normal host workspace or Docker-managed storage, unencrypted
 protected  envd-managed encrypted volume backing store
 ```
+
+Plain storage behavior:
+
+- Plain storage is the default.
+- Plain storage survives `envd lock` and `envd stop` as normal local data.
+- `envd lock` does not make plain storage unreadable to someone with host file
+  access.
+- Plain storage may still use sealed networking and envd-managed secrets.
+- Protected identity policies may require protected storage for sensitive
+  identities.
 
 Protected storage behavior:
 
@@ -2028,18 +2090,19 @@ Performance and reliability:
 Rules:
 
 - Do not pretend normal Docker volumes are encrypted.
-- Do not support persistent unencrypted environment storage.
+- Persistent unencrypted environment storage is the default normal mode.
 - `envd ps` and `envd inspect` must show storage mode.
-- Protected storage is the only normal environment storage mode.
-- Protected identities require protected storage.
-- If protected storage cannot be mounted safely, environment startup fails
-  closed.
+- Protected storage is explicit.
+- Identity policies may require protected storage.
+- If protected storage is requested and cannot be mounted safely, environment
+  startup fails closed.
 
 Example:
 
 ```text
 NAME   NET     VPN   STORAGE    IDENTITY  ISSUE
-books  sealed  ok    protected  work      -
+books  sealed  ok    plain      work      storage is not encrypted
+safe   sealed  ok    protected  work      -
 ```
 
 ### Security Defaults
@@ -2047,7 +2110,7 @@ books  sealed  ok    protected  work      -
 Default behavior:
 
 - `network = sealed`
-- `storage = protected`
+- `storage = plain`
 - `identity = brokered`
 - raw Docker disabled
 - direct host credential mounts disabled
@@ -2057,10 +2120,12 @@ Default behavior:
 - recovery points encrypted
 
 These defaults are appropriate for untrusted locations, shared machines, travel,
-and workspaces where accidental account exposure would be costly. There should
-not be a normal "insecure envd mode"; individual downgrades such as
-`--network direct` or raw Docker access must be explicit and visible. Persistent
-unencrypted environment storage is not a supported downgrade.
+and workspaces where accidental account exposure would be costly, but storage
+encryption is not assumed unless `--storage protected` is selected. There should
+not be a normal "silent insecure envd mode"; downgrades such as `--network
+direct`, raw Docker access, or plain storage must be explicit and visible in
+status/inspect output. Plain storage is the default for normal development, not a
+claim of at-rest secrecy.
 
 ### Multi-Hop Gateways
 
@@ -3070,6 +3135,9 @@ Broker rules:
 - Grants are revoked when network mode changes, gateway generation changes,
   egress policy fails, or `doctor` marks the environment unsafe.
 - If the broker cannot verify policy, it denies access.
+- The broker, not PATH order, is the security boundary.
+- If a user bypasses wrappers and invokes SSH, Git, or a credential helper
+  directly, broker policy must still deny unsafe credential use.
 - Direct raw access to host `~/.ssh`, `~/.gitconfig`, or tool credential files is
   disabled by default.
 - If the user explicitly mounts host credential files, enables raw Docker, or
@@ -3112,7 +3180,9 @@ Required checks:
 - No persistent environment variables contain long-lived account tokens.
 - SSH auth goes through the envd broker socket when an identity is attached.
 - Git credential helper is envd-managed.
-- Account-sensitive wrappers are installed and first in PATH where practical.
+- Account-sensitive wrappers may be installed and first in PATH where practical,
+  but wrappers are convenience and diagnostics only. Broker denial must still work
+  if wrappers are bypassed.
 - Broker denies access when the environment is direct.
 - Broker denies access when sealed route is unhealthy.
 - Broker denies access when egress policy fails.
@@ -3223,13 +3293,17 @@ Project Docker gate:
 
 Storage gate:
 
-- Persistent environment data must never be stored in normal Docker volumes.
+- Plain storage must be labeled as plain and never described as encrypted.
+- Protected storage must never be implemented with normal unencrypted Docker
+  volumes.
 - macOS APFS encrypted image and Linux LUKS2-backed image behavior must be tested
-  for create, mount, unmount, lock, stop, crash recovery, and recovery points.
+  for create, mount, unmount, lock, stop, crash recovery, and recovery points
+  before protected storage ships.
 - Missing, truncated, tampered, dirty, or unsupported storage must fail closed.
-- `envd stop <env>` must leave storage encrypted at rest.
-- `envd lock` must stop envd-managed environments and leave protected storage
-  encrypted at rest.
+- If protected storage is requested, `envd stop <env>` must leave it encrypted at
+  rest.
+- If protected storage is requested, `envd lock` must stop envd-managed
+  environments and leave protected storage encrypted at rest.
 
 Recovery-point gate:
 
@@ -3238,8 +3312,8 @@ Recovery-point gate:
   around risky operations.
 - Recovery point pruning must be automatic and must never delete live environment
   storage.
-- `envd rm <env>` must remove the environment's protected storage and env-owned
-  recovery points after confirmation.
+- `envd rm <env>` must remove the environment's envd-managed storage and
+  env-owned recovery points after confirmation.
 - Stable environments must not accumulate unbounded recovery points.
 - Tests must prove rollback works from an automatic recovery point.
 - Tests must prove automatic pruning preserves rollback for the latest risky
@@ -3280,7 +3354,7 @@ Lock/session gate:
 
 - `envd lock` must terminate envd-managed shell, SSH, and one-shot command
   sessions, stop envd-managed environments and service/app runtimes, stop sealed
-  project Docker engines, and close protected storage.
+  project Docker engines, and close protected storage where present.
 - New envd-managed access sessions must be refused while locked.
 - envd-owned shell clients must stop accepting input, clear/reset the visible
   terminal state where supported, exit, and leave a locked message when they
@@ -3308,7 +3382,8 @@ Supervisor/idle gate:
 - Auto-stop must not trigger while an envd shell, VS Code/SSH proxy, one-shot
   command session, port connection, recovery-point operation, migration, repair,
   profile build, or keep-alive service is active.
-- Auto-stop must close protected storage and preserve environment data.
+- Auto-stop must close protected storage where present and preserve environment
+  data.
 - Auto-stop must not delete images, layers, caches, or recovery points.
 - If the supervisor cannot confidently determine that an environment is idle, it
   must leave it running and report the reason.
@@ -3359,56 +3434,103 @@ The new Go implementation does not need to preserve Bash internals.
 
 However, migration should preserve user data:
 
-- Existing Docker volumes.
 - Existing environment names where feasible.
 - Existing SSH config entries where safe.
 - Existing remote Xray credentials if imported.
 
+Legacy storage migration policy:
+
+- Existing Docker volumes are plain storage.
+- Migration should import legacy Docker volume data into envd-managed protected
+  storage only when the user explicitly requests protected storage.
+- If protected import is unsafe or unsupported, leave the legacy volume untouched
+  and mark the migrated environment `plain`.
+- A migrated environment must not claim protected storage while any active
+  persistent data path is a normal Docker volume or raw host bind mount.
+- envd must never claim a legacy Docker volume is encrypted just because envd now
+  manages the environment.
+
 The old Bash script can remain temporarily as implementation reference, but the
 new Go CLI should not shell out to it for normal operations.
 
-## Immediate Build Plan
+## Phased Build Plan
+
+The spec describes the long-term product, but implementation must be release
+gated. v1 is deliberately narrower than the full architecture.
+
+The execution tracker lives in `docs/implementation-checklist.md`.
+
+v1 baseline:
 
 1. Create source-built `install.sh` bootstrap.
 2. Create Go CLI skeleton.
-3. Implement config/state model.
+3. Implement encrypted config/state model and implicit first-run initialization.
 4. Implement environment specs and `envd ps` from envd state plus Docker state.
-5. Implement image identity, profile tags, and image drift detection.
-6. Implement runtime asset/image manager.
+5. Implement image identity, profile tags, drift detection, and automatic image
+   deletion recovery.
+6. Implement runtime asset manager with pinned assets and automatic restore.
 7. Implement local gateway manager through a provider interface.
 8. Implement `envd proxy` and `envd proxy test`.
-9. Implement `envd doctor --deep`.
-10. Implement sealed environment creation.
-11. Implement direct/offline environment modes and safe mode changes.
+9. Implement `envd doctor --deep` with real host, gateway, and sealed-container
+   traffic tests.
+10. Implement sealed single-container environment creation with sidecar
+    kill-switch routing.
+11. Implement direct/offline environment modes and safe stop/recreate mode
+    changes.
 12. Implement interactive `envd gateway install <name>` with internal
     inspect/plan/apply/verify phases.
-13. Implement `gateway inspect`, `gateway repair`, `gateway prune`, `--adopt`,
-    and `--replace` as advanced controls.
-14. Implement atomic `envd gateway use <name>` switching and rollback.
-15. Create maintained hosting catalog data files.
-16. Implement `envd internet status`, hosting catalog updates, gateway
-    acquisition helper, and gateway risk scoring.
-17. Implement user URI generation.
-18. Implement dev image profiles.
-19. Implement package manifest, lazy profile builds, generations, and image
-    pruning.
-20. Implement package promotion suggestions from existing environments.
-21. Implement workspace/project manifest support.
-22. Implement automatic encrypted recovery points and lifecycle pruning.
-23. Implement event log and `envd why`.
-24. Implement identity profiles, identity broker, and account-sensitive command
-    guards.
-25. Implement `envd code <env>` and envd-controlled SSH proxy access.
-26. Implement secure-by-default lock behavior and encrypted environment storage.
-27. Implement user-level supervisor, idle auto-stop, and cleanup queue.
-28. Implement sealed project Docker engine for standard `docker` and
-    `docker compose` inside envd shells.
-29. Implement gateway chains.
-30. Implement raw host Docker detection and risk reporting.
-31. Remove Bash dependency.
+13. Implement atomic `envd gateway use <name>` switching, rollback, and internal
+    reconciliation for affected sealed environments.
+14. Implement `envd events` and `envd why`.
+15. Remove Bash dependency from normal operations.
 
-The first milestone is not feature parity. The first milestone is reliable
-environment identity, gateway/proxy diagnostics, and sealed environment
-creation. A user should be able to create one sealed environment, see exact
-network state in `envd ps`, recover after image deletion, and identify the
-failing network layer without manual curl/ping debugging.
+v1 success criteria:
+
+- A user can install envd from source with `./install.sh`.
+- A user can create one sealed environment and see exact network/storage/image
+  state in `envd ps`.
+- A broken gateway, broken DNS, broken sidecar, missing image, or wrong proxy port
+  is diagnosed by layer without manual curl/ping debugging.
+- Docker image deletion is repaired for envd-owned images.
+- Gateway switching verifies before activation and fails closed on error.
+- Sealed environments never silently fall back to direct networking.
+
+Post-v1 security/storage milestone:
+
+- Protected APFS/LUKS storage backends.
+- Optional legacy Docker volume import into protected storage.
+- `envd lock` deterministic shutdown behavior.
+- Automatic encrypted recovery points and lifecycle pruning.
+- `envd code <env>` and envd-controlled SSH proxy access.
+
+Post-v1 identity milestone:
+
+- Identity profiles.
+- Identity broker and scoped grants.
+- Account-sensitive command wrappers as convenience only.
+- `envd doctor --identity` negative tests.
+
+Post-v1 productivity milestone:
+
+- Dev image profiles.
+- Package manifest and lazy profile generations.
+- Package promotion suggestions from existing environments.
+- Workspace/project manifest support.
+- User-level supervisor, idle auto-stop, and cleanup queue.
+
+Post-v1 resilience/censorship milestone:
+
+- Signed hosting catalog schema and conservative built-in catalog.
+- Catalog updates and local reachability history.
+- `envd internet status`, `envd hosting shortlist`, and gateway risk scoring.
+- User URI generation.
+- Gateway chains.
+
+Post-v1 project Docker milestone:
+
+- Sealed project Docker endpoint for standard `docker` and `docker compose`
+  inside envd shells.
+- Raw host Docker detection and risk reporting.
+
+No later milestone can ship by intention alone. Each feature must satisfy its
+release gate before it becomes part of the supported product.
