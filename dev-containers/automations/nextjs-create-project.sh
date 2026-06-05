@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-
-npx create-next-app@latest .

@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 build_dir="$repo_dir/build/cross"
 go_image=${ENVD_GO_IMAGE:-golang:1.22-alpine}
 alpine_image=${ENVD_ALPINE_IMAGE:-alpine:3.21}
@@ -41,7 +41,7 @@ verify_go_target() {
     -v "$out_dir/envd:/usr/local/bin/envd:ro" \
     -w /src \
     "$alpine_image" \
-    sh -lc 'envd version && envd help >/dev/null && envd proxy >/dev/null'
+    sh -lc 'envd version && envd help >/dev/null && envd proxy help >/dev/null'
 }
 
 verify_image_target() {
@@ -52,19 +52,19 @@ verify_image_target() {
   docker build \
     --platform "$platform" \
     -t "envd-cross-sshdev:$arch_label" \
-    "$repo_dir/dev-containers/sshdev"
+    "$repo_dir/internal/assets/containers/sshdev"
 
   echo "==> build net-sidecar image for $platform"
   docker build \
     --platform "$platform" \
     -t "envd-cross-net-sidecar:$arch_label" \
-    "$repo_dir/dev-containers/net-sidecar"
+    "$repo_dir/internal/assets/containers/net-sidecar"
 
   echo "==> build project Docker image for $platform"
   docker build \
     --platform "$platform" \
     -t "envd-cross-project-docker:$arch_label" \
-    "$repo_dir/dev-containers/project-docker"
+    "$repo_dir/internal/assets/containers/project-docker"
 }
 
 verify_go_target amd64 linux/amd64

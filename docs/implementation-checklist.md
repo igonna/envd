@@ -73,6 +73,24 @@ only where implemented and release-gated.
 - [x] Detect port conflicts before starting gateway.
 - [x] Detect wrong/stale proxy port in diagnostics.
 
+### Self-Contained Install And Gateway Runtime
+
+- [x] Embed envd-owned runtime container assets into the Go binary.
+- [x] Embed gateway render templates into the Go binary.
+- [x] Remove `example.env` from product/runtime assets.
+- [x] Stop requiring repo checkout discovery for normal installed commands.
+- [x] Materialize gateway runtime files into envd-owned data/cache paths when
+      needed.
+- [x] Render local gateway config from encrypted gateway state, not manual
+      `.env`, for normal operation.
+- [x] Keep `gateway import-local` only as legacy migration from old manual
+      `.env` setups.
+- [x] Update help/docs so `gateway install/use` is the normal path and manual
+      `.env` is not normal UX.
+- [x] Add tests proving assets/templates work without a repo checkout.
+- [x] Add verification that the installed binary can restore runtime images
+      from embedded assets.
+
 ### Remote Gateway Install
 
 - [x] Implement SSH connection to remote server.

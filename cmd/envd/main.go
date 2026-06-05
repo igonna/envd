@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -34,6 +35,8 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/term"
+
+	envdassets "github.com/envd/envd/internal/assets"
 )
 
 const version = "0.1.0-dev"
@@ -61,12 +64,15 @@ const (
 	projectDockerImage = "envd-project-docker:27-rootless"
 	gatewayNet         = "vpn-gateway_inside"
 	remoteXrayVersion  = "26.2.6"
+	gatewayDeployDir   = "deploy/gateway"
+	containerAssetsDir = "internal/assets/containers"
 )
 
 type assetSpec struct {
-	Name       string
-	Image      string
-	ContextDir string
+	Name        string
+	Image       string
+	ContextDir  string
+	EmbeddedDir string
 }
 
 type runOptions struct {
@@ -125,9 +131,9 @@ type gatewayProvider interface {
 type xrayProvider struct{}
 
 var runtimeAssets = []assetSpec{
-	{Name: "dev image", Image: devImage, ContextDir: filepath.Join("dev-containers", "sshdev")},
-	{Name: "net sidecar image", Image: sidecarImage, ContextDir: filepath.Join("dev-containers", "net-sidecar")},
-	{Name: "project Docker image", Image: projectDockerImage, ContextDir: filepath.Join("dev-containers", "project-docker")},
+	{Name: "dev image", Image: devImage, ContextDir: filepath.Join(containerAssetsDir, "sshdev"), EmbeddedDir: "containers/sshdev"},
+	{Name: "net sidecar image", Image: sidecarImage, ContextDir: filepath.Join(containerAssetsDir, "net-sidecar"), EmbeddedDir: "containers/net-sidecar"},
+	{Name: "project Docker image", Image: projectDockerImage, ContextDir: filepath.Join(containerAssetsDir, "project-docker"), EmbeddedDir: "containers/project-docker"},
 }
 
 const builtInHostingCatalogJSON = `{
@@ -226,10 +232,16 @@ func (a app) run(args []string) error {
 		fmt.Fprintf(a.stdout, "envd %s\n", version)
 		return nil
 	case "proxy":
-		return a.runProxy(args[1:])
+		if len(args) > 1 && isHelpArg(args[1]) {
+			return a.runProxy(args[1:], nil)
+		}
+		return a.withState(func(st *envdState) error { return a.runProxy(args[1:], st) })
 	case "doctor":
 		return a.withStateSaveOnError(func(st *envdState) error { return a.runDoctor(args[1:], st) })
 	case "gateway":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.runGateway(args[1:], nil)
+		}
 		return a.withState(func(st *envdState) error { return a.runGateway(args[1:], st) })
 	case "user":
 		return a.withState(func(st *envdState) error { return a.runUser(args[1:], st) })
@@ -282,6 +294,10 @@ func (a app) run(args []string) error {
 	}
 }
 
+func isHelpArg(arg string) bool {
+	return arg == "help" || arg == "-h" || arg == "--help"
+}
+
 func (a app) withState(fn func(*envdState) error) error {
 	store, err := newStateStore()
 	if err != nil {
@@ -331,11 +347,11 @@ Core commands:
   gateway inspect      Show active/local gateway config summary
   gateway render       Validate generated local gateway config
   gateway egress       Show public egress IP through gateway
-  gateway import-local <name> --yes
-                       Import current vpn-gateway/.env into encrypted state
   gateway install <name> --host <ip> --user <user> --password --probe --dry-run
                        Plan and SSH-probe a remote gateway without mutating it
   gateway use <name>   Verify and activate an encrypted gateway record
+  gateway import-local <name> --yes
+                       Legacy migration from old manual local .env setups
   gateway rollback     Verify and switch back to the previous active gateway
   user uri <gateway>    Print an app import URI for a gateway user
   internet status       Check direct and gateway internet reachability
@@ -368,11 +384,11 @@ Core commands:
 `)
 }
 
-func (a app) runProxy(args []string) error {
+func (a app) runProxy(args []string, st *envdState) error {
 	if len(args) > 0 {
 		switch args[0] {
 		case "test":
-			return a.runProxyTest(args[1:])
+			return a.runProxyTest(args[1:], st)
 		case "help", "-h", "--help":
 			fmt.Fprint(a.stdout, "Usage: envd proxy [test]\n")
 			return nil
@@ -381,7 +397,7 @@ func (a app) runProxy(args []string) error {
 		}
 	}
 
-	cfg, err := a.loadGatewayConfig()
+	cfg, _, err := a.activeGatewayConfig(st)
 	if err != nil {
 		return err
 	}
@@ -396,7 +412,7 @@ func (a app) runProxy(args []string) error {
 	return nil
 }
 
-func (a app) runProxyTest(args []string) error {
+func (a app) runProxyTest(args []string, st *envdState) error {
 	fs := flag.NewFlagSet("proxy test", flag.ContinueOnError)
 	fs.SetOutput(a.stderr)
 	target := fs.String("target", "api.ipify.org:443", "HTTPS target to test through proxies")
@@ -405,7 +421,7 @@ func (a app) runProxyTest(args []string) error {
 		return err
 	}
 
-	cfg, err := a.loadGatewayConfig()
+	cfg, _, err := a.activeGatewayConfig(st)
 	if err != nil {
 		return err
 	}
@@ -468,7 +484,7 @@ func (a app) runDoctor(args []string, st *envdState) error {
 					probeSOCKS("Host SOCKS", net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort)), "api.ipify.org:443", 10*time.Second),
 					probeHTTPProxy("Host HTTP", net.JoinHostPort(host, strconv.Itoa(cfg.HTTPHostPort)), "api.ipify.org:443", 10*time.Second),
 				)
-				checks = append(checks, a.probeSealedEnvTraffic())
+				checks = append(checks, a.probeSealedEnvTraffic(st))
 				checks = append(checks, a.probeProjectDockerTraffic(st))
 			}
 		}
@@ -516,7 +532,7 @@ func recordDoctorEvents(st *envdState, currentFailures map[string]string) {
 
 func (a app) runGateway(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd gateway <status|inspect|render|egress|risk|import-local|install|use|chain>\n")
+		fmt.Fprint(a.stdout, "Usage: envd gateway <install|use|status|inspect|render|egress|rollback|risk|chain|import-local>\n")
 		return nil
 	}
 	switch args[0] {
@@ -1236,7 +1252,7 @@ func (a app) createDevContainer(userName, id, devName, netName, storageMode, hom
 }
 
 func (a app) createProjectDocker(id, dockerName, netName, dockerVol string) error {
-	if err := a.ensureRuntimeAsset(assetSpec{Name: "project Docker image", Image: projectDockerImage, ContextDir: filepath.Join("dev-containers", "project-docker")}); err != nil {
+	if err := a.ensureRuntimeAsset(runtimeAssets[2]); err != nil {
 		return err
 	}
 	if err := dockerRun(projectDockerRunArgs(id, dockerName, netName, dockerVol)...); err != nil {
@@ -2444,7 +2460,7 @@ func (a app) runMigrateGateway(args []string, st *envdState) error {
 	if len(args) != 1 || args[0] != "inspect" {
 		return fmt.Errorf("usage: envd migrate gateway inspect")
 	}
-	cfg, err := a.loadGatewayConfig()
+	cfg, err := a.loadGatewayConfigFromFile()
 	if err != nil {
 		return err
 	}
@@ -2469,7 +2485,7 @@ func (a app) runMigrateInspect(st *envdState) error {
 		fmt.Fprintf(a.stdout, "%-18s %-10s %-8s %-8s %-12s %-12s %s\n",
 			env.Name, env.Dev.State.Status, env.networkMode(), "plain", volumeStatus(ref.HomeVol), volumeStatus(ref.RepoVol), note)
 	}
-	cfg, err := a.loadGatewayConfig()
+	cfg, err := a.loadGatewayConfigFromFile()
 	if err != nil {
 		fmt.Fprintf(a.stdout, "Gateway: not discovered (%s)\n", redactSensitive(err.Error()))
 	} else {
@@ -2505,7 +2521,7 @@ func (a app) runMigrateAdopt(st *envdState) error {
 		adopted++
 	}
 	fmt.Fprintf(a.stdout, "Adopted: %d legacy plain environments\n", adopted)
-	if _, err := a.loadGatewayConfig(); err == nil {
+	if _, err := a.loadGatewayConfigFromFile(); err == nil {
 		st.addEvent("migration", "gateway", "discovered local gateway config; credentials not imported")
 	}
 	return nil
@@ -2556,9 +2572,14 @@ func (a app) runGatewayRender(st *envdState) error {
 	if err != nil {
 		return layerErr("local gateway", err)
 	}
+	runtimeDir, err := a.materializeGatewayRuntime(cfg)
+	if err != nil {
+		return layerErr("local gateway", err)
+	}
 	fmt.Fprintf(a.stdout, "Provider: %s\n", provider.Name())
 	fmt.Fprintf(a.stdout, "Render:   OK\n")
 	fmt.Fprintf(a.stdout, "Bytes:    %d\n", len(rendered))
+	fmt.Fprintf(a.stdout, "Runtime:  %s\n", runtimeDir)
 	return nil
 }
 
@@ -3623,13 +3644,18 @@ func (a app) activateGateway(name string, st *envdState, reason string, verify g
 			st.addEvent("gateway", name, "chain activation refused fail-closed; chain backend unavailable")
 			return fmt.Errorf("gateway chain %q (%s -> %s) cannot be activated yet; refusing to degrade to direct or single-hop", name, chain.Entry, chain.Exit)
 		}
-		return fmt.Errorf("gateway %q not found; run `envd gateway import-local %s --yes` first", name, name)
+		return fmt.Errorf("gateway %q not found; run `envd gateway install %s --host <ip> --user root --password` first", name, name)
 	}
 	cfg := rec.toConfig()
 	gatewayEgress, err := verify(cfg)
 	if err != nil {
 		st.addEvent("gateway", name, reason+" activation failed during verification: "+redactSensitive(err.Error()))
 		return err
+	}
+	runtimeDir, err := a.materializeGatewayRuntime(cfg)
+	if err != nil {
+		st.addEvent("gateway", name, reason+" activation failed while materializing local runtime: "+redactSensitive(err.Error()))
+		return layerErr("local gateway", err)
 	}
 	previous := st.ActiveGateway
 	if previous != name {
@@ -3644,6 +3670,7 @@ func (a app) activateGateway(name string, st *envdState, reason string, verify g
 	st.addEvent("gateway", name, eventMessage)
 	fmt.Fprintf(a.stdout, "Active gateway: %s\n", name)
 	fmt.Fprintf(a.stdout, "Generation:     %d\n", st.GatewayGeneration)
+	fmt.Fprintf(a.stdout, "Runtime:        %s\n", runtimeDir)
 	fmt.Fprintf(a.stdout, "Reconciled:     %d\n", result.Reconciled)
 	if result.Blocked > 0 {
 		fmt.Fprintf(a.stdout, "Blocked:        %d sealed envs failed reconciliation and were stopped fail-closed\n", result.Blocked)
@@ -3677,7 +3704,7 @@ func (a app) runUserURI(args []string, st *envdState) error {
 	name := args[0]
 	rec, ok := st.Gateways[name]
 	if !ok {
-		return fmt.Errorf("gateway %q not found; run `envd gateway import-local %s --yes` first", name, name)
+		return fmt.Errorf("gateway %q not found; run `envd gateway install %s --host <ip> --user root --password` first", name, name)
 	}
 	uri, err := gatewayUserURI(name, rec.toConfig())
 	if err != nil {
@@ -5110,6 +5137,9 @@ func (a app) gatewayEgressIP(cfg gatewayConfig) (string, error) {
 }
 
 func (a app) activeGatewayConfig(st *envdState) (gatewayConfig, string, error) {
+	if st == nil {
+		return gatewayConfig{}, "", fmt.Errorf("active gateway requires encrypted envd state")
+	}
 	st.ensureDefaults()
 	if st.ActiveGateway != "" {
 		rec, ok := st.Gateways[st.ActiveGateway]
@@ -5118,11 +5148,7 @@ func (a app) activeGatewayConfig(st *envdState) (gatewayConfig, string, error) {
 		}
 		return rec.toConfig(), "encrypted state", nil
 	}
-	cfg, err := a.loadGatewayConfigFromFile()
-	if err != nil {
-		return gatewayConfig{}, "", err
-	}
-	return cfg, "vpn-gateway/.env", nil
+	return gatewayConfig{}, "", fmt.Errorf("no active gateway; run `envd gateway install <name> --host <ip> --user root --password`, then `envd gateway use <name>`")
 }
 
 func (a app) loadGatewayConfigFromFile() (gatewayConfig, error) {
@@ -5359,12 +5385,12 @@ func (a app) probeGatewayPortConflicts(cfg gatewayConfig) probeResult {
 	return probeResult{Name: "Gateway preflight", Detail: "configured ports are free"}
 }
 
-func (a app) probeSealedEnvTraffic() probeResult {
+func (a app) probeSealedEnvTraffic(st *envdState) probeResult {
 	envs, err := listEnvContainers(&envdState{Environments: map[string]envRecord{}})
 	if err != nil {
 		return probeResult{Name: "Sealed HTTPS", Err: layerErr("sealed sidecar", err)}
 	}
-	cfg, err := a.loadGatewayConfig()
+	cfg, _, err := a.activeGatewayConfig(st)
 	if err != nil {
 		return probeResult{Name: "Sealed HTTPS", Err: layerErr("local gateway", err)}
 	}
@@ -5385,7 +5411,7 @@ func (a app) probeSealedEnvTraffic() probeResult {
 }
 
 func (a app) probeProjectDockerTraffic(st *envdState) probeResult {
-	cfg, err := a.loadGatewayConfig()
+	cfg, _, err := a.activeGatewayConfig(st)
 	if err != nil {
 		return probeResult{Name: "Project Docker", Err: layerErr("local gateway", err)}
 	}
@@ -5817,7 +5843,7 @@ func runCommand(name string, args ...string) error {
 }
 
 func (a app) ensureRuntimeAsset(asset assetSpec) error {
-	return ensureImage(asset.Image, filepath.Join(a.root, asset.ContextDir))
+	return ensureImage(asset.Image, filepath.Join(a.root, asset.ContextDir), asset.EmbeddedDir)
 }
 
 func (a app) ensureRuntimeAssetRecorded(st *envdState, asset assetSpec) error {
@@ -5846,7 +5872,7 @@ func recordAssetMetadata(st *envdState, image string, meta assetRecord, existed 
 	}
 }
 
-func ensureImage(ref, contextDir string) error {
+func ensureImage(ref, contextDir, embeddedDir string) error {
 	if imageExists(ref) {
 		_ = saveImageToAssetCache(ref)
 		return nil
@@ -5857,13 +5883,69 @@ func ensureImage(ref, contextDir string) error {
 		return nil
 	}
 	if _, err := os.Stat(filepath.Join(contextDir, "Dockerfile")); err != nil {
-		return fmt.Errorf("cannot restore required image %s: %w", ref, err)
+		if embeddedDir == "" {
+			return fmt.Errorf("cannot restore required image %s: %w", ref, err)
+		}
+		var materializeErr error
+		contextDir, materializeErr = materializeEmbeddedAssetContext(ref, embeddedDir)
+		if materializeErr != nil {
+			return fmt.Errorf("cannot restore required image %s from embedded assets: %w", ref, materializeErr)
+		}
 	}
 	if err := dockerRun("build", "-t", ref, contextDir); err != nil {
 		return fmt.Errorf("cannot restore required image %s: %w", ref, err)
 	}
 	_ = saveImageToAssetCache(ref)
 	return nil
+}
+
+func materializeEmbeddedAssetContext(ref, embeddedDir string) (string, error) {
+	dataDir, err := envdDataDir()
+	if err != nil {
+		return "", err
+	}
+	dest := filepath.Join(dataDir, "assets", "contexts", safeAssetName(ref))
+	if err := materializeEmbeddedDir(embeddedDir, dest); err != nil {
+		return "", err
+	}
+	return dest, nil
+}
+
+func materializeEmbeddedDir(sourceDir, dest string) error {
+	if err := os.RemoveAll(dest); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		return err
+	}
+	return fs.WalkDir(envdassets.FS, sourceDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(sourceDir, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		target := filepath.Join(dest, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o700)
+		}
+		raw, err := envdassets.FS.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(0o600)
+		if strings.HasSuffix(path, ".sh") {
+			mode = 0o700
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(target, raw, mode)
+	})
 }
 
 func envdDataDir() (string, error) {
@@ -5960,7 +6042,7 @@ func ensureDockerNetwork(name string) error {
 	if exec.Command("docker", "network", "inspect", name).Run() == nil {
 		return nil
 	}
-	return fmt.Errorf("required Docker network %s is missing; start vpn-gateway first", name)
+	return fmt.Errorf("required Docker network %s is missing; start the gateway compose stack first", name)
 }
 
 func pickPort(start, end int) (int, error) {
@@ -7060,7 +7142,7 @@ func (a app) loadGatewayConfig() (gatewayConfig, error) {
 		HTTPInner:    2089,
 		Raw:          map[string]string{},
 	}
-	envPath := filepath.Join(a.root, "vpn-gateway", ".env")
+	envPath := filepath.Join(a.root, gatewayDeployDir, ".env")
 	vals, err := readDotEnv(envPath)
 	if err != nil {
 		return cfg, fmt.Errorf("gateway config missing at %s: %w", envPath, err)
@@ -7082,8 +7164,7 @@ func (xrayProvider) Name() string {
 }
 
 func (xrayProvider) Render(a app, cfg gatewayConfig) ([]byte, error) {
-	templatePath := filepath.Join(a.root, "vpn-gateway", "config.template.json")
-	raw, err := os.ReadFile(templatePath)
+	raw, err := loadGatewayTemplate(a.root)
 	if err != nil {
 		return nil, err
 	}
@@ -7124,6 +7205,76 @@ func (xrayProvider) Render(a app, cfg gatewayConfig) ([]byte, error) {
 		return nil, fmt.Errorf("rendered Xray config is not valid JSON")
 	}
 	return []byte(rendered), nil
+}
+
+func loadGatewayTemplate(root string) ([]byte, error) {
+	if root != "" {
+		templatePath := filepath.Join(root, gatewayDeployDir, "config.template.json")
+		if raw, err := os.ReadFile(templatePath); err == nil {
+			return raw, nil
+		}
+	}
+	return envdassets.FS.ReadFile("gateway/config.template.json")
+}
+
+func (a app) materializeGatewayRuntime(cfg gatewayConfig) (string, error) {
+	dir, err := gatewayRuntimeDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	rendered, err := (xrayProvider{}).Render(a, cfg)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), rendered, 0o600); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "compose.yml"), []byte(gatewayComposeYAML(cfg)), 0o600); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func gatewayRuntimeDir() (string, error) {
+	dataDir, err := envdDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dataDir, "gateway"), nil
+}
+
+func gatewayComposeYAML(cfg gatewayConfig) string {
+	bind := hostForClient(cfg.BindIP)
+	return fmt.Sprintf(`name: vpn-gateway
+
+services:
+  xray:
+    image: teddysun/xray@sha256:5ced88b51b157890fbadeb5dc6d70f157f5d577cd5d93ec09b30d14b86b07fde
+    restart: unless-stopped
+    ports:
+      - "%s:%d:%d"
+      - "%s:%d:%d"
+    volumes:
+      - ./config.json:/etc/xray/config.json:ro
+    command: ["xray", "-config", "/etc/xray/config.json"]
+    networks:
+      outside:
+        priority: 1000
+        gw_priority: 1
+      inside:
+        priority: 100
+        gw_priority: 0
+
+networks:
+  inside:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  outside: {}
+`, bind, cfg.SOCKSPort, cfg.SOCKSInner, bind, cfg.HTTPHostPort, cfg.HTTPInner)
 }
 
 type probeResult struct {
@@ -7329,9 +7480,9 @@ func nextActionForError(err error) string {
 	case "asset cache":
 		return "Rerun the command from the envd repo so envd can rebuild required runtime images."
 	case "local gateway":
-		return "Run `envd gateway render`, then restart `vpn-gateway` if render is OK."
+		return "Run `envd gateway render`, then restart the gateway compose stack if render is OK."
 	case "local proxy":
-		return "Check `envd proxy`; if ports differ from Docker mappings, restart `vpn-gateway`."
+		return "Check `envd proxy`; if ports differ from Docker mappings, restart the gateway compose stack."
 	case "remote gateway":
 		return "Run `envd gateway egress`; if it fails, the remote gateway path is down."
 	case "sealed sidecar":
@@ -7425,7 +7576,7 @@ func findRepoRoot() (string, error) {
 		return "", err
 	}
 	for {
-		if _, err := os.Stat(filepath.Join(wd, "vpn-gateway", "compose.yml")); err == nil {
+		if isRepoRoot(wd) {
 			return wd, nil
 		}
 		parent := filepath.Dir(wd)
@@ -7438,7 +7589,7 @@ func findRepoRoot() (string, error) {
 	if err == nil {
 		dir := filepath.Dir(exe)
 		for {
-			if _, err := os.Stat(filepath.Join(dir, "vpn-gateway", "compose.yml")); err == nil {
+			if isRepoRoot(dir) {
 				return dir, nil
 			}
 			parent := filepath.Dir(dir)
@@ -7449,6 +7600,20 @@ func findRepoRoot() (string, error) {
 		}
 	}
 	return "", errors.New("repo root not found")
+}
+
+func isRepoRoot(dir string) bool {
+	markers := []string{
+		"go.mod",
+		filepath.Join("internal", "assets", "assets.go"),
+		filepath.Join(gatewayDeployDir, ".env"),
+	}
+	for _, marker := range markers {
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func mustParseURL(raw string) *url.URL {

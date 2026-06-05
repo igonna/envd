@@ -125,7 +125,7 @@ func TestEncryptedStateDoesNotLeakSensitiveValues(t *testing.T) {
 
 func TestLoadGatewayConfig(t *testing.T) {
 	root := t.TempDir()
-	gwDir := filepath.Join(root, "vpn-gateway")
+	gwDir := filepath.Join(root, "deploy", "gateway")
 	if err := os.MkdirAll(gwDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -155,19 +155,41 @@ func TestLoadGatewayConfig(t *testing.T) {
 	}
 }
 
-func TestProxyPrintsEffectivePorts(t *testing.T) {
-	root := t.TempDir()
-	gwDir := filepath.Join(root, "vpn-gateway")
-	if err := os.MkdirAll(gwDir, 0o755); err != nil {
-		t.Fatal(err)
+func validTestGatewayConfig(serverIP string) gatewayConfig {
+	return gatewayConfig{
+		BindIP:       "127.0.0.1",
+		SOCKSPort:    11080,
+		HTTPHostPort: 11081,
+		SOCKSInner:   2088,
+		HTTPInner:    2089,
+		ServerIP:     serverIP,
+		ServerPort:   "443",
+		Raw: map[string]string{
+			"XRAY_UUID":       "00000000-0000-0000-0000-000000000000",
+			"XRAY_PUBLIC_KEY": "pub",
+			"XRAY_SNI":        "example.com",
+			"XRAY_SHORT_ID":   "abcd",
+		},
 	}
-	if err := os.WriteFile(filepath.Join(gwDir, ".env"), []byte("XRAY_SOCKS_PORT=11080\nXRAY_HTTP_PROXY_HOST_PORT=11081\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+}
 
+func TestProxyPrintsEffectivePorts(t *testing.T) {
 	var out bytes.Buffer
-	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: root}
-	if err := a.run([]string{"proxy"}); err != nil {
+	st := envdState{
+		ActiveGateway: "ams1",
+		Gateways: map[string]gatewayRecord{
+			"ams1": gatewayRecordFromConfig("ams1", gatewayConfig{
+				BindIP:       "127.0.0.1",
+				SOCKSPort:    11080,
+				HTTPHostPort: 11081,
+				ServerIP:     "1.2.3.4",
+				ServerPort:   "443",
+				Raw:          map[string]string{},
+			}, time.Now().UTC()),
+		},
+	}
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	if err := a.runProxy(nil, &st); err != nil {
 		t.Fatalf("proxy failed: %v", err)
 	}
 	got := out.String()
@@ -180,7 +202,7 @@ func TestProxyPrintsEffectivePorts(t *testing.T) {
 
 func TestXrayProviderRender(t *testing.T) {
 	root := t.TempDir()
-	gwDir := filepath.Join(root, "vpn-gateway")
+	gwDir := filepath.Join(root, "deploy", "gateway")
 	if err := os.MkdirAll(gwDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -216,9 +238,34 @@ func TestXrayProviderRender(t *testing.T) {
 	}
 }
 
+func TestXrayProviderRenderUsesEmbeddedTemplateWithoutRepo(t *testing.T) {
+	cfg := gatewayConfig{
+		SOCKSInner: 2088,
+		HTTPInner:  2089,
+		ServerIP:   "1.2.3.4",
+		ServerPort: "443",
+		Raw: map[string]string{
+			"XRAY_UUID":       "00000000-0000-0000-0000-000000000000",
+			"XRAY_PUBLIC_KEY": "pub",
+			"XRAY_SNI":        "example.com",
+			"XRAY_SHORT_ID":   "abcd",
+		},
+	}
+	rendered, err := (xrayProvider{}).Render(app{root: t.TempDir()}, cfg)
+	if err != nil {
+		t.Fatalf("embedded render failed: %v", err)
+	}
+	if !json.Valid(rendered) {
+		t.Fatalf("embedded rendered config is invalid JSON: %s", rendered)
+	}
+	if strings.Contains(string(rendered), "${") {
+		t.Fatalf("embedded render left unresolved template variable: %s", rendered)
+	}
+}
+
 func TestXrayProviderRenderMissingRequiredValue(t *testing.T) {
 	root := t.TempDir()
-	gwDir := filepath.Join(root, "vpn-gateway")
+	gwDir := filepath.Join(root, "deploy", "gateway")
 	if err := os.MkdirAll(gwDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -228,6 +275,79 @@ func TestXrayProviderRenderMissingRequiredValue(t *testing.T) {
 	_, err := (xrayProvider{}).Render(app{root: root}, gatewayConfig{Raw: map[string]string{}})
 	if err == nil || !strings.Contains(err.Error(), "missing XRAY_SERVER_IP") {
 		t.Fatalf("unexpected render error: %v", err)
+	}
+}
+
+func TestGatewayRuntimeMaterializesWithoutEnvFile(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("ENVD_DATA_DIR", dataDir)
+	cfg := gatewayConfig{
+		BindIP:       "127.0.0.1",
+		SOCKSPort:    11080,
+		HTTPHostPort: 11081,
+		SOCKSInner:   2088,
+		HTTPInner:    2089,
+		ServerIP:     "1.2.3.4",
+		ServerPort:   "443",
+		Raw: map[string]string{
+			"XRAY_UUID":       "00000000-0000-0000-0000-000000000000",
+			"XRAY_PUBLIC_KEY": "pub",
+			"XRAY_SNI":        "example.com",
+			"XRAY_SHORT_ID":   "abcd",
+		},
+	}
+	dir, err := (app{root: t.TempDir()}).materializeGatewayRuntime(cfg)
+	if err != nil {
+		t.Fatalf("materialize gateway runtime failed: %v", err)
+	}
+	if !strings.HasPrefix(dir, dataDir) {
+		t.Fatalf("runtime dir %q outside data dir %q", dir, dataDir)
+	}
+	configRaw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatalf("config not written: %v", err)
+	}
+	if !json.Valid(configRaw) {
+		t.Fatalf("materialized config invalid JSON: %s", configRaw)
+	}
+	composeRaw, err := os.ReadFile(filepath.Join(dir, "compose.yml"))
+	if err != nil {
+		t.Fatalf("compose not written: %v", err)
+	}
+	compose := string(composeRaw)
+	for _, forbidden := range []string{"env_file", ".env", "${"} {
+		if strings.Contains(compose, forbidden) {
+			t.Fatalf("compose contains manual env dependency %q:\n%s", forbidden, compose)
+		}
+	}
+	for _, want := range []string{"name: vpn-gateway", "127.0.0.1:11080:2088", "127.0.0.1:11081:2089", "./config.json:/etc/xray/config.json:ro"} {
+		if !strings.Contains(compose, want) {
+			t.Fatalf("compose missing %q:\n%s", want, compose)
+		}
+	}
+}
+
+func TestActiveGatewayConfigRequiresEncryptedState(t *testing.T) {
+	st := envdState{Gateways: map[string]gatewayRecord{}}
+	_, _, err := (app{root: t.TempDir()}).activeGatewayConfig(&st)
+	if err == nil || !strings.Contains(err.Error(), "no active gateway") {
+		t.Fatalf("expected active gateway error, got %v", err)
+	}
+}
+
+func TestActiveGatewayConfigUsesEncryptedStateWithoutRepo(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := gatewayConfig{ServerIP: "1.2.3.4", ServerPort: "443", Raw: map[string]string{"XRAY_UUID": "uuid"}}
+	st := envdState{
+		ActiveGateway: "ams1",
+		Gateways:      map[string]gatewayRecord{"ams1": gatewayRecordFromConfig("ams1", cfg, now)},
+	}
+	got, source, err := (app{root: t.TempDir()}).activeGatewayConfig(&st)
+	if err != nil {
+		t.Fatalf("active gateway from encrypted state failed: %v", err)
+	}
+	if source != "encrypted state" || got.ServerIP != "1.2.3.4" {
+		t.Fatalf("unexpected active gateway: source=%q cfg=%+v", source, got)
 	}
 }
 
@@ -543,6 +663,25 @@ func TestDevContainerArgsBlockHostDockerAndHostAccessByDefault(t *testing.T) {
 	}
 	if strings.Contains(directArgs, "DOCKER_HOST=") {
 		t.Fatalf("direct mode enabled project Docker endpoint: %q", directArgs)
+	}
+}
+
+func TestEmbeddedAssetContextMaterializesWithoutRepo(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("ENVD_DATA_DIR", dataDir)
+	dir, err := materializeEmbeddedAssetContext(projectDockerImage, "containers/project-docker")
+	if err != nil {
+		t.Fatalf("materialize embedded context failed: %v", err)
+	}
+	if !strings.HasPrefix(dir, dataDir) {
+		t.Fatalf("context dir %q outside data dir %q", dir, dataDir)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "Dockerfile"))
+	if err != nil {
+		t.Fatalf("embedded Dockerfile missing: %v", err)
+	}
+	if !strings.Contains(string(raw), "docker:27-dind-rootless") {
+		t.Fatalf("unexpected embedded Dockerfile: %s", raw)
 	}
 }
 
@@ -2087,13 +2226,16 @@ func TestSealedRuntimeRecreateReason(t *testing.T) {
 }
 
 func TestGatewayActivationTracksPreviousAndRollbackEvents(t *testing.T) {
+	t.Setenv("ENVD_DATA_DIR", t.TempDir())
 	now := time.Now().UTC()
+	oldCfg := validTestGatewayConfig("1.1.1.1")
+	newCfg := validTestGatewayConfig("2.2.2.2")
 	st := envdState{
 		GatewayGeneration: 2,
 		ActiveGateway:     "old",
 		Gateways: map[string]gatewayRecord{
-			"old": gatewayRecordFromConfig("old", gatewayConfig{ServerIP: "1.1.1.1", ServerPort: "443", Raw: map[string]string{}}, now),
-			"new": gatewayRecordFromConfig("new", gatewayConfig{ServerIP: "2.2.2.2", ServerPort: "443", Raw: map[string]string{}}, now),
+			"old": gatewayRecordFromConfig("old", oldCfg, now),
+			"new": gatewayRecordFromConfig("new", newCfg, now),
 		},
 		Environments: map[string]envRecord{},
 	}
@@ -2155,7 +2297,7 @@ func TestGatewayActivationFailureDoesNotMutateState(t *testing.T) {
 
 func TestGatewayUseFailedRenderKeepsPreviousActive(t *testing.T) {
 	root := t.TempDir()
-	gwDir := filepath.Join(root, "vpn-gateway")
+	gwDir := filepath.Join(root, "deploy", "gateway")
 	if err := os.MkdirAll(gwDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

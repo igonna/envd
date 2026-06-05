@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 go_image=${ENVD_GO_IMAGE:-golang:1.22-alpine}
 alpine_image=${ENVD_ALPINE_IMAGE:-alpine:3.21}
 build_dir="$repo_dir/build/linux-luks"

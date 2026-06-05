@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 envd_bin=${ENVD_BIN:-"$HOME/.local/bin/envd"}
 if [ ! -x "$envd_bin" ]; then
   envd_bin="$repo_dir/build/envd"
@@ -17,14 +17,21 @@ password="test-password"
 port="18080"
 
 cleanup() {
-  ENVD_HOME="$state_dir" ENVD_MASTER_PASSWORD="$password" "$envd_bin" rm "$env_name" --yes >/dev/null 2>&1 || true
+  ENVD_STATE_DIR="$state_dir" ENVD_MASTER_PASSWORD="$password" "$envd_bin" rm "$env_name" --yes >/dev/null 2>&1 || true
   rm -rf "$state_dir"
 }
 trap cleanup EXIT INT TERM
 
 envd() {
-  ENVD_HOME="$state_dir" ENVD_MASTER_PASSWORD="$password" "$envd_bin" "$@"
+  ENVD_STATE_DIR="$state_dir" ENVD_MASTER_PASSWORD="$password" "$envd_bin" "$@"
 }
+
+if [ -f "$repo_dir/deploy/gateway/.env" ]; then
+  (cd "$repo_dir" && envd gateway import-local verify --yes >/dev/null)
+else
+  echo "verify-project-docker requires deploy/gateway/.env or a prepared gateway import path" >&2
+  exit 1
+fi
 
 echo "==> create sealed env with managed project Docker"
 envd run "$env_name" >/dev/null

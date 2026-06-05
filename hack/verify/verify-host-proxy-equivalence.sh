@@ -1,10 +1,12 @@
 #!/usr/bin/env sh
 set -eu
 
-repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 envd_bin=${ENVD_BIN:-"$HOME/.local/bin/envd"}
 alpine_image=${ENVD_ALPINE_IMAGE:-alpine:3.21}
 target_url=${ENVD_PROXY_TEST_URL:-https://example.com/}
+state_dir=""
+password="test-password"
 
 if [ ! -x "$envd_bin" ]; then
   envd_bin="$repo_dir/build/envd"
@@ -14,8 +16,30 @@ if [ ! -x "$envd_bin" ]; then
   exit 1
 fi
 
+cleanup() {
+  if [ -n "$state_dir" ]; then
+    rm -rf "$state_dir"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+envd() {
+  if [ -n "$state_dir" ]; then
+    ENVD_STATE_DIR="$state_dir" ENVD_MASTER_PASSWORD="$password" "$envd_bin" "$@"
+  else
+    "$envd_bin" "$@"
+  fi
+}
+
+if [ -f "$repo_dir/deploy/gateway/.env" ]; then
+  state_dir=$(mktemp -d "$repo_dir/envd-host-proxy-state.XXXXXX")
+  (cd "$repo_dir" && envd gateway import-local verify --yes >/dev/null)
+else
+  echo "No legacy deploy/gateway/.env found; using the caller's active envd state." >&2
+fi
+
 echo "==> host proxy protocol check"
-"$envd_bin" proxy test -target example.com:443 -timeout 15s
+envd proxy test -target example.com:443 -timeout 15s
 
 echo "==> Linux client proxy protocol check via host.docker.internal"
 docker run --rm \

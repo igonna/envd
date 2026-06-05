@@ -158,7 +158,7 @@ because host apps often already use those ports.
 
 Host proxy equivalence is a tested contract, not an assumption: `envd proxy
 test` verifies the host SOCKS/HTTP protocol path, and
-`scripts/verify-host-proxy-equivalence.sh` verifies a Linux Docker client can
+`hack/verify/verify-host-proxy-equivalence.sh` verifies a Linux Docker client can
 reach the same host-published SOCKS and HTTP CONNECT endpoints through
 `host.docker.internal`.
 
@@ -406,8 +406,7 @@ Catalog maintenance model:
 Repository layout idea:
 
 ```text
-data/hosting/providers.yaml
-data/hosting/regions.yaml
+data/hosting/providers.json
 data/hosting/schema.json
 data/hosting/sources.md
 ```
@@ -1112,6 +1111,24 @@ restore required assets/images automatically when safe.
 state. If a user runs `docker image prune -a` or otherwise deletes images, the
 next command that needs those images should repair automatically.
 
+Installed `envd` binaries must be self-contained for envd-owned runtime assets.
+The binary embeds the default dev container, sidecar, project-Docker build
+contexts, and gateway render templates. A repo checkout may be used during local
+development, but installed commands must not require `dev-containers/`,
+`deploy/gateway/`, copied compose files, or an `example.env`.
+
+Normal gateway operation is state-driven:
+
+```text
+encrypted gateway record -> embedded gateway template -> envd data/runtime dir
+```
+
+`envd gateway install` and `envd gateway use` are the normal path. `gateway use`
+materializes `config.json` and the local gateway compose file under the envd
+data directory from encrypted state. `gateway import-local` exists only to
+migrate old manual `.env` setups into encrypted state; it is not the normal UX
+and should not be required after installation.
+
 The asset cache should include:
 
 - Pinned Xray/gateway image or build context.
@@ -1533,7 +1550,7 @@ Project engine rules:
   Docker socket mounts, privileged host access, or arbitrary device mounts, are
   blocked by default.
 
-`scripts/verify-project-docker.sh` is the release gate for this subsystem. It
+`hack/verify/verify-project-docker.sh` is the release gate for this subsystem. It
 creates a sealed env, verifies `docker` and `docker compose` use the managed
 endpoint, verifies project-container egress matches gateway egress, proves
 published project ports are not reachable from the host, disconnects the sidecar
