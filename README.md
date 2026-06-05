@@ -24,6 +24,14 @@ envd version
 envd help
 ```
 
+Build release-style binaries for common platforms:
+
+```bash
+./build.sh
+```
+
+Outputs go to `build/dist/` for macOS arm64/amd64 and Linux arm64/amd64.
+
 ## Normal Flow
 
 Create or adopt a gateway:
