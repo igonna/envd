@@ -53,7 +53,7 @@ Core user promises:
 - Every stateful envd command uses secure encrypted state; plaintext state is not
   a fallback mode.
 - Projects can declare non-secret envd intent in the repo when useful.
-- Risky migrations can preserve recoverable volume snapshots.
+- Risky migrations create automatic encrypted recovery points.
 - envd records an event log so "what changed?" is answerable.
 - `envd doctor --deep` identifies the broken layer with real traffic tests.
 - macOS and Linux behavior should be equivalent except where Docker itself
@@ -96,8 +96,8 @@ repair, it should be questioned.
   normal Docker images.
 - Runtime install/bootstrap should be owned by `envd`, not copied from README
   snippets.
-- `envd init` may exist for explicit setup, but normal commands must lazily
-  initialize required state themselves.
+- There is no setup/init ritual in normal UX. Normal commands must lazily
+  initialize required encrypted state themselves.
 - Secrets must not be stored in world-readable files.
 - `doctor --deep` must test real traffic, not just container liveness.
 - Network mode changes must be explicit and must stop/recreate affected
@@ -188,7 +188,6 @@ Command design should leave room for this:
 ```bash
 envd gateway install ams1 --host 1.2.3.4 --user root --provider xray
 envd gateway inspect ams1
-envd gateway repair ams1
 envd gateway use ams1
 envd user add phone
 envd user uri phone
@@ -251,8 +250,8 @@ Rules:
 - Do not claim any protocol is permanently undetectable.
 - Pin provider versions and strategy definitions.
 - Store the strategy version in gateway state.
-- `envd self update` may add newer strategies, but must not silently mutate an
-  existing gateway.
+- Signed strategy/catalog refresh may add newer strategies, but must not silently
+  mutate an existing gateway.
 - Strategy changes require explicit commands and real verification.
 
 Example:
@@ -304,15 +303,10 @@ Commands:
 ```bash
 envd internet status
 envd internet report
-envd internet sources
-envd hosting update
 envd hosting check
 envd hosting list
 envd hosting shortlist
-envd gateway prepare
 envd gateway risk ams1
-envd provider token set provider-a
-envd gateway create ams2 --provider provider-a --region nl
 ```
 
 `envd internet status` should summarize the user's current network:
@@ -365,8 +359,8 @@ Provider/hosting catalog:
 - Do not only list the most famous providers. Well-known providers may be
   targeted first, so the catalog should include a broad, maintained spread of
   smaller reputable providers too.
-- Catalog entries should be versioned and updateable by `envd self update` or
-  `envd hosting update`.
+- Catalog entries should be versioned and refreshed through envd's signed
+  catalog update path.
 - Catalog entries should have confidence levels: `verified`, `community`,
   `user`, `stale`, `unknown`.
 - The default catalog should be good enough that most users never manually add a
@@ -440,27 +434,14 @@ notes:
 confidence: user
 ```
 
-Catalog commands:
-
-```bash
-envd hosting update
-envd hosting add
-envd hosting edit senko-digital
-envd hosting import providers.yaml
-envd hosting export --local providers.yaml
-envd hosting history
-```
-
-`hosting add`, `edit`, `import`, and `export` are advanced escape hatches. The
-normal path should use the maintained catalog.
+Catalog refresh should be automatic through signed envd catalog updates. Manual
+catalog editing is not normal UX.
 
 Gateway acquisition flow:
 
 ```bash
-envd hosting list --region europe --payment crypto
-envd hosting check
 envd hosting shortlist
-envd gateway prepare
+envd gateway install ams2 --host <ip> --user root --password
 ```
 
 `envd hosting shortlist` should rank providers by:
@@ -505,20 +486,14 @@ provider-e      fail fail ok ok     recovered
 This lets the user see what changed since the last check instead of redoing
 research manually.
 
-`envd gateway prepare` should guide the user through creating the next gateway:
+`envd hosting shortlist` should guide the user through creating the next
+gateway:
 
 ```text
 1. Pick provider/region.
 2. Open signup/create-server URL.
 3. Show recommended VPS size and OS image.
 4. After the user enters IP/root/password, continue with gateway install.
-```
-
-If a provider API token is configured, envd may automate VPS creation:
-
-```bash
-envd provider token set provider-a
-envd gateway create ams2 --provider provider-a --region nl
 ```
 
 Rules:
@@ -684,10 +659,11 @@ Principles:
 - If an asset, image, profile build, gateway config, or state directory is
   missing, the command that needs it should restore or create it.
 - If a change is risky, show a concise plan and ask before applying.
-- If a command cannot safely repair automatically, fail with the exact command
-  that can repair it.
-- Keep `status`, `inspect`, `doctor`, `logs`, `prune`, and explicit `repair`
-  commands for visibility, debugging, cleanup, and automation.
+- If a command cannot safely repair automatically, explain the exact blocker and
+  the smallest next action, usually `envd doctor --deep` or an inline
+  confirmation prompt.
+- Keep `status`, `inspect`, `doctor`, and `logs` for visibility and debugging.
+  Cleanup and repair should happen automatically when envd has enough context.
 
 Examples:
 
@@ -741,6 +717,13 @@ envd gateway use <name>
 envd run <name>
   Create a dev environment. Uses sealed networking by default.
 
+envd code <name>
+  Open the environment in VS Code through an envd-controlled local SSH proxy.
+
+envd lock
+  Stop envd-owned work, revoke identities/secrets, close protected storage, and
+  then clean up registered Docker artifacts asynchronously.
+
 --network direct
   Explicitly use normal Docker networking. This can expose traffic outside the
   gateway and is never selected automatically.
@@ -749,22 +732,18 @@ envd run <name>
 ### Top Level
 
 ```bash
-envd self doctor
-envd self update
-envd self repair
 envd doctor
 envd doctor --deep
 envd status
 envd events
 envd why books
 envd lock
-envd unlock
-envd secure status
-envd init
 ```
 
-`envd init` may exist as an explicit preflight command, but it must not be
-required before `envd run`, `envd gateway install`, `envd ps`, or diagnostics.
+No init command is required. The first stateful command creates or unlocks
+encrypted envd state automatically. There is no required unlock ritual; after
+`envd lock`, the next stateful command asks for the master password and resumes
+if policy allows.
 
 ### Primary Happy Path
 
@@ -792,6 +771,7 @@ envd gateway use <name>
 envd run <env>
 envd ps
 envd shell <env>
+envd code <env>
 envd stop <env>
 envd start <env>
 envd rm <env>
@@ -820,29 +800,21 @@ envd pkg promote <env> --to <profile>
 envd migrate <env> --profile <profile>
 ```
 
-Maintenance commands:
-
-```bash
-envd self doctor
-envd self repair
-envd images repair
-envd assets fetch
-envd backup configure
-envd backup status <env>
-envd gateway repair <name>
-envd gateway rollback
-```
+Support/repair actions should usually be suggested by `envd doctor`, `envd why`,
+or the command that failed. They should not be commands the user memorizes for
+normal operation.
 
 Rules:
 
-- No required `envd init`.
+- No init/setup command in normal use.
 - No required profile/image build command in normal use.
 - No required manual image repair after Docker prune.
 - No proxy environment variables inside sealed environments.
 - No copied long-lived identity files.
 - No direct-network fallback.
 - No silent Docker socket exposure.
-- No managed Compose in v2 core.
+- No Compose reimplementation. Standard `docker compose` should work inside an
+  envd shell by using an envd-managed sealed Docker engine.
 - No expectation that users manually research VPS providers during outages.
   envd ships and updates a maintained hosting catalog.
 
@@ -860,10 +832,7 @@ envd gateway chain status workchain
 envd gateway status
 envd gateway doctor
 envd gateway logs
-envd gateway sync
-envd gateway repair ams1
 envd gateway inspect ams1
-envd gateway prune ams1
 envd gateway egress ams1
 envd gateway policy set ams1 --expect-country NL --strict
 envd gateway upgrade
@@ -872,12 +841,13 @@ envd gateway rm ams1
 ```
 
 Gateway commands manage both the active local gateway and the remote server
-profile behind it. The CLI can still expose advanced inspection/repair commands,
-but the primary install flow must be one command.
+profile behind it. The primary install flow must be one command.
 
 Normal usage should mostly be `gateway install`, `gateway use`, and
-`gateway status`. `inspect`, `repair`, `prune`, logs, rollback, and explicit
-upgrade commands are for debugging, recovery, cleanup, and controlled changes.
+`gateway status`. `inspect`, logs, rollback, and explicit upgrade commands are
+for debugging, recovery visibility, and controlled changes. Repair and cleanup of
+envd-owned remote resources should be automatic when a gateway command has enough
+context.
 
 `gateway install` behavior:
 
@@ -949,7 +919,6 @@ Commands that can change gateway behavior:
 
 - `envd gateway install`
 - `envd gateway use`
-- `envd gateway repair`
 - `envd gateway rollback`
 - `envd gateway upgrade`
 - `envd gateway strategy set`
@@ -973,16 +942,16 @@ drop policy and `envd ps` should show the issue:
 
 ```text
 NAME   STATE    NET     VPN      PROFILE  ISSUE
-books  running  sealed  blocked  web      gateway sync failed
+books  running  sealed  blocked  web      gateway reconciliation failed
 ```
 
-Manual repair commands:
+Recovery path:
 
-```bash
-envd gateway sync
-envd repair books --network
-envd doctor books --deep
-```
+- The gateway change command should reconcile affected environments
+  automatically.
+- If reconciliation cannot complete safely, affected environments stay
+  fail-closed.
+- `envd doctor --deep` should explain the failed layer and what envd tried.
 
 No design should depend on restarting all of Docker to make containers notice a
 gateway config change.
@@ -1025,7 +994,8 @@ Result:        OK
 Policy rules:
 
 - Egress policy checks should run during `gateway install`, `gateway use`,
-  `gateway sync`, `doctor --deep`, and sealed environment startup.
+  internal gateway reconciliation, `doctor --deep`, and sealed environment
+  startup.
 - If `--strict` is enabled and policy cannot be verified, fail closed.
 - If host egress and sealed egress differ, fail closed for sealed environments.
 - If egress appears to be direct host internet instead of the gateway, fail
@@ -1055,10 +1025,7 @@ envd user enable phone
 ### Identities
 
 ```bash
-envd identity create work
-envd identity set work --git-name "Name" --git-email "me@example.com"
-envd identity key import work ~/.ssh/id_ed25519
-envd identity token set work github
+envd identity add work
 envd identity policy set work --require sealed
 envd identity policy set work --expect-country NL --strict
 envd identity list
@@ -1073,7 +1040,6 @@ those credentials can be used inside an environment.
 ```bash
 envd proxy
 envd proxy test
-envd proxy restart
 envd proxy logs
 ```
 
@@ -1091,15 +1057,10 @@ Remote egress: x.x.x.x
 ```bash
 envd internet status
 envd internet report
-envd internet sources
-envd hosting update
 envd hosting check
 envd hosting list
 envd hosting shortlist
-envd gateway prepare
 envd gateway risk ams1
-envd provider token set provider-a
-envd gateway create ams2 --provider provider-a --region nl
 ```
 
 These commands summarize censorship/reachability signals, hosting/provider
@@ -1110,23 +1071,12 @@ protocol-specific, or broad network disruption.
 
 ### Runtime Assets
 
-```bash
-envd assets status
-envd assets fetch
-envd assets verify
-envd assets prune
-envd images
-envd images repair
-```
-
-Normal commands should fetch, verify, build, or restore required assets/images
-automatically when safe. Asset and image commands are for inspection,
-prewarming, explicit repair, and cleanup.
+Runtime assets are internal. Normal commands should fetch, verify, build, or
+restore required assets/images automatically when safe.
 
 `envd` should keep a managed runtime asset cache outside normal user project
-state. If a user runs `docker image prune -a` or otherwise deletes images,
-the next command that needs those images should attempt repair automatically.
-`envd images repair` remains available as an explicit manual repair command.
+state. If a user runs `docker image prune -a` or otherwise deletes images, the
+next command that needs those images should repair automatically.
 
 The asset cache should include:
 
@@ -1147,7 +1097,7 @@ If automatic repair fails:
 ```text
 FAIL Required image missing: envd/net-sidecar:<version>
 Auto-repair failed: registry unavailable
-Action: envd images repair --network direct
+Action: envd doctor --deep
 ```
 
 ### Environments
@@ -1158,17 +1108,12 @@ envd run dev1 --network sealed
 envd run dev1 --network direct
 envd run dev1 --network offline
 envd shell dev1
-envd run-cmd dev1 -- <command>
 envd stop dev1
 envd start dev1
 envd restart dev1
 envd rm dev1
 envd ps
 envd inspect dev1
-envd repair dev1
-envd snapshot dev1
-envd restore dev1 <snapshot-or-archive>
-envd storage status dev1
 envd network set dev1 sealed
 ```
 
@@ -1207,12 +1152,130 @@ books         running  sealed  ok    NL x.x.x.x default  9df44ebfc908   image id
 
 Expected action:
 
-```bash
-envd repair books
+```text
+envd repairs the declared image automatically on next start/recreate.
+envd doctor --deep explains if automatic repair cannot finish.
 ```
 
-Repair should rebuild or restore the pinned image that matches the saved envd
-spec, then recreate containers while preserving env volumes.
+### Idle Supervisor And Auto-Stop
+
+Many environments will be created with `envd run` and then forgotten. envd should
+clean these up automatically without making the user micromanage containers.
+
+This is resource management, not a security primitive. `envd lock` remains the
+explicit security action.
+
+Default behavior:
+
+```text
+idle stop enabled
+default stop-after 3h
+only stop when envd is confident the environment is unused
+```
+
+An environment is considered active if any of these are true:
+
+- An envd-owned shell, SSH, VS Code, or one-shot command session is attached.
+- An envd-managed port forward has active connections.
+- An envd-managed service/app runtime is running and marked keep-alive.
+- A sealed project Docker operation is running.
+- A profile build, migration, recovery-point operation, or repair is running.
+- envd cannot confidently distinguish baseline container processes from user
+  work.
+
+An environment can be auto-stopped only when:
+
+- No envd-owned access sessions are attached.
+- No envd-managed keep-alive service is running.
+- No active envd-managed port connections exist.
+- No envd-managed project Docker operation is active.
+- No risky migration, recovery-point, or repair operation is active.
+- The environment has stayed idle for the configured grace period.
+
+When auto-stop happens:
+
+- Stop the dev environment.
+- Stop its sidecar and sealed project Docker engine if present.
+- Close protected storage.
+- Keep envd state, recovery points, and profile images intact.
+- Record the reason in events.
+- Show the stop reason in `envd ps` and `envd why <env>`.
+
+Expected status:
+
+```text
+NAME   STATE    IDLE       STORAGE    ISSUE
+books  stopped  idle 3h    protected  auto-stopped, envd start books
+api    running  active     protected  VS Code attached
+db     running  keep-alive protected  service postgres
+```
+
+Configuration should stay simple:
+
+```bash
+envd run books --idle-stop 3h
+envd run db --keep-running
+envd inspect books
+```
+
+Project manifests may declare non-secret idle intent:
+
+```yaml
+idle:
+  stop_after: 3h
+  keep_running: false
+```
+
+Rules:
+
+- Auto-stop must never delete environment data.
+- Auto-stop must never prune images, layers, caches, or recovery points.
+- Auto-stop should be conservative. If envd is unsure whether user work is
+  active, leave the environment running and explain why.
+- Auto-stop should not apply to raw host Docker containers except for registered
+  cleanup on explicit `envd lock`.
+- `envd start <env>` should restore the environment from protected storage.
+- `envd code <env>` or `envd shell <env>` should start a stopped environment
+  lazily when safe.
+- Users should not need to keep a terminal open just to prevent stop; declared
+  services or `--keep-running` are the explicit keep-alive mechanism.
+
+### Supervisor Process
+
+envd may run a small user-level supervisor to coordinate lifecycle events.
+
+Responsibilities:
+
+- Track envd-owned sessions and editor/SSH proxy connections.
+- Track idle timers and perform conservative auto-stop.
+- Coordinate `envd lock` broadcasts to envd-owned terminals.
+- Process registered Docker cleanup queued after core sealing.
+- Watch envd-managed port forward lifecycle.
+- Record lifecycle events.
+
+Efficiency requirements:
+
+- User-level process only; no root daemon for normal operation.
+- Event-driven where possible; no busy polling.
+- Coarse timers for idle checks, for example minute-scale, not second-scale.
+- No continuous network probes in the idle loop.
+- No battery-expensive Docker scans in tight loops.
+- Start on demand when envd has active environments, sessions, proxy targets, or
+  pending cleanup.
+- Sleep or exit when there is nothing to manage.
+- Foreground envd commands must still reconcile state if the supervisor is not
+  running.
+
+Platform model:
+
+- macOS: user `launchd` agent or on-demand process.
+- Linux: user `systemd` service/timer or on-demand process.
+- No platform-specific secret store dependency.
+- Same behavior at the envd command level on macOS and Linux.
+
+The supervisor is a lifecycle coordinator, not an authority that weakens the
+security model. If it crashes or is killed, the next envd command should detect
+stale state, reconcile safely, and fail closed where needed.
 
 ### Workspaces And Project Manifests
 
@@ -1234,7 +1297,7 @@ Useful commands:
 ```bash
 envd run books .
 envd inspect books
-envd open books
+envd code books
 ```
 
 `envd inspect books` should show:
@@ -1281,35 +1344,57 @@ Manifest rules:
 This gives teams or future machines a simple "clone repo, run envd" path without
 turning envd into a complex orchestration platform.
 
-### Data, Snapshots, And Restore
+### Data And Automatic Recovery Points
 
 Volumes are user data. Rebuilds and migrations are only safe if volume handling
 is explicit and recoverable.
 
-Commands:
+Rules:
 
-```bash
-envd snapshot books
-envd snapshots books
-envd restore books <snapshot>
-envd backup books
-envd restore books <archive>
+- Profile migration, network mode changes, and major image repairs should create
+  an encrypted recovery point automatically when volumes are affected.
+- Recovery points are internal safety points, not a user-managed archive product.
+- Recovery points should be local and fast when the storage backend supports it.
+- Recovery points are encrypted by default.
+- Recovery points should not include envd secrets unless they are part of the
+  encrypted envd state required for that environment's recovery.
+- `envd rm <env>` is the explicit removal action. After confirmation, it should
+  remove the environment, protected storage, env-owned recovery points, and env
+  state together.
+- `envd ps`, `envd inspect`, and `envd why` may mention that an automatic
+  recovery point exists when it is relevant, but users should not manage recovery
+  points during normal use.
+
+This protects the user from "small image/package change destroyed my dev state"
+failure modes.
+
+### Recovery Point Retention
+
+Recovery points must not grow forever. envd should keep only what is useful for
+current environments and automatically delete the rest.
+
+Default lifecycle:
+
+```text
+keep the latest recovery point per active environment
+keep recent pre-change recovery points for a short rollback window
+delete recovery points for envs removed by envd rm
+prune only after the current protected storage is verified
 ```
 
 Rules:
 
-- Profile migration, network mode changes, and major image repairs should offer
-  or create a pre-change snapshot when volumes are affected.
-- Snapshots should be local and fast when Docker supports it.
-- Backups should be portable archives for moving to another machine.
-- Backup export should exclude secrets by default.
-- Including secrets must require explicit `--include-secrets`.
-- `envd rm` should not delete volumes unless explicitly requested.
-- `envd ps` or `envd inspect` should show whether an environment has recoverable
-  snapshots.
-
-This protects the user from "small image/package change destroyed my dev state"
-failure modes.
+- Recovery point pruning is automatic.
+- No normal recovery-point management commands.
+- Pruning deletes only envd-managed recovery points, never live environment data.
+- Pruning should happen only after storage integrity verification succeeds.
+- Keep enough recent recovery points to rollback the latest risky operation.
+- Remove old recovery points when the environment is stable and they are no
+  longer needed.
+- Remove all env-owned recovery points when `envd rm <env>` removes that
+  environment.
+- If recovery point storage grows unexpectedly, `envd doctor` and `envd inspect`
+  should explain why envd is keeping them.
 
 ### Services And Ports
 
@@ -1337,44 +1422,188 @@ normal Docker networking and bypass the gateway.
 Principle:
 
 ```text
-sealed parent environment does not automatically make child Docker containers sealed
+sealed parent environment does not automatically make host Docker containers sealed
 ```
 
-That means raw Docker and Docker Compose are outside the sealed guarantee unless
-envd explicitly manages that specific workflow:
+Raw host Docker is outside the sealed guarantee. If a process talks to the host
+Docker daemon, Docker creates sibling containers on the host, and those
+containers may use normal Docker networking.
+
+envd cannot make arbitrary host Docker safe unless envd controls the Docker API
+endpoint being used. Global shell wrappers, warnings, or PATH tricks are not a
+security boundary because users and tools can bypass them.
+
+### Sealed Project Docker
+
+The safe model is a Docker-compatible project engine managed by envd.
+
+User experience:
 
 ```bash
-docker run ...
+envd shell books
 docker compose up
 ```
 
-Compose support should not be part of the v2 core. Compose has too many features
-and edge cases to safely wrap casually. The initial goal is to avoid accidental
-leaks, not to reimplement Compose semantics.
+Inside an envd shell, `docker` and `docker compose` should talk to the
+envd-managed project Docker engine, not the host Docker daemon. The user still
+uses standard Docker and Compose commands. envd does not reimplement Compose
+semantics.
 
-Options:
+Project engine rules:
 
-- Do not mount the host Docker socket by default.
-- If the Docker socket is mounted, install wrapper scripts for `docker` and
-  `docker compose` that warn when a command is outside envd's sealed guarantee.
-- Allow raw host Docker access only with explicit opt-in.
+- The host Docker socket is not mounted by default.
+- `DOCKER_HOST` or Docker context inside the env points to the envd project
+  engine.
+- The project engine is created lazily on first Docker use.
+- The project engine runs under envd control and uses the sealed gateway route.
+- Images, Compose networks, Compose volumes, and build cache for the project
+  engine live in envd-managed protected storage.
+- If the sealed route is unhealthy, project Docker operations fail closed.
+- DNS, IPv4, and IPv6 for project containers must follow the sealed network
+  policy.
+- Compose `ports:` must not silently publish services to the host or LAN. Host
+  exposure goes through envd port policy.
+- Compose host path mounts are allowed only for envd-approved workspace paths.
+  Arbitrary host paths are blocked or require an explicit unsafe override.
+- Compose features that break isolation, such as host networking, raw host
+  Docker socket mounts, privileged host access, or arbitrary device mounts, are
+  blocked by default.
+
+This makes common Compose development safe without inventing an `envd compose`
+command.
+
+Expected status:
+
+```text
+NAME   NET     DOCKER          VPN   STORAGE    ISSUE
+books  sealed  sealed-engine  ok    protected  -
+```
+
+Useful commands:
+
+```bash
+envd inspect books
+envd doctor --deep
+```
+
+Normal usage remains standard `docker` and `docker compose` inside the envd
+shell. envd should create, repair, stop, and clean up the sealed project Docker
+engine automatically when it has enough context. If it cannot, `envd doctor
+--deep` explains why.
+
+Implementation options:
+
+- Rootless Docker project daemon.
+- containerd/nerdctl-compatible project engine if Docker Compose compatibility is
+  sufficient.
+- Privileged Docker-in-Docker only as an explicit compatibility backend, not the
+  secure default.
+
+The backend is an implementation detail. The invariant is that the Docker API
+endpoint used inside envd is envd-managed, sealed, protected, and fail-closed.
+
+### Raw Host Docker
 
 Raw Docker opt-in:
 
 ```bash
 envd run dev1 --docker raw
-envd docker enable dev1 --raw
 ```
 
 Rules:
 
-- Raw Docker access must be shown in `envd ps` as a risk.
-- Raw Docker containers are not considered sealed unless envd created and
-  verified them.
-- `docker compose up` inside a sealed env must show a clear warning unless raw
-  Docker access was explicitly enabled.
-- Future managed Compose support may be considered only after the sealed core is
-  stable and there is a concrete design for the required Compose features.
+- Raw host Docker access must be shown in `envd ps` as a risk.
+- Raw host Docker containers are not considered sealed.
+- Protected identities are denied while raw host Docker is attached unless a
+  separate explicit identity policy allows it.
+- envd should detect unmanaged host Docker containers and report them in
+  `envd status`, but detection is informational only.
+- envd should not install global `docker` wrappers as a security feature.
+- If a project truly requires raw host Docker, envd must label the environment
+  outside the sealed Docker guarantee.
+
+### Registered Docker Artifacts
+
+Some projects may still need host Docker or Compose. envd can make lock cleanup
+fast and predictable only for Docker artifacts that are explicitly registered as
+envd-owned.
+
+Registration model:
+
+```text
+Docker label     dev.envd.owner=<env-id>
+Docker label     dev.envd.lock=remove-container
+Docker label     dev.envd.role=app|service|build
+envd state       maps labels to encrypted human project/env names
+```
+
+Help output:
+
+- `envd lock --help` and Docker-related help should show copyable label snippets
+  for Compose and `docker run`.
+- Help must explain that cleanup applies only to running containers with matching
+  container labels.
+- Dockerfile image labels may document intended policy, but they are not enough
+  by themselves. The running container must be labeled by Compose, `docker run`,
+  or an envd-managed project engine.
+
+Compose example:
+
+```yaml
+services:
+  web:
+    build: .
+    labels:
+      dev.envd.owner: "${ENVD_ENV_ID}"
+      dev.envd.lock: "remove-container"
+      dev.envd.role: "app"
+```
+
+`docker run` example:
+
+```bash
+docker run \
+  --label "dev.envd.owner=${ENVD_ENV_ID}" \
+  --label "dev.envd.lock=remove-container" \
+  --label "dev.envd.role=app" \
+  image
+```
+
+Optional Dockerfile provenance labels:
+
+```dockerfile
+LABEL dev.envd.role="app"
+LABEL dev.envd.lock="remove-container"
+```
+
+`envd shell <env>` should export `ENVD_ENV_ID` so Compose and shell commands can
+attach artifacts to the current env without exposing the human environment name.
+
+`envd lock` behavior for registered artifacts:
+
+- After core sealing succeeds, enqueue registered host Docker cleanup
+  asynchronously.
+- Stop registered app/service containers.
+- Remove registered app/service containers after stop.
+- Remove registered temporary/build containers where safe.
+- Close envd-managed port forwards for those artifacts.
+- Leave images, layers, build cache, and volumes alone unless envd owns them
+  inside protected storage.
+- Record cleanup progress and failures in events.
+- Report pending or failed cleanup in `envd status`.
+
+Important boundary:
+
+- Stopping/removing registered host Docker containers prevents easy continued use
+  of the running app.
+- It is cleanup and access reduction, not encrypted-at-rest security.
+- Registered host Docker cleanup must never block core envd sealing.
+- Docker image layers, build cache, logs, and volumes may still contain data if
+  they were created in raw host Docker.
+- Sensitive code, secrets, and identities should not be put into raw host Docker
+  layers or logs.
+- For protected guarantees, the app runtime must be envd-managed from the
+  beginning, not merely cleaned up on lock.
 
 ## Secure-By-Default And Untrusted Machines
 
@@ -1386,7 +1615,7 @@ Threats envd should address:
 
 - Someone steals the envd binary.
 - Someone copies `~/.config/envd`, `~/.local/state/envd`, Docker volumes, or
-  project backups while envd is locked.
+  recovery points while envd is locked.
 - Someone tries to use stored server passwords, gateway profiles, identities, or
   project secrets without the master password.
 - Someone starts an environment in direct networking and tries to use protected
@@ -1407,26 +1636,27 @@ Principle:
 
 ```text
 envd unlocked      -> access allowed only when policy passes
-envd locked        -> no new human access, no new secret/identity grants
+envd locked        -> access killed, envd workloads stopped, storage closed
 envd stopped       -> storage closed and encrypted at rest
 host compromised while active -> outside envd's full guarantee
 ```
 
-Locking envd is a deterministic access cutoff. It kills envd-managed access
-sessions, stops accepting new shell/SSH access, and prevents new secret/identity
-grants. The behavior should be simple and predictable.
+Locking envd is a deterministic shutdown posture for envd-owned work. It kills
+envd-managed access sessions, stops accepting new shell/SSH access, prevents new
+secret/identity grants, stops envd-managed workloads, and closes protected
+storage. The behavior should be simple and predictable.
 
 Important limit: a process killed by lock can only preserve work it already
 wrote to storage. Arbitrary in-memory state is not recoverable unless the tool
 itself saved it.
 
 ```text
-envd lock       kill envd-managed access sessions and block new access
-envd stop <env> stop environment and close encrypted storage
+envd lock       kill access, stop envd-owned workloads, close storage
+envd stop <env> stop one environment and close encrypted storage
 ```
 
-Full at-rest closure happens when the environment is stopped or envd performs a
-full shutdown.
+Full at-rest closure happens when the environment is stopped, `envd lock` stops
+it, or envd performs a full shutdown.
 
 ### Secure State Boundary
 
@@ -1479,9 +1709,7 @@ Commands:
 
 ```bash
 envd lock
-envd unlock
 envd status
-envd secure status
 ```
 
 Rules:
@@ -1498,13 +1726,17 @@ Rules:
   of envd's security model.
 - Lock revokes all identity broker grants.
 - Lock terminates envd-managed shell, SSH, and one-shot command sessions.
-- Lock prevents new `envd shell`, `envd run-cmd`, `envd ssh`, identity, secret,
+- Lock prevents new envd-managed shell, one-shot command, SSH, identity, secret,
   and gateway management operations until unlock.
 - Lock does not create new decrypted mounts.
 - Lock does not expose envd secrets, identity material, or decrypted storage
   through new access paths.
 - Stopping an environment closes its protected storage.
+- `envd lock` stops envd-managed environments and service/app runtimes, then
+  closes their protected storage.
 - If an operation cannot be made safe while locked, it must fail closed.
+- There is no required `unlock` command in normal use. The next stateful command
+  prompts for the master password and reopens only the state it needs.
 
 SSH/access behavior:
 
@@ -1512,30 +1744,147 @@ SSH/access behavior:
   processes.
 - New SSH connections through envd-managed SSH endpoints must be refused while
   locked.
-- `envd shell`, `envd run-cmd`, and `envd ssh` must require unlock.
+- envd-managed shell, one-shot command, and SSH access must require unlock.
 - envd should not expose plain SSH daemons that remain reachable independently of
   envd's lock state.
+
+### Editor And SSH Access
+
+Home-laptop UX should stay smooth while envd is unlocked. VS Code reconnects
+should not require hunting for server passwords or repeatedly copying keys.
+
+Expected commands:
+
+```bash
+envd run books
+envd code books
+```
+
+Access model:
+
+```text
+VS Code / ssh client -> envd ssh-proxy <env> -> envd policy check -> container
+```
+
+The preferred VS Code integration is an SSH `ProxyCommand`, not a durable SSH
+server exposed on the network:
+
+```sshconfig
+Host envd-8f6c2a91
+  HostName envd-8f6c2a91
+  User envd
+  ProxyCommand envd ssh-proxy --target 8f6c2a91
+```
+
+Rules:
+
+- `envd code <env>` may create or refresh a VS Code Remote SSH target.
+- Generated SSH targets should use opaque aliases by default. Human env names
+  stay in encrypted envd state.
+- The proxy must require envd to be unlocked.
+- The proxy must verify the target environment is running, protected storage is
+  mounted, network policy is valid, and the caller is local.
+- No password login.
+- No container-owned reusable login key as the security boundary.
+- Any client key or certificate material must be envd-managed, encrypted at
+  rest, and scoped to envd access.
+- Short-lived SSH certificates are preferred over long-lived static keys where
+  practical.
+- `envd lock` must terminate active editor/SSH sessions and make the proxy
+  refuse reconnects until unlock.
+
+If a TCP SSH listener is required for tool compatibility:
+
+- Bind to `127.0.0.1` or `::1` only by default.
+- Treat localhost binding as exposure reduction, not the only security boundary.
+- Require envd-managed authentication and unlocked state.
+- Prefer a Unix domain socket with user-only permissions where the platform and
+  tool support it.
+- Never listen on `0.0.0.0`, LAN addresses, or public interfaces unless the user
+  enables an explicit unsafe remote-access mode.
+
+Unsafe remote access mode, if ever added, must be visibly outside the default
+security model and must be denied protected identities unless an explicit policy
+allows it.
 
 Manual lock only:
 
 - There is no automatic lock in the security model.
-- `envd lock` must apply synchronously and deterministically.
+- `envd lock` must apply synchronously and deterministically after stopping
+  envd-managed workloads.
 - envd must not infer safety from host screen-lock, sleep, logout, or idle state.
-- `envd secure status` reports envd's own lock state, active envd-managed
-  sessions, identity grants, storage mounts, and network policy state.
+- `envd status` reports envd's own lock state, active envd-managed sessions,
+  identity grants, storage mounts, and network policy state.
 - Access session types must be controlled by envd. If a session type cannot be
   terminated deterministically, envd must not expose it.
+
+Lock ordering:
+
+1. Persist locked state and reject new envd access.
+2. Revoke identity broker grants and close secret/vault access.
+3. Broadcast lock to envd-owned terminal sessions.
+4. Stop envd-managed environments, service/app runtimes, and sealed project
+   Docker engines.
+5. Close protected storage for stopped environments.
+6. Mark core sealing complete.
+7. Queue registered host Docker cleanup asynchronously.
+8. Record cleanup progress, completion, or failure in events/status.
+
+Core sealing must not wait on registered host Docker cleanup. If asynchronous
+cleanup is slow, blocked, or fails, envd remains locked and protected storage
+remains closed.
 
 Active tool behavior:
 
 - During normal unlocked use, encrypted storage appears as a normal filesystem to
   tools such as editors, Git, Codex, Claude Code, package managers, and language
   servers.
-- On lock, tools running under envd-managed shell/SSH/run-cmd sessions are
-  terminated.
+- On lock, tools running under envd-managed shell, SSH, or one-shot command
+  sessions are terminated.
 - Files already written to encrypted storage are preserved.
 - Arbitrary in-memory tool state is preserved only if the tool saved it.
-- This is intentionally simple: lock means access sessions die.
+- This is intentionally simple: lock means envd-owned work stops.
+
+`envd lock` is for the "make everything envd owns disappear now" case:
+
+- Kill envd-managed access sessions.
+- Revoke identity and secret grants.
+- Close envd-managed port forwards.
+- Stop envd-managed dev environments.
+- Stop envd-managed services/app runtimes.
+- Stop sealed project Docker engines if enabled.
+- Stop/remove envd-marked app containers that are registered for lock cleanup.
+- Remove envd-managed temporary/build containers where safe.
+- Close protected storage for stopped environments.
+- Leave raw host Docker containers alone, but report them as outside envd
+  guarantee.
+
+Terminal custody mode:
+
+- `envd lock` is a security cutoff, not a screen-hiding guarantee.
+- If sensitive work happens only inside envd-owned terminal sessions, envd can
+  provide a strong practical visual lock for those sessions.
+- `envd shell <env>` should own the local PTY and register it as an envd-managed
+  access session.
+- `envd lock` should broadcast a lock event to all envd-owned terminal sessions.
+- Each envd-owned terminal client should stop accepting input, send
+  best-supported terminal reset/clear-scrollback sequences, print a minimal
+  locked message, and exit.
+- The terminal that ran `envd lock` should also clear itself and end on the same
+  locked message.
+- This is reliable only for envd-owned terminal sessions on compatible terminal
+  emulators with no external terminal logging or multiplexer history.
+- The hard guarantee remains killed envd-managed access sessions, revoked grants,
+  and closed storage for stopped environments.
+- Terminal custody mode is useful against casual visual exposure when the user
+  works only through envd terminals, but it is not a promise to clean arbitrary
+  host UI state.
+- envd must not claim it can clear non-envd terminals, editor panes, terminal
+  logs, tmux/screen history outside envd control, screenshots, screen
+  recordings, copied output, or OS-level recent-window previews.
+- If a user needs the computer display hidden from someone physically nearby,
+  they should also lock the OS session or close the laptop. envd must not treat
+  OS screen state as part of its own security model.
 
 Avoid:
 
@@ -1553,7 +1902,7 @@ User-facing contract:
 
 ```text
 envd run <env>   -> creates safe encrypted container storage automatically
-envd lock        -> kills access sessions and blocks new human/credential access
+envd lock        -> stops envd workloads and closes protected storage
 envd stop <env>  -> stops work and leaves storage encrypted at rest
 ```
 
@@ -1566,7 +1915,7 @@ What the user can trust:
 - Normal Docker volumes are not used for persistent env data.
 - When an environment is stopped, its data is encrypted at rest.
 - When an environment is running, tools see a normal filesystem.
-- `envd lock` prevents new shell/SSH/identity/secret access.
+- `envd lock` stops envd-managed environments and closes their storage.
 - `envd stop <env>` is the full "put it away encrypted" action.
 - `envd ps` and `envd inspect` show storage state plainly.
 
@@ -1574,9 +1923,8 @@ Visible storage states:
 
 ```text
 active      environment running, storage available while unlocked
-locked      access sessions killed, new access blocked
+locked      envd workloads stopped, storage encrypted at rest, access blocked
 stopped     environment stopped, storage encrypted at rest
-ephemeral   non-persistent scratch storage
 ```
 
 Implementation detail:
@@ -1586,30 +1934,20 @@ persistent environment data in normal Docker volumes. Internally, envd can use
 encrypted APFS/LUKS-backed storage and mount it only for the environment that
 needs it.
 
-Modes:
+Mode:
 
 ```text
 protected  envd-managed encrypted volume backing store
-ephemeral  tmpfs/non-persistent workspace for throwaway work
-```
-
-Commands:
-
-```bash
-envd run books
-envd storage status books
-envd storage lock books
-envd storage unlock books
-envd run scratch --storage ephemeral
 ```
 
 Protected storage behavior:
 
 - Environment data is stored encrypted at rest.
 - Running environments get a normal filesystem view.
-- `envd lock` kills envd-managed access sessions and blocks new access.
+- `envd lock` kills envd-managed access sessions, stops envd-managed
+  environments, and closes protected storage.
 - `envd stop <env>` stops work and returns storage to encrypted-at-rest state.
-- Snapshots and backups remain encrypted by default.
+- Recovery points remain encrypted by default.
 - Recovery requires master password or recovery key.
 - Protected storage metadata is tracked in envd state.
 
@@ -1620,36 +1958,27 @@ Deletion and tamper model:
   compromised host/admin may still be able to inspect active runtime state.
 - Encryption does not prevent someone with filesystem access from deleting the
   encrypted backing files.
-- Local snapshots help with accidental mistakes, but they can also be deleted by
-  someone with host filesystem access.
-- Reliable protection against deletion requires encrypted backups outside the
-  local machine.
-- envd should make encrypted backup configuration easy and visible.
+- Local recovery points help with accidental mistakes, but they can also be
+  deleted by someone with host filesystem access.
+- Reliable protection against deletion requires encrypted copies outside the
+  local machine, if that is added later.
+- envd should manage local recovery points automatically and invisibly.
 - envd should detect missing, truncated, or tampered storage metadata and fail
   closed instead of creating a fresh empty environment silently.
-
-Commands:
-
-```bash
-envd backup configure
-envd backup now books
-envd backup status books
-```
 
 Implementation options:
 
 - Linux: fscrypt, LUKS-backed image, or a portable encrypted filesystem layer.
 - macOS: encrypted APFS sparse image or a portable encrypted filesystem layer.
-- Cross-platform fallback: encrypted archive/snapshot for backup, with a clear
-  warning if live volume encryption is unavailable.
+- Cross-platform recovery export may exist later, but is not normal UX.
 
 Final backend model:
 
 ```text
-envd storage API        portable behavior and commands
+envd storage API        portable behavior and semantics
 macOS live backend      encrypted APFS sparse image
 Linux live backend      LUKS2/dm-crypt-backed image
-backup format           portable envd encrypted archive
+recovery points         envd-managed encrypted local restore points
 fallback live backend   none by default; fail closed if native backend unavailable
 ```
 
@@ -1662,8 +1991,8 @@ Rationale:
   problems.
 - Native encrypted disk/file-system backends are mature and better aligned with
   each OS.
-- The portable layer should be envd's storage API, metadata model, backup
-  format, lock/unlock semantics, and tests.
+- The portable layer should be envd's storage API, metadata model, recovery-point
+  semantics, lock/unlock semantics, and tests.
 
 Key hierarchy:
 
@@ -1686,8 +2015,8 @@ Performance and reliability:
   using native filesystem/disk encryption.
 - Large database workloads, many-small-file workloads, and FUSE-style encrypted
   filesystems may have noticeable overhead.
-- `envd storage status` should show backend type, mount state, and last
-  verification.
+- `envd inspect` and `envd doctor --deep` should show backend type, mount state,
+  and last verification.
 - `envd doctor --deep` should verify protected storage mount/unmount behavior.
 - If the selected backend is slow or less reliable on the current platform, envd
   should warn and explain the tradeoff.
@@ -1701,7 +2030,7 @@ Rules:
 - Do not pretend normal Docker volumes are encrypted.
 - Do not support persistent unencrypted environment storage.
 - `envd ps` and `envd inspect` must show storage mode.
-- Protected storage is the default.
+- Protected storage is the only normal environment storage mode.
 - Protected identities require protected storage.
 - If protected storage cannot be mounted safely, environment startup fails
   closed.
@@ -1711,7 +2040,6 @@ Example:
 ```text
 NAME   NET     VPN   STORAGE    IDENTITY  ISSUE
 books  sealed  ok    protected  work      -
-scratch sealed  ok    ephemeral  none      non-persistent
 ```
 
 ### Security Defaults
@@ -1726,8 +2054,7 @@ Default behavior:
 - strict egress policy required for protected identities
 - explicit `envd lock` required for access cutoff
 - event logging enabled
-- snapshots encrypted
-- backups exclude secrets unless explicitly requested
+- recovery points encrypted
 
 These defaults are appropriate for untrusted locations, shared machines, travel,
 and workspaces where accidental account exposure would be costly. There should
@@ -1799,9 +2126,13 @@ layer.
 Host checks:
 
 - Docker daemon reachable.
+- Unmanaged host Docker containers detected and reported as outside envd
+  guarantee.
 - Required images available or buildable.
 - envd lock/store state valid.
 - Protected storage backend available when required.
+- envd editor/SSH proxy targets are localhost/proxy-only and locked-state aware.
+- envd supervisor state is healthy or safely recoverable.
 - Xray gateway container running.
 - Xray rendered config valid.
 - Host SOCKS endpoint accepts connections.
@@ -1819,6 +2150,9 @@ Sealed container checks:
 - Sidecar exists and runs.
 - Sidecar healthcheck passes.
 - Protected storage mounted only when unlocked when required.
+- Project Docker engine uses envd-managed Docker endpoint when enabled.
+- Project Docker engine storage is protected when enabled.
+- Project Docker engine route follows sealed network policy when enabled.
 - Default route is TUN.
 - Kill-switch policies are installed.
 - DNS resolves.
@@ -1900,11 +2234,16 @@ Events to record:
 - Profile image generation built.
 - Package added/promoted/removed.
 - Environment created, migrated, repaired, removed.
+- Environment auto-stopped after idle timeout.
+- Environment auto-stop skipped with reason.
 - Protected storage locked, unlocked, mounted, unmounted, or failed.
+- Recovery point created, verified, pruned, deleted, failed, or skipped.
 - Network mode changed.
 - Identity credentials injected or blocked by policy.
 - Account-sensitive command blocked or allowed by override.
 - Identity broker grant created, denied, or revoked.
+- Editor/SSH proxy target created, refreshed, denied, or revoked.
+- Supervisor started, stopped, crashed, recovered, or reconciled stale state.
 - Internet status or hosting/provider risk changed.
 - Image or asset auto-repair happened.
 - Doctor found a new failure.
@@ -1922,18 +2261,18 @@ Example:
 
 ```text
 2026-06-05 10:12 gateway use ams1 -> hel1
-2026-06-05 10:12 gateway sync books ok
+2026-06-05 10:12 gateway reconciliation books ok
 2026-06-05 10:13 doctor books fail egress policy country mismatch
-2026-06-05 10:14 repair books network ok
+2026-06-05 10:14 auto-repair books network ok
 ```
 
 `envd why <env>` should summarize the current state and the recent events that
 explain it:
 
 ```text
-books is blocked because gateway sync failed after gateway generation 17.
+books is blocked because gateway reconciliation failed after gateway generation 17.
 Last working generation: 16.
-Suggested action: envd gateway sync
+Suggested action: envd doctor --deep
 ```
 
 This makes "what changed?" answerable without reading Docker/Xray logs first.
@@ -1988,7 +2327,7 @@ If something is missing, the output should say what envd can do next:
 
 ```text
 PROVIDER     missing
-ACTION       envd gateway repair ams1
+ACTION       envd can reinstall envd-owned provider after confirmation
 ```
 
 Fresh server bootstrap:
@@ -2010,7 +2349,6 @@ Existing server flows:
 envd gateway inspect ams1
 envd gateway install ams1 --adopt
 envd gateway install ams1 --replace
-envd gateway repair ams1
 ```
 
 Rules:
@@ -2018,9 +2356,9 @@ Rules:
 - `inspect` is always read-only.
 - `adopt` imports compatible existing provider state without destroying unknown
   users.
-- `replace` is explicit and destructive to the provider config, but must create
-  a backup first.
-- `repair` is safe and idempotent for envd-owned resources.
+- `replace` is explicit and destructive to the provider config, but must preserve
+  a previous envd-owned config for rollback first.
+- Automatic reconciliation is safe and idempotent for envd-owned resources.
 - Unknown non-envd configs must not be overwritten by default.
 - Provider config files should include an envd ownership marker.
 - Remote changes should be applied atomically: write candidate config, validate,
@@ -2036,8 +2374,9 @@ Remote provider footprint rules:
 - Check memory, disk, CPU architecture, and systemd availability before install.
 - Refuse or warn before installing on servers below the provider's minimum
   resource budget.
-- `envd gateway prune <name>` should remove inactive envd-owned providers and
-  stale candidate configs.
+- envd should remove inactive envd-owned providers and stale candidate configs
+  automatically when applying a replacement, finishing an upgrade, or removing a
+  gateway.
 - Unknown non-envd services must not be stopped or removed.
 
 Example:
@@ -2046,7 +2385,6 @@ Example:
 envd gateway inspect ams1
 envd gateway install ams1 --strategy censorship-resistant --dry-run
 envd gateway install ams1 --strategy censorship-resistant
-envd gateway prune ams1
 ```
 
 The interactive plan, and `--dry-run`, should show whether envd will install,
@@ -2057,7 +2395,6 @@ Server switching should be simple from the user side:
 ```bash
 envd gateway use ams1
 envd gateway use hel1
-envd gateway test hel1
 ```
 
 Switch flow:
@@ -2068,7 +2405,7 @@ Switch flow:
 4. Verify host SOCKS/HTTP route.
 5. Verify sealed test route.
 6. Update active gateway pointer.
-7. Run gateway sync for affected sealed environments.
+7. Run internal gateway reconciliation for affected sealed environments.
 8. Verify dependent sealed environments or leave them fail-closed.
 
 If the new gateway fails verification, envd must keep using the previous working
@@ -2154,9 +2491,13 @@ State should include:
 - Environment/project secret references.
 - Environment identity reference and identity policy result.
 - Environment identity broker grant state.
+- Environment editor/SSH proxy target state.
+- Environment idle policy, last activity, and auto-stop reason.
+- Environment active envd-managed session count.
+- Supervisor lifecycle state and pending cleanup queue.
 - Environment sidecar gateway generation.
 - Environment last egress verification.
-- Environment snapshots and backup metadata.
+- Environment recovery point metadata and storage usage.
 - Profile package manifest and generation.
 - Profile build network mode used for last build.
 - Raw Docker access flag per environment.
@@ -2204,19 +2545,13 @@ remember encrypted in envd vault
 ```
 
 SSH keys may still be installed for reliability, but storing the server password
-is allowed and expected so `envd gateway repair`, server switching, and
+is allowed and expected so automatic gateway repair, server switching, and
 re-bootstrap flows do not require hunting for credentials in other tools.
 
 Example:
 
 ```bash
 envd gateway install ams1 --host 1.2.3.4 --user root --password
-envd gateway auth set ams1 --password
-envd gateway auth rotate-key ams1
-envd secrets unlock
-envd secrets lock
-envd secrets list
-envd secrets forget remote/ams1/password
 ```
 
 If `envd gateway install ... --password` is the first stateful command, envd
@@ -2224,10 +2559,15 @@ should create the encrypted state store, ask the user to create a master
 password, save the server password, and then continue installing the gateway. It
 should not stop with "run `envd secrets init` first".
 
+If the stored SSH password or key stops working, the gateway command that needs
+access should ask for replacement credentials, store them encrypted after
+success, and continue.
+
 Rules:
 
 - Secrets should be scoped by purpose, for example `remote/ams1/password`.
-- Vault unlock state follows the explicit envd lock state.
+- Vault availability follows envd's explicit lock state and implicit unlock on
+  the next stateful command.
 - `envd lock` must close the vault, revoke decrypted secret access, and terminate
   any envd-managed process or agent that holds decrypted secret material.
 - Single-shot commands may prompt for the master password, decrypt what is
@@ -2235,7 +2575,7 @@ Rules:
 - Remembering a server password does not mean remembering the master password.
 - `envd doctor` should report whether required secrets are available or locked,
   without revealing values.
-- Exporting a full backup should require explicit `--include-secrets`.
+- Any future full export must require explicit secret inclusion.
 
 This keeps server switching and repair simple without forcing users to dig
 through external notes or apps for credentials every time.
@@ -2318,7 +2658,7 @@ Rules:
 - If `PATH` needs updating, print the exact line and explain it.
 - The script should be idempotent.
 - Re-running it should upgrade or repair the local binary.
-- The installed binary should be able to run `envd self doctor` immediately.
+- The installed binary should be able to run `envd doctor --deep` immediately.
 
 Expected first experience:
 
@@ -2333,19 +2673,15 @@ envd run books
 README should not be the primary installation mechanism. It can document
 bootstrap, but the utility should manage itself after first install.
 
-Expected commands:
+Expected user-facing command:
 
 ```bash
-envd self doctor
-envd self update
-envd self repair
-envd assets fetch
-envd images repair
+envd doctor --deep
 ```
 
-These commands are explicit maintenance tools. Normal envd commands should still
-repair their own missing prerequisites automatically when that can be done
-safely.
+Normal envd commands should repair their own missing prerequisites automatically
+when that can be done safely. `envd doctor --deep` explains what could not be
+repaired automatically and why.
 
 Responsibilities:
 
@@ -2383,7 +2719,6 @@ The CLI should expose:
 
 ```bash
 envd version
-envd images
 envd gateway upgrade --to <version>
 envd gateway rollback
 ```
@@ -2424,8 +2759,8 @@ Desired model:
 - Image tags are stable and human-readable.
 - Image digests are recorded when available.
 - Anonymous image IDs are treated as drift.
-- `envd repair <name>` restores the declared image, not an arbitrary latest
-  image.
+- envd restores the declared image, not an arbitrary latest image, when the
+  environment is started, recreated, migrated, or diagnosed.
 
 Example tags:
 
@@ -2460,15 +2795,15 @@ Tooling should be managed by profiles, not by editing Dockerfiles manually every
 time:
 
 ```bash
-envd profile list
-envd profile create web --from default --add node:lts --add pnpm
-envd profile create go --from default --add go:stable
+envd pkg add web tool:node-lts
+envd pkg add web npm:pnpm
+envd pkg add go tool:go-stable
 envd run app1 --profile web
 ```
 
-Profile images should build lazily when first used. Explicit image/profile build
-commands may exist for prewarming or debugging, but they are not required normal
-UX.
+Referencing a new profile name creates that profile lazily from the default
+baseline. Profile images should build lazily when first used. The user should
+not need a separate create or build command.
 
 Profile rules:
 
@@ -2528,6 +2863,7 @@ Package sources:
 - `npm:<package>`
 - `pip:<package>`
 - `go:<package>`
+- `tool:<name>` for envd-supported language runtimes and common toolchains
 - `binary:<url>@<checksum>`
 - `script:<name>` only for envd-managed reviewed scripts
 
@@ -2536,12 +2872,10 @@ Rules:
 - Profiles should store package intent, not only a generated Dockerfile.
 - Generated Dockerfiles are build artifacts.
 - Package changes create profile generations.
-- Dirty profiles are built lazily by `envd run`, `envd migrate`, and
-  `envd repair`.
+- Dirty profiles are built lazily by `envd run`, `envd migrate`, and commands
+  that need the profile.
 - Existing environments are not mutated until the user runs a controlled
   migration.
-- `envd profile build <name>` may exist only as an explicit prebuild/debug
-  command, not as required UX.
 - `envd pkg suggest <env>` can inspect apt history, dpkg state, global npm
   packages, pipx/pip globals, and common tool paths, but suggestions are
   best-effort and must be confirmed.
@@ -2559,16 +2893,17 @@ Storage rules:
   package caches.
 - Env images should be tagged by profile and generation.
 - Older generations should be kept only while environments reference them.
-- Unreferenced envd-owned images can be removed by `envd images prune`.
-- `envd images` should explain which images are active, repairable, cached, or
-  garbage-collectable.
+- Unreferenced envd-owned images should be garbage-collected automatically after
+  envd verifies no environment references them.
+- `envd inspect`, `envd status`, and `envd doctor --deep` should explain which
+  images are active, repairable, cached, or garbage-collectable when relevant.
 
 Example:
 
 ```text
 IMAGE                       ROLE      USED BY       STATUS
 envd/dev-web:2026.06.05-1   profile   books         active
-envd/dev-web:2026.06.04-1   profile   -             pruneable
+envd/dev-web:2026.06.04-1   profile   -             queued for automatic cleanup
 envd/net-sidecar:...        runtime   all sealed    protected
 ```
 
@@ -2639,12 +2974,14 @@ copied credential files do.
 `envd` should manage identities as first-class objects:
 
 ```bash
-envd identity create work
-envd identity set work --git-name "Name" --git-email "me@example.com"
-envd identity key import work ~/.ssh/id_ed25519
-envd identity token set work github
+envd identity add work
 envd run dev1 --identity work
 ```
+
+`identity add` should run an interactive import flow for Git identity, SSH keys,
+Git hosting tokens, and tool credentials. Defaults should require sealed
+networking and deny direct/raw Docker exposure unless the user explicitly
+changes policy.
 
 Identity contents:
 
@@ -2869,15 +3206,45 @@ Gateway gate:
   after a successful switch.
 - A failed reconciliation leaves affected environments closed, not direct.
 
+Project Docker gate:
+
+- `docker` and `docker compose` inside an envd shell must use the envd-managed
+  project Docker endpoint, not the host Docker socket.
+- Project Docker containers must have no direct egress when the gateway is down.
+- Project Docker DNS, IPv4, and IPv6 behavior must match sealed policy.
+- Compose `ports:` must not silently expose services to the host or LAN.
+- Host path mounts outside approved workspace paths must be blocked by default.
+- Host networking, raw host Docker socket mounts, privileged host access, and
+  arbitrary device mounts must be blocked by default.
+- `envd doctor --deep` must prove project Docker traffic is sealed by launching a
+  test container through the project engine.
+- Raw host Docker must be reported as outside envd guarantee, not treated as a
+  weaker sealed mode.
+
 Storage gate:
 
 - Persistent environment data must never be stored in normal Docker volumes.
 - macOS APFS encrypted image and Linux LUKS2-backed image behavior must be tested
-  for create, mount, unmount, lock, stop, crash recovery, backup, and restore.
+  for create, mount, unmount, lock, stop, crash recovery, and recovery points.
 - Missing, truncated, tampered, dirty, or unsupported storage must fail closed.
 - `envd stop <env>` must leave storage encrypted at rest.
-- `envd lock` must block new access without pretending to be full at-rest
-  closure for active mounted storage.
+- `envd lock` must stop envd-managed environments and leave protected storage
+  encrypted at rest.
+
+Recovery-point gate:
+
+- Recovery points must be encrypted by default.
+- Recovery point creation and integrity verification must happen automatically
+  around risky operations.
+- Recovery point pruning must be automatic and must never delete live environment
+  storage.
+- `envd rm <env>` must remove the environment's protected storage and env-owned
+  recovery points after confirmation.
+- Stable environments must not accumulate unbounded recovery points.
+- Tests must prove rollback works from an automatic recovery point.
+- Tests must prove automatic pruning preserves rollback for the latest risky
+  operation.
+- Tests must prove `envd rm <env>` removes that environment's recovery points.
 
 Identity gate:
 
@@ -2889,6 +3256,67 @@ Identity gate:
 - Direct networking, unhealthy sealed routing, wrong egress, gateway switch, and
   lock must all revoke or deny broker access.
 - `envd doctor --identity` must run negative tests, not only inspect config.
+
+Editor/SSH access gate:
+
+- `envd code <env>` and VS Code Remote SSH must connect through envd-controlled
+  proxy/auth, not a durable exposed container SSH server.
+- Generated SSH config must use `ProxyCommand envd ssh-proxy ...` or an
+  equivalent envd-controlled local endpoint.
+- No default listener may bind to `0.0.0.0`, LAN addresses, or public
+  interfaces.
+- Localhost or socket endpoints must still require envd-managed authentication
+  and unlocked state.
+- Generated SSH aliases should be opaque by default; human env-name mappings
+  must stay in encrypted state unless the user explicitly opts into visible
+  aliases.
+- Lock must terminate active editor/SSH sessions and make reconnect fail until
+  unlock.
+- Tests must prove another machine on the LAN cannot connect to envd editor/SSH
+  access by default.
+- Tests must prove stale keys/certificates cannot reconnect after lock.
+
+Lock/session gate:
+
+- `envd lock` must terminate envd-managed shell, SSH, and one-shot command
+  sessions, stop envd-managed environments and service/app runtimes, stop sealed
+  project Docker engines, and close protected storage.
+- New envd-managed access sessions must be refused while locked.
+- envd-owned shell clients must stop accepting input, clear/reset the visible
+  terminal state where supported, exit, and leave a locked message when they
+  receive a lock event.
+- The terminal that executes `envd lock` must follow the same visible cleanup
+  path after the lock succeeds.
+- Terminal cleanup must not be used as proof of security outside envd-owned PTYs.
+- The test must prove no terminated session can still access storage, identities,
+  secrets, or the sealed network after lock.
+- The test must prove `envd lock` leaves protected storage closed for every
+  envd-managed environment it stopped.
+- The test must prove registered host Docker cleanup starts only after core
+  sealing completes.
+- Slow or failed registered host Docker cleanup must not prevent envd from
+  reaching locked state.
+- Pending or failed registered host Docker cleanup must be visible in
+  `envd status` and events.
+- Raw host Docker must remain reported as outside envd guarantee; `envd lock`
+  must not claim to secure unmanaged host containers.
+
+Supervisor/idle gate:
+
+- The supervisor must be user-level, event-driven, and mostly asleep when idle.
+- The supervisor must not perform continuous network probes or tight Docker scans.
+- Auto-stop must not trigger while an envd shell, VS Code/SSH proxy, one-shot
+  command session, port connection, recovery-point operation, migration, repair,
+  profile build, or keep-alive service is active.
+- Auto-stop must close protected storage and preserve environment data.
+- Auto-stop must not delete images, layers, caches, or recovery points.
+- If the supervisor cannot confidently determine that an environment is idle, it
+  must leave it running and report the reason.
+- If the supervisor is killed or crashes, the next envd command must reconcile
+  state safely.
+- Tests must prove auto-stopped environments start again with data intact.
+- Tests must prove the supervisor uses coarse timers or event notifications, not
+  busy polling.
 
 Encrypted-state gate:
 
@@ -2966,14 +3394,18 @@ new Go CLI should not shell out to it for normal operations.
     pruning.
 20. Implement package promotion suggestions from existing environments.
 21. Implement workspace/project manifest support.
-22. Implement snapshots, backup, and restore.
+22. Implement automatic encrypted recovery points and lifecycle pruning.
 23. Implement event log and `envd why`.
 24. Implement identity profiles, identity broker, and account-sensitive command
     guards.
-25. Implement secure-by-default lock behavior and encrypted environment storage.
-26. Implement gateway chains.
-27. Implement raw Docker socket detection and warnings.
-28. Remove Bash dependency.
+25. Implement `envd code <env>` and envd-controlled SSH proxy access.
+26. Implement secure-by-default lock behavior and encrypted environment storage.
+27. Implement user-level supervisor, idle auto-stop, and cleanup queue.
+28. Implement sealed project Docker engine for standard `docker` and
+    `docker compose` inside envd shells.
+29. Implement gateway chains.
+30. Implement raw host Docker detection and risk reporting.
+31. Remove Bash dependency.
 
 The first milestone is not feature parity. The first milestone is reliable
 environment identity, gateway/proxy diagnostics, and sealed environment
