@@ -11,6 +11,7 @@ services:
     command: >
       sh -lc "
         export XRAY_HTTP_PROXY_PORT=\${XRAY_HTTP_PROXY_PORT:-\${XRAY_HTTP_RPOXY_PORT:-1081}} &&
+        export XRAY_FINGERPRINT=\${XRAY_FINGERPRINT:-firefox} &&
         envsubst < /in/config.template.json > /out/config.json &&
         test -s /out/config.json
       "
@@ -24,7 +25,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "${XRAY_BIND_IP:-127.0.0.1}:${XRAY_SOCKS_PORT:-1080}:${XRAY_INBOUND_PORT:-1080}"
-      - "${XRAY_BIND_IP:-127.0.0.1}:${XRAY_HTTP_PROXY_PORT:-${XRAY_HTTP_RPOXY_PORT:-1081}}:${XRAY_HTTP_PROXY_PORT:-${XRAY_HTTP_RPOXY_PORT:-1081}}"
+      - "${XRAY_BIND_IP:-127.0.0.1}:${XRAY_HTTP_PROXY_HOST_PORT:-${XRAY_HTTP_PROXY_PORT:-${XRAY_HTTP_RPOXY_PORT:-1081}}}:${XRAY_HTTP_PROXY_PORT:-${XRAY_HTTP_RPOXY_PORT:-1081}}"
     volumes:
       - xray_config:/etc/xray:ro
     command: >

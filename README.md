@@ -42,20 +42,24 @@ envd/
 Create `vpn-gateway/.env`:
 
 ```bash
-XRAY_INBOUND_PORT=1080
-XRAY_HTTP_PROXY_PORT=1081
+XRAY_INBOUND_PORT=2088
+XRAY_HTTP_PROXY_PORT=2089
+XRAY_HTTP_PROXY_HOST_PORT=1081
 XRAY_SERVER_IP=YOUR_SERVER_IP
 XRAY_SERVER_PORT=443
 XRAY_UUID=YOUR_UUID
 XRAY_PUBLIC_KEY=YOUR_PUBLIC_KEY
 XRAY_SNI=www.example.com
 XRAY_SHORT_ID=YOUR_SHORT_ID
+XRAY_FINGERPRINT=firefox
 ```
 
 Notes:
 - `XRAY_HTTP_PROXY_PORT` is optional unless you need HTTP proxy inbound for host apps.
 - `compose.yml` keeps backward compatibility with the old typoed variable name `XRAY_HTTP_RPOXY_PORT`.
 - `XRAY_BIND_IP=127.0.0.1` exposes the proxy to the host only. Use `XRAY_BIND_IP=0.0.0.0` only when containers or other machines must reach the HTTP proxy through the host.
+- `XRAY_SOCKS_PORT` and `XRAY_HTTP_PROXY_HOST_PORT` are host-published ports. Keep them different from ports used by other host proxy apps if host traffic should not share the envd gateway.
+- `XRAY_FINGERPRINT=firefox` avoids the current `chrome` Reality/Vision instability seen with Xray 26.2.6 in this setup.
 
 Start gateway:
 
@@ -95,8 +99,8 @@ Inside an `envd` dev container, prefer the sidecar path instead of
 `host.docker.internal`:
 
 ```bash
-curl -Iv --socks5-hostname xray:1080 https://registry-1.docker.io/v2/
-curl -Iv --proxy http://xray:1081 https://registry-1.docker.io/v2/
+curl -Iv --socks5-hostname xray:2088 https://registry-1.docker.io/v2/
+curl -Iv --proxy http://xray:2089 https://registry-1.docker.io/v2/
 ```
 
 `host.docker.internal` is a host-Docker address. From an `envd` container it is

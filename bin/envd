@@ -1131,8 +1131,8 @@ case "$cmd" in
       --cap-add NET_ADMIN \
       --device /dev/net/tun \
       -e XRAY_HOST="xray" \
-      -e XRAY_PORT="1080" \
-      -e XRAY_HTTP_PORT="1081" \
+      -e XRAY_PORT="2088" \
+      -e XRAY_HTTP_PORT="2089" \
       -p "127.0.0.1:${PORT}:22" \
       "$NET_IMAGE" >/dev/null
     created_net="true"
@@ -1564,10 +1564,11 @@ case "$cmd" in
         fi
 
         if [[ "$net_state" == "running" ]]; then
-          if docker exec "$net_name" sh -lc 'nc -z -w 2 xray 1080' >/dev/null 2>&1; then
-            doctor_ok "Sidecar can reach xray:1080"
+          sidecar_xray_port="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$net_name" 2>/dev/null | awk -F= '$1=="XRAY_PORT"{print $2; found=1; exit} END{if(!found) print "2088"}')"
+          if docker exec "$net_name" sh -lc "nc -z -w 2 xray ${sidecar_xray_port}" >/dev/null 2>&1; then
+            doctor_ok "Sidecar can reach xray:${sidecar_xray_port}"
           else
-            doctor_fail "Sidecar cannot reach xray:1080"
+            doctor_fail "Sidecar cannot reach xray:${sidecar_xray_port}"
           fi
 
           default_dev="$(docker exec "$net_name" sh -lc "ip route 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if(\$i==\"dev\") {print \$(i+1); exit}}'" 2>/dev/null || true)"
