@@ -48,6 +48,10 @@ Core user promises:
 - Developer identities and account credentials are protected by network policy.
 - A maintained hosting catalog helps users get a replacement gateway quickly
   instead of researching providers from zero during an outage.
+- Secure-by-default behavior protects envd state, identities, and environment
+  data when envd is locked.
+- Every stateful envd command uses secure encrypted state; plaintext state is not
+  a fallback mode.
 - Projects can declare non-secret envd intent in the repo when useful.
 - Risky migrations can preserve recoverable volume snapshots.
 - envd records an event log so "what changed?" is answerable.
@@ -81,6 +85,10 @@ repair, it should be questioned.
 - Long-lived account credentials must not be copied into containers as plain
   files in the protected identity path. Access goes through envd-controlled
   brokers or short-lived material.
+- envd secrets and environment data must be encrypted at rest by default.
+- envd operational state must be encrypted by default. Plain host/Docker
+  metadata must be minimal, non-sensitive, and use opaque identifiers where
+  possible.
 - Offline/no-internet networking must be explicit: `--network offline`.
 - Docker is the only required host runtime dependency.
 - Xray and sing-box versions must be pinned, not `latest`.
@@ -652,13 +660,15 @@ Rules:
 
 Every command should perform implicit startup:
 
-1. Ensure config and state directories exist.
-2. Ensure the encrypted store exists if the command needs secrets.
-3. Ask for master password setup only if no store exists and a secret must be
-   saved.
-4. Ask for master password unlock only if an existing store must be read or
-   updated.
-5. Continue the original command after initialization/unlock.
+1. If the command is stateless, such as `help`, `version`, or shell completion,
+   run without opening envd state.
+2. For every stateful command, ensure config and state directories exist with
+   safe permissions.
+3. Ensure the encrypted envd state store exists before writing operational
+   state.
+4. Ask for master password setup if no encrypted store exists.
+5. Ask for master password unlock if encrypted state must be read or updated.
+6. Continue the original command after initialization/unlock.
 
 The user should not need a separate setup ritual before normal use.
 
@@ -692,8 +702,8 @@ profile image, start the gateway, create the sidecar, and verify sealed routing.
 envd gateway install ams1 --host 1.2.3.4 --user root --password
 ```
 
-May lazily create the encrypted store, save credentials, inspect the server, show
-a plan, apply after confirmation, and verify the gateway.
+May lazily create the encrypted state store, save credentials, inspect the
+server, show a plan, apply after confirmation, and verify the gateway.
 
 ```bash
 envd pkg add web apt:ffmpeg
@@ -747,6 +757,9 @@ envd doctor --deep
 envd status
 envd events
 envd why books
+envd lock
+envd unlock
+envd secure status
 envd init
 ```
 
@@ -778,7 +791,7 @@ envd gateway install <name> --host <ip> --user root --password
 envd gateway use <name>
 envd run <env>
 envd ps
-envd exec <env>
+envd shell <env>
 envd stop <env>
 envd start <env>
 envd rm <env>
@@ -814,6 +827,8 @@ envd self doctor
 envd self repair
 envd images repair
 envd assets fetch
+envd backup configure
+envd backup status <env>
 envd gateway repair <name>
 envd gateway rollback
 ```
@@ -840,6 +855,8 @@ why it cannot.
 ```bash
 envd gateway install ams1 --host 1.2.3.4 --user root --password
 envd gateway use ams1
+envd gateway chain create workchain --entry reg1 --exit ams1
+envd gateway chain status workchain
 envd gateway status
 envd gateway doctor
 envd gateway logs
@@ -865,7 +882,7 @@ upgrade commands are for debugging, recovery, cleanup, and controlled changes.
 `gateway install` behavior:
 
 1. Lazily initialize envd state.
-2. Create or unlock the encrypted store if a password must be saved.
+2. Create or unlock the encrypted state store.
 3. Save the server password encrypted.
 4. Connect over SSH.
 5. Inspect OS, architecture, memory, disk, systemd, ports, and existing provider
@@ -1075,9 +1092,14 @@ Remote egress: x.x.x.x
 envd internet status
 envd internet report
 envd internet sources
+envd hosting update
 envd hosting check
 envd hosting list
+envd hosting shortlist
+envd gateway prepare
 envd gateway risk ams1
+envd provider token set provider-a
+envd gateway create ams2 --provider provider-a --region nl
 ```
 
 These commands summarize censorship/reachability signals, hosting/provider
@@ -1135,7 +1157,8 @@ envd run dev1
 envd run dev1 --network sealed
 envd run dev1 --network direct
 envd run dev1 --network offline
-envd exec dev1
+envd shell dev1
+envd run-cmd dev1 -- <command>
 envd stop dev1
 envd start dev1
 envd restart dev1
@@ -1145,6 +1168,7 @@ envd inspect dev1
 envd repair dev1
 envd snapshot dev1
 envd restore dev1 <snapshot-or-archive>
+envd storage status dev1
 envd network set dev1 sealed
 ```
 
@@ -1352,6 +1376,418 @@ Rules:
 - Future managed Compose support may be considered only after the sealed core is
   stable and there is a concrete design for the required Compose features.
 
+## Secure-By-Default And Untrusted Machines
+
+envd should be secure by default on machines and networks the user does not fully
+trust. Encryption, brokered identities, and fail-closed networking are baseline
+behavior, not optional hardening.
+
+Threats envd should address:
+
+- Someone steals the envd binary.
+- Someone copies `~/.config/envd`, `~/.local/state/envd`, Docker volumes, or
+  project backups while envd is locked.
+- Someone tries to use stored server passwords, gateway profiles, identities, or
+  project secrets without the master password.
+- Someone starts an environment in direct networking and tries to use protected
+  identities.
+- Someone opens SSH/Git/tooling from a stale or unsafe network state.
+
+Threats envd cannot fully solve:
+
+- The host OS is actively compromised while envd is unlocked.
+- An attacker has administrator/root access while decrypted volumes are mounted.
+- A malicious employer-owned device records keystrokes, screen, memory, or Docker
+  daemon traffic.
+- The user manually copies secrets into the container or mounts raw host
+  credential directories.
+- The user explicitly enables raw Docker and runs untrusted containers.
+
+Principle:
+
+```text
+envd unlocked      -> access allowed only when policy passes
+envd locked        -> no new human access, no new secret/identity grants
+envd stopped       -> storage closed and encrypted at rest
+host compromised while active -> outside envd's full guarantee
+```
+
+Locking envd is a deterministic access cutoff. It kills envd-managed access
+sessions, stops accepting new shell/SSH access, and prevents new secret/identity
+grants. The behavior should be simple and predictable.
+
+Important limit: a process killed by lock can only preserve work it already
+wrote to storage. Arbitrary in-memory state is not recoverable unless the tool
+itself saved it.
+
+```text
+envd lock       kill envd-managed access sessions and block new access
+envd stop <env> stop environment and close encrypted storage
+```
+
+Full at-rest closure happens when the environment is stopped or envd performs a
+full shutdown.
+
+### Secure State Boundary
+
+The encrypted envd store is not only for passwords. It is the default home for
+state that can reveal the user's work, infrastructure, accounts, or habits.
+
+Encrypted state should include:
+
+- Gateway profiles, remote hosts, provider accounts, and server credentials.
+- Environment names, project paths, profile assignments, and identity bindings.
+- Identity profiles, secret references, broker grants, and policy decisions.
+- Local event history, previous diagnostic results, hosting check history, and
+  gateway risk history.
+- Storage metadata and per-environment storage keys.
+- Project manifests after they are imported into envd state.
+
+Plain host state is allowed only when it is public, required before unlock, or
+not meaningfully sensitive:
+
+- The envd binary and installation metadata.
+- Public signed runtime assets, pinned image definitions, and public hosting
+  catalog data.
+- Opaque Docker container, network, volume, and image identifiers.
+- Non-secret lock files, PID files, and crash markers that contain no project,
+  gateway, identity, or account names.
+
+Docker object names, labels, and logs must not be treated as private. Therefore,
+envd-managed Docker objects should use opaque IDs by default:
+
+```text
+human name in envd       books
+Docker container name    envd-e-8f6c2a91
+Docker network name      envd-n-4b109bd0
+Docker volume/mount id   envd-s-91b2d7aa
+```
+
+`envd ps` maps opaque IDs back to human names only after encrypted state is
+available. When locked, envd may show a minimal locked status, but it should not
+print encrypted names or paths without unlock.
+
+Migration from older installations should detect human-readable Docker object
+names and offer a controlled rename/recreate plan where safe.
+
+### Lock Model
+
+The envd binary is not secret. Security must not depend on hiding the executable
+or the config file names.
+
+Commands:
+
+```bash
+envd lock
+envd unlock
+envd status
+envd secure status
+```
+
+Rules:
+
+- Master password is required to unlock encrypted envd state.
+- Master password is never stored.
+- Use memory-hard password-based key derivation, such as Argon2id, with random
+  salt and calibrated cost.
+- Use authenticated encryption for the store and protected metadata.
+- Optional hardware-key/passkey support may be added later, but it should not be
+  required.
+- `envd lock` is the only lock security primitive.
+- Host screen-lock, sleep, logout, idle timers, and OS session state are not part
+  of envd's security model.
+- Lock revokes all identity broker grants.
+- Lock terminates envd-managed shell, SSH, and one-shot command sessions.
+- Lock prevents new `envd shell`, `envd run-cmd`, `envd ssh`, identity, secret,
+  and gateway management operations until unlock.
+- Lock does not create new decrypted mounts.
+- Lock does not expose envd secrets, identity material, or decrypted storage
+  through new access paths.
+- Stopping an environment closes its protected storage.
+- If an operation cannot be made safe while locked, it must fail closed.
+
+SSH/access behavior:
+
+- `envd lock` must terminate envd-managed SSH clients and server-side session
+  processes.
+- New SSH connections through envd-managed SSH endpoints must be refused while
+  locked.
+- `envd shell`, `envd run-cmd`, and `envd ssh` must require unlock.
+- envd should not expose plain SSH daemons that remain reachable independently of
+  envd's lock state.
+
+Manual lock only:
+
+- There is no automatic lock in the security model.
+- `envd lock` must apply synchronously and deterministically.
+- envd must not infer safety from host screen-lock, sleep, logout, or idle state.
+- `envd secure status` reports envd's own lock state, active envd-managed
+  sessions, identity grants, storage mounts, and network policy state.
+- Access session types must be controlled by envd. If a session type cannot be
+  terminated deterministically, envd must not expose it.
+
+Active tool behavior:
+
+- During normal unlocked use, encrypted storage appears as a normal filesystem to
+  tools such as editors, Git, Codex, Claude Code, package managers, and language
+  servers.
+- On lock, tools running under envd-managed shell/SSH/run-cmd sessions are
+  terminated.
+- Files already written to encrypted storage are preserved.
+- Arbitrary in-memory tool state is preserved only if the tool saved it.
+- This is intentionally simple: lock means access sessions die.
+
+Avoid:
+
+- Date-based password lists.
+- Locally stored password schedules.
+- Security based on changing the system clock.
+
+Reason: if the schedule is local, it can be stolen; if time is local, it can be
+manipulated. The right primitive is a key derived from something the user knows,
+optionally combined with something the user has.
+
+### Safe Container Storage
+
+User-facing contract:
+
+```text
+envd run <env>   -> creates safe encrypted container storage automatically
+envd lock        -> kills access sessions and blocks new human/credential access
+envd stop <env>  -> stops work and leaves storage encrypted at rest
+```
+
+The user should not need to think about Docker volumes, mount points, or crypto
+plumbing during normal use. envd owns that complexity.
+
+What the user can trust:
+
+- Persistent environment data is stored in envd-managed encrypted storage.
+- Normal Docker volumes are not used for persistent env data.
+- When an environment is stopped, its data is encrypted at rest.
+- When an environment is running, tools see a normal filesystem.
+- `envd lock` prevents new shell/SSH/identity/secret access.
+- `envd stop <env>` is the full "put it away encrypted" action.
+- `envd ps` and `envd inspect` show storage state plainly.
+
+Visible storage states:
+
+```text
+active      environment running, storage available while unlocked
+locked      access sessions killed, new access blocked
+stopped     environment stopped, storage encrypted at rest
+ephemeral   non-persistent scratch storage
+```
+
+Implementation detail:
+
+Docker volumes are not encrypted by Docker by default, so envd must not put
+persistent environment data in normal Docker volumes. Internally, envd can use
+encrypted APFS/LUKS-backed storage and mount it only for the environment that
+needs it.
+
+Modes:
+
+```text
+protected  envd-managed encrypted volume backing store
+ephemeral  tmpfs/non-persistent workspace for throwaway work
+```
+
+Commands:
+
+```bash
+envd run books
+envd storage status books
+envd storage lock books
+envd storage unlock books
+envd run scratch --storage ephemeral
+```
+
+Protected storage behavior:
+
+- Environment data is stored encrypted at rest.
+- Running environments get a normal filesystem view.
+- `envd lock` kills envd-managed access sessions and blocks new access.
+- `envd stop <env>` stops work and returns storage to encrypted-at-rest state.
+- Snapshots and backups remain encrypted by default.
+- Recovery requires master password or recovery key.
+- Protected storage metadata is tracked in envd state.
+
+Deletion and tamper model:
+
+- Encryption prevents reading protected data when the environment is stopped.
+- While an environment is active, `envd lock` blocks envd-managed access but a
+  compromised host/admin may still be able to inspect active runtime state.
+- Encryption does not prevent someone with filesystem access from deleting the
+  encrypted backing files.
+- Local snapshots help with accidental mistakes, but they can also be deleted by
+  someone with host filesystem access.
+- Reliable protection against deletion requires encrypted backups outside the
+  local machine.
+- envd should make encrypted backup configuration easy and visible.
+- envd should detect missing, truncated, or tampered storage metadata and fail
+  closed instead of creating a fresh empty environment silently.
+
+Commands:
+
+```bash
+envd backup configure
+envd backup now books
+envd backup status books
+```
+
+Implementation options:
+
+- Linux: fscrypt, LUKS-backed image, or a portable encrypted filesystem layer.
+- macOS: encrypted APFS sparse image or a portable encrypted filesystem layer.
+- Cross-platform fallback: encrypted archive/snapshot for backup, with a clear
+  warning if live volume encryption is unavailable.
+
+Final backend model:
+
+```text
+envd storage API        portable behavior and commands
+macOS live backend      encrypted APFS sparse image
+Linux live backend      LUKS2/dm-crypt-backed image
+backup format           portable envd encrypted archive
+fallback live backend   none by default; fail closed if native backend unavailable
+```
+
+Rationale:
+
+- Portable UX matters; portable live encryption implementation is less important.
+- A single custom cross-platform encrypted filesystem would be more code and more
+  risk.
+- FUSE-style portability can add dependencies, platform friction, and reliability
+  problems.
+- Native encrypted disk/file-system backends are mature and better aligned with
+  each OS.
+- The portable layer should be envd's storage API, metadata model, backup
+  format, lock/unlock semantics, and tests.
+
+Key hierarchy:
+
+```text
+master password -> Argon2id-derived unlock key
+unlock key      -> decrypts envd store
+envd store      -> stores per-environment storage keys encrypted
+storage key     -> unlocks APFS/LUKS protected environment storage
+```
+
+The master password is never stored. Per-environment storage keys can be rotated
+independently where the backend supports it.
+
+Performance and reliability:
+
+- Prefer mature OS/filesystem encryption or encrypted disk images over custom
+  per-file crypto.
+- Use vetted encryption primitives and libraries only.
+- Expect low overhead for normal source-code and package-manager workloads when
+  using native filesystem/disk encryption.
+- Large database workloads, many-small-file workloads, and FUSE-style encrypted
+  filesystems may have noticeable overhead.
+- `envd storage status` should show backend type, mount state, and last
+  verification.
+- `envd doctor --deep` should verify protected storage mount/unmount behavior.
+- If the selected backend is slow or less reliable on the current platform, envd
+  should warn and explain the tradeoff.
+- If protected storage cannot be mounted, verified, locked, or recovered safely,
+  the environment must fail closed.
+- Crash recovery must be explicit: detect dirty mounts, run backend-specific
+  checks when available, and never silently attach corrupted storage.
+
+Rules:
+
+- Do not pretend normal Docker volumes are encrypted.
+- Do not support persistent unencrypted environment storage.
+- `envd ps` and `envd inspect` must show storage mode.
+- Protected storage is the default.
+- Protected identities require protected storage.
+- If protected storage cannot be mounted safely, environment startup fails
+  closed.
+
+Example:
+
+```text
+NAME   NET     VPN   STORAGE    IDENTITY  ISSUE
+books  sealed  ok    protected  work      -
+scratch sealed  ok    ephemeral  none      non-persistent
+```
+
+### Security Defaults
+
+Default behavior:
+
+- `network = sealed`
+- `storage = protected`
+- `identity = brokered`
+- raw Docker disabled
+- direct host credential mounts disabled
+- strict egress policy required for protected identities
+- explicit `envd lock` required for access cutoff
+- event logging enabled
+- snapshots encrypted
+- backups exclude secrets unless explicitly requested
+
+These defaults are appropriate for untrusted locations, shared machines, travel,
+and workspaces where accidental account exposure would be costly. There should
+not be a normal "insecure envd mode"; individual downgrades such as
+`--network direct` or raw Docker access must be explicit and visible. Persistent
+unencrypted environment storage is not a supported downgrade.
+
+### Multi-Hop Gateways
+
+envd can support chained gateways for stronger network compartmentalization.
+
+Goal:
+
+```text
+local machine -> regional entry gateway -> final exit gateway -> internet
+```
+
+Use cases:
+
+- The local network should see only a connection to a less suspicious regional
+  entry point.
+- The final exit IP should be different from the entry provider.
+- Provider/ASN diversity is desired.
+- A gateway should be replaceable without changing the sealed environment model.
+
+Commands:
+
+```bash
+envd gateway chain create workchain --entry reg1 --exit ams1
+envd gateway use workchain
+envd gateway chain status workchain
+envd gateway chain doctor workchain
+```
+
+Rules:
+
+- Each hop is a normal envd gateway profile with its own provider, strategy,
+  health checks, and risk score.
+- The chain must be verified end-to-end before activation.
+- If any hop fails, sealed environments fail closed.
+- A chain must never silently degrade to only the entry hop.
+- A chain must never silently bypass the chain and use direct networking.
+- Chain egress policy is evaluated at the final exit, not at the entry hop.
+- `envd ps` must show when a chain is active.
+- Identity policy should bind to final egress policy and chain health.
+- Chain topology is local envd state and should not be exposed to dev
+  containers.
+- More hops increase latency, cost, and operational failure points.
+
+Limitations:
+
+- Multi-hop does not make traffic anonymous like Tor.
+- Entry provider can see the user connecting to the entry server.
+- Exit provider can see egress metadata from the exit server.
+- A compromised local host can still observe user actions while envd is
+  unlocked.
+
+Multi-hop is a resilience and compartmentalization feature, not a magic
+anonymity guarantee.
+
 ## Diagnostics
 
 Diagnostics are a first-class feature. `envd doctor` should be fast and useful.
@@ -1364,6 +1800,8 @@ Host checks:
 
 - Docker daemon reachable.
 - Required images available or buildable.
+- envd lock/store state valid.
+- Protected storage backend available when required.
 - Xray gateway container running.
 - Xray rendered config valid.
 - Host SOCKS endpoint accepts connections.
@@ -1380,6 +1818,7 @@ Sealed container checks:
 - Dev container exists and runs.
 - Sidecar exists and runs.
 - Sidecar healthcheck passes.
+- Protected storage mounted only when unlocked when required.
 - Default route is TUN.
 - Kill-switch policies are installed.
 - DNS resolves.
@@ -1454,12 +1893,14 @@ telemetry. It is local history for debugging and audit.
 Events to record:
 
 - Gateway installed, switched, repaired, upgraded, rolled back.
+- Gateway chain created, switched, repaired, or failed.
 - Gateway strategy or egress policy changed.
 - Sidecars synced or failed to sync.
 - Profile manifest changed.
 - Profile image generation built.
 - Package added/promoted/removed.
 - Environment created, migrated, repaired, removed.
+- Protected storage locked, unlocked, mounted, unmounted, or failed.
 - Network mode changed.
 - Identity credentials injected or blocked by policy.
 - Account-sensitive command blocked or allowed by override.
@@ -1674,6 +2115,7 @@ State should include:
 - Gateway strategy.
 - Gateway strategy version.
 - Gateway generation.
+- Gateway chain definitions.
 - Gateway status from last successful verification.
 - Gateway egress policy.
 - Last verified gateway egress IP/country/ASN.
@@ -1707,6 +2149,7 @@ State should include:
 - Environment network modes.
 - Environment image/tool profile.
 - Environment workspace path and mount path.
+- Environment storage mode and protected storage metadata.
 - Environment project manifest path and last applied checksum.
 - Environment/project secret references.
 - Environment identity reference and identity policy result.
@@ -1719,6 +2162,7 @@ State should include:
 - Raw Docker access flag per environment.
 - Identity profiles, broker state, and account-sensitive command guard settings.
 - Local event log retention policy.
+- Security defaults, explicit downgrade flags, and lock behavior.
 
 Private keys and sensitive remote credentials must not be logged.
 
@@ -1759,10 +2203,9 @@ Default remote password behavior:
 remember encrypted in envd vault
 ```
 
-SSH keys may still be installed for convenience and reliability, but storing the
-server password is allowed and expected so `envd gateway repair`, server
-switching, and re-bootstrap flows do not require hunting for credentials in other
-tools.
+SSH keys may still be installed for reliability, but storing the server password
+is allowed and expected so `envd gateway repair`, server switching, and
+re-bootstrap flows do not require hunting for credentials in other tools.
 
 Example:
 
@@ -1776,16 +2219,17 @@ envd secrets list
 envd secrets forget remote/ams1/password
 ```
 
-If `envd gateway install ... --password` is the first command that needs the
-encrypted store, envd should ask the user to create a master password, save the
-server password, and then continue installing the gateway. It should not stop
-with "run `envd secrets init` first".
+If `envd gateway install ... --password` is the first stateful command, envd
+should create the encrypted state store, ask the user to create a master
+password, save the server password, and then continue installing the gateway. It
+should not stop with "run `envd secrets init` first".
 
 Rules:
 
 - Secrets should be scoped by purpose, for example `remote/ams1/password`.
-- The vault should auto-lock after a configurable idle timeout when envd keeps an
-  unlocked process or agent.
+- Vault unlock state follows the explicit envd lock state.
+- `envd lock` must close the vault, revoke decrypted secret access, and terminate
+  any envd-managed process or agent that holds decrypted secret material.
 - Single-shot commands may prompt for the master password, decrypt what is
   needed, then clear sensitive memory before exit.
 - Remembering a server password does not mean remembering the master password.
@@ -2400,6 +2844,87 @@ These guardrails are not a replacement for provider-side account security, but
 they prevent common local mistakes: running account tools from direct networking,
 wrong egress country, stale gateway, or an unsealed raw Docker context.
 
+## Reliability And Security Gates
+
+The design is only useful if implementation errors are caught before users rely
+on it. These gates are release blockers, not nice-to-have tests.
+
+Kill-switch gate:
+
+- A sealed environment must have no direct egress when the gateway is down.
+- DNS must not bypass the tunnel.
+- IPv4 and IPv6 must both be covered.
+- Sidecar restart, gateway restart, Docker network recreate, and route changes
+  must not create a leak window.
+- Tests must run from inside a sealed container and prove that only the permitted
+  pre-tunnel path is reachable before the tunnel is healthy.
+
+Gateway gate:
+
+- `envd gateway use <name>` is a two-phase switch: verify first, activate second.
+- The previous known-good gateway remains available until the new route passes
+  host, local gateway, sealed container, DNS, and egress policy checks.
+- Activation failure rolls back automatically.
+- Existing sealed environments are pinned to a gateway generation and reconcile
+  after a successful switch.
+- A failed reconciliation leaves affected environments closed, not direct.
+
+Storage gate:
+
+- Persistent environment data must never be stored in normal Docker volumes.
+- macOS APFS encrypted image and Linux LUKS2-backed image behavior must be tested
+  for create, mount, unmount, lock, stop, crash recovery, backup, and restore.
+- Missing, truncated, tampered, dirty, or unsupported storage must fail closed.
+- `envd stop <env>` must leave storage encrypted at rest.
+- `envd lock` must block new access without pretending to be full at-rest
+  closure for active mounted storage.
+
+Identity gate:
+
+- No private keys or long-lived tokens may exist in the container filesystem by
+  default.
+- Git/SSH/token access must go through the envd broker.
+- Broker grants must be scoped to environment ID, identity, command class, and
+  gateway generation.
+- Direct networking, unhealthy sealed routing, wrong egress, gateway switch, and
+  lock must all revoke or deny broker access.
+- `envd doctor --identity` must run negative tests, not only inspect config.
+
+Encrypted-state gate:
+
+- Stateful envd commands must create or unlock encrypted state before reading or
+  writing operational state.
+- Human environment names, project paths, gateway hosts, identity names, and
+  event history must not be written to plaintext host files or Docker metadata.
+- Docker object names and labels should use opaque IDs.
+- Logs must be redacted, and detailed event history must live in encrypted state.
+
+Catalog/update gate:
+
+- Runtime assets, provider strategy definitions, and hosting catalog updates must
+  be pinned and signature-verified or checksum-verified through envd releases.
+- Unsigned remote catalog updates must be rejected.
+- Catalog entries must carry confidence/source metadata and must not claim a
+  provider or protocol is guaranteed safe.
+
+Diagnostics gate:
+
+- Every major failure must map to a layer: host Docker, asset cache, local
+  gateway, remote gateway, sealed sidecar, DNS, egress policy, identity broker,
+  encrypted storage, or provider/catalog state.
+- `envd doctor --deep` must perform real traffic tests, including sealed
+  container traffic, not only process checks.
+- `envd why <env>` must explain the last state transition or blocking reason.
+
+Cross-platform gate:
+
+- macOS and Linux behavior must be equivalent at the command and security-model
+  level.
+- arm64 and amd64 runtime images must be selected automatically.
+- Platform-specific storage backends are hidden behind the envd storage API.
+- If the required backend is unavailable, envd fails closed instead of silently
+  using weaker storage.
+
 ## Migration From Current System
 
 The new Go implementation does not need to preserve Bash internals.
@@ -2445,8 +2970,10 @@ new Go CLI should not shell out to it for normal operations.
 23. Implement event log and `envd why`.
 24. Implement identity profiles, identity broker, and account-sensitive command
     guards.
-25. Implement raw Docker socket detection and warnings.
-26. Remove Bash dependency.
+25. Implement secure-by-default lock behavior and encrypted environment storage.
+26. Implement gateway chains.
+27. Implement raw Docker socket detection and warnings.
+28. Remove Bash dependency.
 
 The first milestone is not feature parity. The first milestone is reliable
 environment identity, gateway/proxy diagnostics, and sealed environment
