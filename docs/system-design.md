@@ -1,0 +1,2058 @@
+# envd System Design
+
+This document describes the next-generation `envd` architecture. The goal is to
+replace the current shell-script control plane with a Go utility that manages
+remote Xray, the local gateway, sealed dev containers, host proxy endpoints, and
+diagnostics as one coherent system.
+
+## Product Definition
+
+`envd` is a development environment manager with a built-in VPN control plane.
+It provides:
+
+- Remote Xray server installation and lifecycle management.
+- Local Xray gateway and stable host proxy endpoints.
+- A pluggable tunnel/provider layer so Xray can be replaced later.
+- Sealed Docker development environments with no accidental direct network leak.
+- Optional non-sealed environments for explicit workflows.
+- Deep diagnostics that identify which network layer failed.
+- Shareable VPN user URIs for apps and other devices.
+- Self-managed installation, runtime assets, and required image cache.
+
+The current sealed sidecar model is the most valuable part of the system and
+must be preserved.
+
+## Product Boundary
+
+`envd` should be understood as one product, not a pile of scripts:
+
+```text
+envd = reproducible dev environments + sealed networking + managed gateway
+```
+
+It owns the path from source code to a running dev container with a known network
+posture. The user should not need to manually remember Docker image IDs, proxy
+ports, sidecar internals, Xray config paths, server install commands, or which
+layer to debug first.
+
+Core user promises:
+
+- New dev environments are useful immediately.
+- First run initializes envd automatically.
+- Sealed networking is the default and fails closed.
+- The active gateway and remote server are inspectable and switchable.
+- Remote server setup is reconciled, not installed blindly.
+- Protocol choices use conservative strategies, not random defaults.
+- Docker image purges are repairable for envd-owned images.
+- Secrets are remembered in an encrypted envd store.
+- Developer identities and account credentials are protected by network policy.
+- Projects can declare non-secret envd intent in the repo when useful.
+- Risky migrations can preserve recoverable volume snapshots.
+- envd records an event log so "what changed?" is answerable.
+- `envd doctor --deep` identifies the broken layer with real traffic tests.
+- macOS and Linux behavior should be equivalent except where Docker itself
+  differs.
+
+Things `envd` should not become:
+
+- A general Docker replacement.
+- A full VPS control panel.
+- A universal VPN client for every use case.
+- A package manager for all possible development stacks.
+- A tool that silently exposes containers to direct networking.
+
+The product should stay narrow enough to be reliable: if a feature does not
+improve reproducibility, sealed networking, diagnostics, gateway management, or
+repair, it should be questioned.
+
+## Non-Negotiable Invariants
+
+- Sealed networking is the default for new dev environments.
+- A sealed environment must never fall back to direct internet if VPN is broken.
+- No proxy environment variables are required inside sealed dev containers.
+- Sidecar kill-switch policy defaults to drop.
+- The only permitted pre-tunnel egress from a sealed sidecar is to the local Xray
+  gateway ports it was configured to use.
+- Direct networking must be explicit: `--network direct`.
+- Account credentials must not be injected into direct/offline/unknown-risk
+  environments unless the identity policy explicitly allows it.
+- Long-lived account credentials must not be copied into containers as plain
+  files in the protected identity path. Access goes through envd-controlled
+  brokers or short-lived material.
+- Offline/no-internet networking must be explicit: `--network offline`.
+- Docker is the only required host runtime dependency.
+- Xray and sing-box versions must be pinned, not `latest`.
+- Required runtime images must be restorable by `envd` even if the user purges
+  normal Docker images.
+- Runtime install/bootstrap should be owned by `envd`, not copied from README
+  snippets.
+- `envd init` may exist for explicit setup, but normal commands must lazily
+  initialize required state themselves.
+- Secrets must not be stored in world-readable files.
+- `doctor --deep` must test real traffic, not just container liveness.
+- Network mode changes must be explicit and must stop/recreate affected
+  containers safely instead of silently exposing running processes.
+
+## Architecture
+
+```text
++---------------------+
+| envd Go CLI          |
+|                     |
+| config/state         |
+| docker manager       |
+| ssh remote manager   |
+| provider manager     |
+| image/tool manager   |
+| diagnostics engine   |
++----------+----------+
+           |
+           v
++---------------------+         +----------------------+
+| local Docker host    |         | remote VPS           |
+|                     |  SSH    |                      |
+| xray gateway         +-------->+ xray server          |
+| host proxy endpoints |         | reality/vless users  |
+| dev containers       |         | managed config       |
+| net sidecars         |         | systemd service      |
++---------------------+         +----------------------+
+```
+
+### Local Gateway
+
+The local gateway is a tunnel client container managed by `envd`. The initial
+provider is Xray, but the CLI must not bake Xray into every concept. It exposes:
+
+- A stable host SOCKS endpoint, for browsers and host apps.
+- A stable host HTTP proxy endpoint, for tools that need HTTP CONNECT.
+- Internal Docker-network endpoints for sealed sidecars.
+
+Host-published ports and internal Xray ports are separate concepts.
+
+Example default:
+
+```text
+host SOCKS: 127.0.0.1:11080
+host HTTP:  127.0.0.1:11081
+internal SOCKS: xray:2088
+internal HTTP:  xray:2089
+```
+
+The internal ports should avoid common user proxy ports like `1080` and `1081`
+because host apps often already use those ports.
+
+### Provider Layer
+
+Xray is the first provider, not the permanent architecture boundary.
+
+Provider interface:
+
+- Inspect remote server state.
+- Reconcile remote server to desired state.
+- Adopt or replace existing provider installs.
+- Generate remote server config.
+- Generate local gateway config.
+- Add/remove users.
+- Emit app import URIs.
+- Report version and health.
+- Run provider-specific deep diagnostics.
+
+Initial provider:
+
+```text
+provider: xray
+protocol: vless-reality
+```
+
+Possible future providers:
+
+```text
+provider: sing-box
+provider: hysteria
+provider: wireguard
+provider: custom
+```
+
+Command design should leave room for this:
+
+```bash
+envd gateway install ams1 --host 1.2.3.4 --user root --provider xray
+envd gateway inspect ams1
+envd gateway repair ams1
+envd gateway use ams1
+envd user add phone
+envd user uri phone
+envd gateway doctor
+```
+
+Most dev-container commands should not care which provider is used. They should
+only depend on the local gateway contract: internal SOCKS/HTTP endpoints plus
+diagnostic probes.
+
+### Protocol Strategy
+
+The user should not need to know which censorship-resistant protocol is currently
+best. `envd` should expose strategies, then map those strategies to pinned
+provider/protocol configurations.
+
+Strategies:
+
+```text
+censorship-resistant  default; conservative anti-DPI/active-probing posture
+fast                  optimized for speed, explicit opt-in
+compatibility         optimized for app/client compatibility
+custom                user-managed provider/protocol settings
+```
+
+Help text should explain what each strategy means without forcing the user to
+know provider internals:
+
+```text
+censorship-resistant
+  Default. Conservative setup for hostile networks. Prioritizes camouflage and
+  active-probing resistance over raw speed. Current implementation:
+  xray/vless-reality/tcp/443.
+
+fast
+  Explicit opt-in. Prioritizes throughput and latency. May use transports that
+  are easier for some networks to throttle or block.
+
+compatibility
+  Explicit opt-in. Prioritizes working with more client apps and constrained
+  networks over best censorship resistance.
+
+custom
+  Expert mode. User chooses provider/protocol details directly.
+```
+
+Default:
+
+```text
+strategy: censorship-resistant
+primary:  xray/vless-reality/tcp/443
+```
+
+Rules:
+
+- Never default to a protocol only because it is faster.
+- Prefer TCP/443 web-like camouflage for the default remote path.
+- Treat UDP-based protocols as explicit candidates, not universal defaults,
+  because some networks throttle or block UDP.
+- Do not claim any protocol is permanently undetectable.
+- Pin provider versions and strategy definitions.
+- Store the strategy version in gateway state.
+- `envd self update` may add newer strategies, but must not silently mutate an
+  existing gateway.
+- Strategy changes require explicit commands and real verification.
+
+Example:
+
+```bash
+envd gateway install ams1 --host 1.2.3.4 --user root
+envd gateway install hel1 --host 5.6.7.8 --user root --strategy fast
+envd gateway strategy set ams1 censorship-resistant
+```
+
+Candidate protocol selection should be evidence-based:
+
+1. Inspect remote OS, architecture, memory, and open ports.
+2. Check whether the selected provider can run on that server.
+3. Install or configure the candidate.
+4. Test remote TCP/UDP reachability from the local host.
+5. Test provider handshake.
+6. Test host proxy route.
+7. Test sealed container route.
+8. Activate only after verification passes.
+
+If verification fails, envd should leave the previous working strategy active and
+report the failing layer.
+
+### Sealed Dev Environment
+
+A sealed environment consists of:
+
+```text
+<name>       dev container, no own network namespace
+<name>-net   sidecar owning the network namespace, TUN route, and kill-switch
+```
+
+The dev container runs with:
+
+```text
+--network container:<name>-net
+```
+
+The sidecar:
+
+- Creates a TUN interface.
+- Routes default traffic through sing-box.
+- sing-box forwards to the local Xray gateway SOCKS inbound.
+- iptables default policy is drop.
+- Only loopback, established traffic, SSH ingress, TUN traffic, and Xray gateway
+  ports are allowed.
+
+If Xray is unavailable, outbound traffic fails closed.
+
+### Network Modes
+
+Sealed is default:
+
+```bash
+envd run dev1
+envd run dev1 --network sealed
+```
+
+Direct is explicit and has normal Docker networking:
+
+```bash
+envd run dev1 --network direct
+```
+
+Offline is explicit and has no external internet:
+
+```bash
+envd run dev1 --network offline
+```
+
+The CLI must show the chosen mode after creation. It should never silently choose
+direct networking because sealed setup failed.
+
+Changing network mode is allowed but must be safe:
+
+```bash
+envd network set dev1 sealed
+envd network set dev1 direct
+envd network set dev1 offline
+```
+
+Rules:
+
+- The target environment must be stopped first, or `envd` must ask for/perform a
+  controlled stop.
+- `envd` must never switch a running sealed environment to direct networking.
+- `envd` must clearly show if ports/services may become reachable after a mode
+  change.
+- Mode changes may recreate the dev container while preserving volumes.
+- `envd inspect <env>` must show the current mode and why.
+
+## Command Model
+
+Every command should perform implicit startup:
+
+1. Ensure config and state directories exist.
+2. Ensure the encrypted store exists if the command needs secrets.
+3. Ask for master password setup only if no store exists and a secret must be
+   saved.
+4. Ask for master password unlock only if an existing store must be read or
+   updated.
+5. Continue the original command after initialization/unlock.
+
+The user should not need a separate setup ritual before normal use.
+
+### Lazy Reconciliation UX
+
+Normal commands should do the required setup, repair, build, fetch, or validation
+implicitly when it is safe.
+
+Principles:
+
+- Do not force users to run separate `init`, `fetch`, `verify`, `build`, `plan`,
+  or `apply` commands in the happy path.
+- If an asset, image, profile build, gateway config, or state directory is
+  missing, the command that needs it should restore or create it.
+- If a change is risky, show a concise plan and ask before applying.
+- If a command cannot safely repair automatically, fail with the exact command
+  that can repair it.
+- Keep `status`, `inspect`, `doctor`, `logs`, `prune`, and explicit `repair`
+  commands for visibility, debugging, cleanup, and automation.
+
+Examples:
+
+```bash
+envd run books
+```
+
+May lazily create config directories, fetch runtime assets, build the selected
+profile image, start the gateway, create the sidecar, and verify sealed routing.
+
+```bash
+envd gateway install ams1 --host 1.2.3.4 --user root --password
+```
+
+May lazily create the encrypted store, save credentials, inspect the server, show
+a plan, apply after confirmation, and verify the gateway.
+
+```bash
+envd pkg add web apt:ffmpeg
+```
+
+Updates the profile manifest only. The next command that needs `web` builds it
+automatically.
+
+### Help UX
+
+Help output is part of the product. Every command group and risky option should
+include a short description of what it is and what it can change.
+
+Required help principles:
+
+- Do not expose internal architecture words without explaining them.
+- Prefer one obvious command for the happy path.
+- Show whether a command touches the remote server, local gateway, Docker
+  containers, sealed network policy, or stored secrets.
+- Mark risky actions such as `--replace`, `--network direct`, and secret export.
+- Strategy names must include practical descriptions, not just labels.
+- If a command can fail closed, say so.
+
+Example:
+
+```text
+envd gateway install <name>
+  Install or adopt a remote gateway, configure the local gateway profile, and
+  verify host + sealed-container traffic before it can become active.
+
+envd gateway use <name>
+  Switch the active gateway. Verifies the new route, syncs sealed environments,
+  and rolls back if validation fails.
+
+envd run <name>
+  Create a dev environment. Uses sealed networking by default.
+
+--network direct
+  Explicitly use normal Docker networking. This can expose traffic outside the
+  gateway and is never selected automatically.
+```
+
+### Top Level
+
+```bash
+envd self doctor
+envd self update
+envd self repair
+envd doctor
+envd doctor --deep
+envd status
+envd events
+envd why books
+envd init
+```
+
+`envd init` may exist as an explicit preflight command, but it must not be
+required before `envd run`, `envd gateway install`, `envd ps`, or diagnostics.
+
+### Primary Happy Path
+
+```bash
+envd gateway install ams1 --host 1.2.3.4 --user root --password
+envd gateway use ams1
+envd run books
+envd ps
+```
+
+The normal user should not need separate `inspect`, `plan`, and `apply`
+commands. `gateway install` should run those phases internally, show a concise
+plan, allow editing, then apply and verify.
+
+### No-Trash Command Philosophy
+
+The CLI should stay small in the normal path. Advanced commands can exist, but
+they must not become required rituals.
+
+Normal commands:
+
+```bash
+envd gateway install <name> --host <ip> --user root --password
+envd gateway use <name>
+envd run <env>
+envd ps
+envd exec <env>
+envd stop <env>
+envd start <env>
+envd rm <env>
+```
+
+Visibility/debug commands:
+
+```bash
+envd doctor --deep
+envd doctor --identity <env>
+envd why <env>
+envd events
+envd inspect <env>
+envd gateway status
+envd gateway doctor
+envd gateway egress
+```
+
+Package/profile commands:
+
+```bash
+envd pkg add <profile> apt:<package>
+envd pkg add <profile> npm:<package>
+envd pkg suggest <env>
+envd pkg promote <env> --to <profile>
+envd migrate <env> --profile <profile>
+```
+
+Maintenance commands:
+
+```bash
+envd self doctor
+envd self repair
+envd images repair
+envd assets fetch
+envd gateway repair <name>
+envd gateway rollback
+```
+
+Rules:
+
+- No required `envd init`.
+- No required profile/image build command in normal use.
+- No required manual image repair after Docker prune.
+- No proxy environment variables inside sealed environments.
+- No copied long-lived identity files.
+- No direct-network fallback.
+- No silent Docker socket exposure.
+- No managed Compose in v2 core.
+
+If implementation pressure adds a command to the happy path, that is a design
+smell. The command that has enough context should do the work lazily or explain
+why it cannot.
+
+### Gateway
+
+```bash
+envd gateway install ams1 --host 1.2.3.4 --user root --password
+envd gateway use ams1
+envd gateway status
+envd gateway doctor
+envd gateway logs
+envd gateway sync
+envd gateway repair ams1
+envd gateway inspect ams1
+envd gateway prune ams1
+envd gateway egress ams1
+envd gateway policy set ams1 --expect-country NL --strict
+envd gateway upgrade
+envd gateway rollback
+envd gateway rm ams1
+```
+
+Gateway commands manage both the active local gateway and the remote server
+profile behind it. The CLI can still expose advanced inspection/repair commands,
+but the primary install flow must be one command.
+
+Normal usage should mostly be `gateway install`, `gateway use`, and
+`gateway status`. `inspect`, `repair`, `prune`, logs, rollback, and explicit
+upgrade commands are for debugging, recovery, cleanup, and controlled changes.
+
+`gateway install` behavior:
+
+1. Lazily initialize envd state.
+2. Create or unlock the encrypted store if a password must be saved.
+3. Save the server password encrypted.
+4. Connect over SSH.
+5. Inspect OS, architecture, memory, disk, systemd, ports, and existing provider
+   state.
+6. Select the default `censorship-resistant` strategy unless overridden.
+7. Build a plan.
+8. Show the plan interactively.
+9. Allow `apply`, `edit`, `details`, or `abort`.
+10. Apply changes only after confirmation.
+11. Verify remote service, local gateway, host proxy, and sealed test route.
+12. Store the gateway profile only after verification succeeds.
+13. If no gateway is active, offer to activate the verified gateway.
+
+`gateway install` prepares and verifies a gateway profile. `gateway use <name>`
+selects the active profile. This keeps installation and activation explicit while
+still letting first-run UX offer "use this now" after a successful install.
+
+Example interactive plan:
+
+```text
+Gateway: ams1
+Host:    1.2.3.4
+Server:  Ubuntu 24.04 x86_64, 1 GB RAM
+Strategy: censorship-resistant
+Provider: xray vless-reality tcp/443
+
+Plan:
+  install xray 26.2.6
+  create envd-owned config
+  create user default
+  enable systemd service
+  verify local and sealed routes
+
+Choose: [a]pply  [e]dit  [d]etails  [q]uit
+```
+
+Flags for explicit behavior:
+
+```bash
+envd gateway install ams1 --host 1.2.3.4 --user root --password
+envd gateway install ams1 --strategy fast
+envd gateway install ams1 --adopt
+envd gateway install ams1 --replace
+envd gateway install ams1 --yes
+envd gateway install ams1 --dry-run
+```
+
+Rules:
+
+- Default interactive mode should be concise.
+- `--dry-run` prints the plan and changes nothing.
+- `--yes` is for automation and should still fail if verification fails.
+- `--replace` must be explicit before overwriting non-envd provider config.
+- `--adopt` imports compatible existing provider state when possible.
+- The command must never leave the gateway marked active unless end-to-end
+  verification passed.
+
+### Gateway Change Propagation
+
+Gateway changes must not require restarting Docker Desktop or guessing which
+container is stale.
+
+Commands that can change gateway behavior:
+
+- `envd gateway install`
+- `envd gateway use`
+- `envd gateway repair`
+- `envd gateway rollback`
+- `envd gateway upgrade`
+- `envd gateway strategy set`
+
+After any successful gateway change, envd should reconcile dependent sealed
+environments:
+
+1. Keep the local gateway endpoint stable when possible.
+2. Enumerate running sealed environments.
+3. Check whether each sidecar is connected to the active gateway generation.
+4. Hot-reload or restart the sidecar tunnel process when possible.
+5. If hot reload is not safe, perform a controlled recreate of the sidecar/dev
+   container pair while preserving volumes.
+6. Reinstall kill-switch rules before allowing egress.
+7. Verify DNS, TCP, TLS, Docker Hub, leak check, and egress policy.
+8. Mark the environment healthy only after validation passes.
+
+During propagation, sealed environments must remain fail-closed. If the active
+gateway changed but a sidecar cannot be updated, the sidecar should keep default
+drop policy and `envd ps` should show the issue:
+
+```text
+NAME   STATE    NET     VPN      PROFILE  ISSUE
+books  running  sealed  blocked  web      gateway sync failed
+```
+
+Manual repair commands:
+
+```bash
+envd gateway sync
+envd repair books --network
+envd doctor books --deep
+```
+
+No design should depend on restarting all of Docker to make containers notice a
+gateway config change.
+
+### Egress Identity And Policy
+
+`envd` should be able to show where traffic appears to exit and block sealed
+environments if the active egress does not match policy.
+
+Useful signals:
+
+- Public egress IP from the host gateway path.
+- Public egress IP from a sealed test container.
+- Country from IP geolocation.
+- ASN/provider from IP geolocation.
+- Whether host and sealed egress identity match.
+- Whether egress IP matches the expected gateway server IP when applicable.
+
+Commands:
+
+```bash
+envd gateway egress
+envd gateway egress ams1
+envd gateway policy set ams1 --expect-country NL --strict
+envd gateway policy set ams1 --deny-country RU --strict
+envd gateway policy clear ams1
+```
+
+Example output:
+
+```text
+Gateway:       ams1
+Remote IP:     1.2.3.4
+Host egress:   1.2.3.4  NL  ASxxxxx
+Sealed egress: 1.2.3.4  NL  ASxxxxx
+Policy:        expect-country NL, strict
+Result:        OK
+```
+
+Policy rules:
+
+- Egress policy checks should run during `gateway install`, `gateway use`,
+  `gateway sync`, `doctor --deep`, and sealed environment startup.
+- If `--strict` is enabled and policy cannot be verified, fail closed.
+- If host egress and sealed egress differ, fail closed for sealed environments.
+- If egress appears to be direct host internet instead of the gateway, fail
+  closed.
+- Country checks are useful but not perfectly reliable because IP geolocation can
+  be stale, inconsistent, or unavailable.
+- Exact egress IP and ASN checks are stronger than country alone, but still
+  should be treated as verification signals, not cryptographic proof.
+
+Country policy is therefore a guardrail, not the primary leak-prevention
+mechanism. The primary leak-prevention mechanism is still sealed routing plus
+kill-switch default drop.
+
+### Users
+
+```bash
+envd user add phone
+envd user rm phone
+envd user uri phone
+envd user list
+envd user disable phone
+envd user enable phone
+```
+
+`user uri <user>` prints a provider-specific import URI suitable for apps.
+
+### Identities
+
+```bash
+envd identity create work
+envd identity set work --git-name "Name" --git-email "me@example.com"
+envd identity key import work ~/.ssh/id_ed25519
+envd identity token set work github
+envd identity policy set work --require sealed
+envd identity policy set work --expect-country NL --strict
+envd identity list
+envd allow dev1 git --once
+```
+
+Identities define account credentials and the network policy required before
+those credentials can be used inside an environment.
+
+### Proxy
+
+```bash
+envd proxy
+envd proxy test
+envd proxy restart
+envd proxy logs
+```
+
+`envd proxy` prints stable connection details:
+
+```text
+SOCKS: 127.0.0.1:11080
+HTTP:  127.0.0.1:11081
+Status: OK
+Remote egress: x.x.x.x
+```
+
+### Runtime Assets
+
+```bash
+envd assets status
+envd assets fetch
+envd assets verify
+envd assets prune
+envd images
+envd images repair
+```
+
+Normal commands should fetch, verify, build, or restore required assets/images
+automatically when safe. Asset and image commands are for inspection,
+prewarming, explicit repair, and cleanup.
+
+`envd` should keep a managed runtime asset cache outside normal user project
+state. If a user runs `docker image prune -a` or otherwise deletes images,
+the next command that needs those images should attempt repair automatically.
+`envd images repair` remains available as an explicit manual repair command.
+
+The asset cache should include:
+
+- Pinned Xray/gateway image or build context.
+- Pinned sidecar image or build context.
+- Pinned dev base image or build context.
+- Provider binaries/checksums if building images locally.
+
+Docker image loss should be diagnosable and repairable:
+
+```text
+FAIL Required image missing: envd/net-sidecar:<version>
+Action: envd is repairing automatically
+```
+
+If automatic repair fails:
+
+```text
+FAIL Required image missing: envd/net-sidecar:<version>
+Auto-repair failed: registry unavailable
+Action: envd images repair --network direct
+```
+
+### Environments
+
+```bash
+envd run dev1
+envd run dev1 --network sealed
+envd run dev1 --network direct
+envd run dev1 --network offline
+envd exec dev1
+envd stop dev1
+envd start dev1
+envd restart dev1
+envd rm dev1
+envd ps
+envd inspect dev1
+envd repair dev1
+envd snapshot dev1
+envd restore dev1 <snapshot-or-archive>
+envd network set dev1 sealed
+```
+
+`envd ps` should expose operational state, not just container names:
+
+```text
+NAME      STATE    NET      VPN     EGRESS     IDENTITY  PROFILE  ISSUE
+dev1      running  sealed   ok      NL x.x.x.x work      default  -
+dev2      stopped  direct   n/a     host       blocked   web      identity requires sealed
+dev4      running  sealed   ok      NL x.x.x.x risky     default  raw credential mount
+dev3      running  offline  n/a     none       none      default  -
+```
+
+The `NET` column is required. A user should always know whether an environment is
+sealed, direct, or offline. For sealed environments, `EGRESS` should show the
+last verified gateway egress identity when available.
+
+`envd ps` must not show anonymous image IDs as the primary identity. If Docker
+only has an image ID, that is a recovery signal, not a normal state. The source
+of truth should be the envd environment spec:
+
+- Environment name.
+- Network mode.
+- Profile name and profile version.
+- Image tag and expected digest when available.
+- Volume names.
+- Sidecar/runtime versions.
+- Creation and last migration timestamps.
+
+Example unhealthy state:
+
+```text
+NAME          STATE    NET     VPN   EGRESS     PROFILE  IMAGE          ISSUE
+books         running  sealed  ok    NL x.x.x.x default  9df44ebfc908   image identity drift
+```
+
+Expected action:
+
+```bash
+envd repair books
+```
+
+Repair should rebuild or restore the pinned image that matches the saved envd
+spec, then recreate containers while preserving env volumes.
+
+### Workspaces And Project Manifests
+
+An environment should know what project/workspace it belongs to.
+
+Default behavior:
+
+```bash
+cd ~/repo/books
+envd run books
+```
+
+If the command is run inside a Git repo or normal project directory, envd should
+mount that directory as the environment workspace and remember it. The user
+should not need to repeat mount flags for ordinary projects.
+
+Useful commands:
+
+```bash
+envd run books .
+envd inspect books
+envd open books
+```
+
+`envd inspect books` should show:
+
+```text
+Workspace: /Users/c/repo/books -> /workspace/books
+Profile:   web
+Network:   sealed
+Manifest:  .envd.yaml
+```
+
+Optional repo-local manifest:
+
+```yaml
+profile: web
+network: sealed
+packages:
+  apt:
+    - ffmpeg
+  npm:
+    - pnpm
+ports:
+  - 3000
+services:
+  - postgres
+secrets:
+  required:
+    - GITHUB_TOKEN
+```
+
+Manifest rules:
+
+- `.envd.yaml` is optional.
+- It should contain non-secret project intent only.
+- Secrets must live in the encrypted envd store, not the repo.
+- The manifest may declare required secret names, but not secret values.
+- Local user overrides should live outside the repo.
+- `envd run` should read the manifest automatically if present.
+- If required secrets are missing, `envd run` should ask once, save them
+  encrypted, and continue.
+- If the manifest would change an existing environment, envd should show a
+  concise plan and ask before migration.
+
+This gives teams or future machines a simple "clone repo, run envd" path without
+turning envd into a complex orchestration platform.
+
+### Data, Snapshots, And Restore
+
+Volumes are user data. Rebuilds and migrations are only safe if volume handling
+is explicit and recoverable.
+
+Commands:
+
+```bash
+envd snapshot books
+envd snapshots books
+envd restore books <snapshot>
+envd backup books
+envd restore books <archive>
+```
+
+Rules:
+
+- Profile migration, network mode changes, and major image repairs should offer
+  or create a pre-change snapshot when volumes are affected.
+- Snapshots should be local and fast when Docker supports it.
+- Backups should be portable archives for moving to another machine.
+- Backup export should exclude secrets by default.
+- Including secrets must require explicit `--include-secrets`.
+- `envd rm` should not delete volumes unless explicitly requested.
+- `envd ps` or `envd inspect` should show whether an environment has recoverable
+  snapshots.
+
+This protects the user from "small image/package change destroyed my dev state"
+failure modes.
+
+### Services And Ports
+
+Existing service and port concepts should remain, but under the Go control
+plane:
+
+```bash
+envd service create dev1 postgres
+envd service ls dev1
+envd port open dev1 3000
+envd port ls dev1
+envd port close dev1 3000
+```
+
+### Docker From Dev Environments
+
+Running Docker from inside a dev environment is not the same as running a normal
+process inside that environment.
+
+When a dev container uses the host Docker daemon, Docker creates new sibling
+containers on the host. Those sibling containers do not automatically share the
+sealed dev container's network namespace. Without envd involvement, they may use
+normal Docker networking and bypass the gateway.
+
+Principle:
+
+```text
+sealed parent environment does not automatically make child Docker containers sealed
+```
+
+That means raw Docker and Docker Compose are outside the sealed guarantee unless
+envd explicitly manages that specific workflow:
+
+```bash
+docker run ...
+docker compose up
+```
+
+Compose support should not be part of the v2 core. Compose has too many features
+and edge cases to safely wrap casually. The initial goal is to avoid accidental
+leaks, not to reimplement Compose semantics.
+
+Options:
+
+- Do not mount the host Docker socket by default.
+- If the Docker socket is mounted, install wrapper scripts for `docker` and
+  `docker compose` that warn when a command is outside envd's sealed guarantee.
+- Allow raw host Docker access only with explicit opt-in.
+
+Raw Docker opt-in:
+
+```bash
+envd run dev1 --docker raw
+envd docker enable dev1 --raw
+```
+
+Rules:
+
+- Raw Docker access must be shown in `envd ps` as a risk.
+- Raw Docker containers are not considered sealed unless envd created and
+  verified them.
+- `docker compose up` inside a sealed env must show a clear warning unless raw
+  Docker access was explicitly enabled.
+- Future managed Compose support may be considered only after the sealed core is
+  stable and there is a concrete design for the required Compose features.
+
+## Diagnostics
+
+Diagnostics are a first-class feature. `envd doctor` should be fast and useful.
+`envd doctor --deep` should perform real network probes and identify the broken
+layer.
+
+### Required Checks
+
+Host checks:
+
+- Docker daemon reachable.
+- Required images available or buildable.
+- Xray gateway container running.
+- Xray rendered config valid.
+- Host SOCKS endpoint accepts connections.
+- Host HTTP endpoint accepts CONNECT.
+- Remote server TCP port reachable.
+- Remote camouflage TLS reachable.
+- Xray Reality handshake works.
+- Host egress through proxy returns real HTTP response.
+- Host egress IP/country/ASN collected.
+- Host egress policy passes when configured.
+
+Sealed container checks:
+
+- Dev container exists and runs.
+- Sidecar exists and runs.
+- Sidecar healthcheck passes.
+- Default route is TUN.
+- Kill-switch policies are installed.
+- DNS resolves.
+- TCP connect through tunnel works.
+- TLS through tunnel works.
+- Docker Hub returns expected `401`.
+- Leak check confirms public IP is VPN egress.
+- Sealed egress matches host/gateway egress expectation.
+- Egress country/ASN policy passes when configured.
+- Identity policy passes before credentials are injected.
+- Identity broker denies credentials on unsafe network states.
+- Kill-switch fails closed when gateway is stopped.
+- Raw Docker access is reported as a risk when enabled.
+
+### Example Healthy Output
+
+```text
+envd doctor --deep
+
+Host Docker                 OK
+Gateway container           OK
+Xray config                 OK
+Remote TCP 443              OK
+Remote camouflage TLS       OK
+Reality handshake           OK
+Host SOCKS                  OK  127.0.0.1:11080
+Host HTTP                   OK  127.0.0.1:11081
+Host egress                 OK  x.x.x.x NL ASxxxxx
+Egress policy               OK  expect-country NL
+
+[env dev1 sealed]
+Sidecar                     OK
+Default route               OK  tun0
+DNS                         OK
+TLS through VPN             OK
+Docker Hub through VPN      OK  HTTP 401
+Leak check                  OK  x.x.x.x matches gateway
+Egress policy               OK  NL
+Kill-switch                 OK
+```
+
+### Example Failure Output
+
+```text
+FAIL Reality handshake
+
+TCP to server:              OK
+Camouflage TLS:             OK
+Xray inbound:               OK
+TLS through Xray:           FAIL after ClientHello
+
+Likely causes:
+- Xray client/server version mismatch
+- Reality fingerprint instability
+- stale Reality keys or shortId
+- server-side Xray reject
+
+Suggested actions:
+- envd gateway doctor --debug
+- envd gateway set fingerprint firefox
+- envd gateway rollback
+```
+
+This is the kind of diagnostic that would have identified the June 2026 failure
+quickly.
+
+## Event Log And Change History
+
+envd should keep a local event log for meaningful state changes. This is not
+telemetry. It is local history for debugging and audit.
+
+Events to record:
+
+- Gateway installed, switched, repaired, upgraded, rolled back.
+- Gateway strategy or egress policy changed.
+- Sidecars synced or failed to sync.
+- Profile manifest changed.
+- Profile image generation built.
+- Package added/promoted/removed.
+- Environment created, migrated, repaired, removed.
+- Network mode changed.
+- Identity credentials injected or blocked by policy.
+- Account-sensitive command blocked or allowed by override.
+- Identity broker grant created, denied, or revoked.
+- Image or asset auto-repair happened.
+- Doctor found a new failure.
+
+Commands:
+
+```bash
+envd events
+envd events books
+envd events gateway ams1
+envd why books
+```
+
+Example:
+
+```text
+2026-06-05 10:12 gateway use ams1 -> hel1
+2026-06-05 10:12 gateway sync books ok
+2026-06-05 10:13 doctor books fail egress policy country mismatch
+2026-06-05 10:14 repair books network ok
+```
+
+`envd why <env>` should summarize the current state and the recent events that
+explain it:
+
+```text
+books is blocked because gateway sync failed after gateway generation 17.
+Last working generation: 16.
+Suggested action: envd gateway sync
+```
+
+This makes "what changed?" answerable without reading Docker/Xray logs first.
+
+## Gateway Installation And Reconciliation
+
+`envd` should own server and client configuration generation. This section
+describes the remote management model. Xray is the first provider. Future
+providers should fit the provider interface instead of changing the
+dev-container model.
+
+Remote management should be idempotent. `envd` should not behave like a one-shot
+install script. It should inspect the actual server state, compare it with the
+desired envd state, apply only missing or drifted changes, verify the result, and
+rollback if activation fails.
+
+Remote states:
+
+- `unknown`: server has not been inspected yet.
+- `unreachable`: SSH or TCP connection failed.
+- `unmanaged`: server is reachable, but no envd-owned provider install exists.
+- `adoptable`: compatible provider install exists, but is not envd-owned.
+- `managed`: envd-owned provider config exists and matches expected state.
+- `drifted`: envd-owned config exists, but remote state differs.
+- `broken`: provider exists but service or handshake is failing.
+
+Read-only inspection:
+
+```bash
+envd gateway inspect ams1
+```
+
+Expected output:
+
+```text
+REMOTE       ams1
+SSH          ok
+OS           Ubuntu 24.04
+ARCH         x86_64
+SYSTEMD      ok
+PROVIDER     xray 26.2.6
+CONFIG       envd-managed, drift none
+SERVICE      running
+PORT         443 open
+HANDSHAKE    ok
+USERS        3
+LOCAL ROUTE  ok
+SEALED ROUTE ok
+```
+
+If something is missing, the output should say what envd can do next:
+
+```text
+PROVIDER     missing
+ACTION       envd gateway repair ams1
+```
+
+Fresh server bootstrap:
+
+1. Connect to VPS over SSH.
+2. Detect OS and architecture.
+3. Install pinned Xray version.
+4. Generate Reality keys if not present.
+5. Generate server config.
+6. Install systemd service.
+7. Open required firewall port if a supported firewall is detected.
+8. Start Xray.
+9. Verify from local machine.
+10. Store local gateway profile.
+
+Existing server flows:
+
+```bash
+envd gateway inspect ams1
+envd gateway install ams1 --adopt
+envd gateway install ams1 --replace
+envd gateway repair ams1
+```
+
+Rules:
+
+- `inspect` is always read-only.
+- `adopt` imports compatible existing provider state without destroying unknown
+  users.
+- `replace` is explicit and destructive to the provider config, but must create
+  a backup first.
+- `repair` is safe and idempotent for envd-owned resources.
+- Unknown non-envd configs must not be overwritten by default.
+- Provider config files should include an envd ownership marker.
+- Remote changes should be applied atomically: write candidate config, validate,
+  restart provider, verify handshake, then mark active.
+- Failed activation should rollback to the previous known-good remote config.
+
+Remote provider footprint rules:
+
+- One active remote strategy per gateway by default.
+- Do not install multiple heavy providers unless explicitly requested.
+- Do not run inactive provider services by default.
+- Keep candidate configs staged but disabled when possible.
+- Check memory, disk, CPU architecture, and systemd availability before install.
+- Refuse or warn before installing on servers below the provider's minimum
+  resource budget.
+- `envd gateway prune <name>` should remove inactive envd-owned providers and
+  stale candidate configs.
+- Unknown non-envd services must not be stopped or removed.
+
+Example:
+
+```bash
+envd gateway inspect ams1
+envd gateway install ams1 --strategy censorship-resistant --dry-run
+envd gateway install ams1 --strategy censorship-resistant
+envd gateway prune ams1
+```
+
+The interactive plan, and `--dry-run`, should show whether envd will install,
+upgrade, stop, start, or remove anything before changes are applied.
+
+Server switching should be simple from the user side:
+
+```bash
+envd gateway use ams1
+envd gateway use hel1
+envd gateway test hel1
+```
+
+Switch flow:
+
+1. Load target gateway profile.
+2. Generate candidate local gateway config.
+3. Start or reload local gateway with candidate config.
+4. Verify host SOCKS/HTTP route.
+5. Verify sealed test route.
+6. Update active gateway pointer.
+7. Run gateway sync for affected sealed environments.
+8. Verify dependent sealed environments or leave them fail-closed.
+
+If the new gateway fails verification, envd must keep using the previous working
+gateway and report the exact failing layer.
+
+User management:
+
+- Each named user gets a UUID.
+- Users can be enabled/disabled independently.
+- `envd user uri <name>` emits a provider-specific import URI.
+- Server config can be updated atomically.
+- Previous config is retained for rollback.
+
+Example:
+
+```bash
+envd user add phone --gateway ams1
+envd user uri phone --gateway ams1
+envd user disable phone --gateway ams1
+```
+
+The URI format is provider-specific. For Xray Reality this is a VLESS Reality
+URI. Other providers may emit different app import strings.
+
+## State And Secrets
+
+Default state paths:
+
+```text
+~/.config/envd/config.yaml
+~/.config/envd/gateways/<name>.yaml
+~/.local/state/envd/store.db
+~/.cache/envd/
+~/.local/state/envd/
+```
+
+Files containing secrets must be `0600`.
+
+State should include:
+
+- Gateway name.
+- Active gateway pointer.
+- Gateway provider.
+- Gateway strategy.
+- Gateway strategy version.
+- Gateway generation.
+- Gateway status from last successful verification.
+- Gateway egress policy.
+- Last verified gateway egress IP/country/ASN.
+- Remote host.
+- SSH user/key reference.
+- Remote ownership marker.
+- Remote OS and architecture.
+- Remote memory and disk capacity.
+- Active remote provider service.
+- Installed envd-owned provider services.
+- Xray version.
+- Server public endpoint.
+- Local proxy endpoints.
+- Internal Docker endpoints.
+- Reality public key.
+- SNI.
+- shortId.
+- Users.
+- Last known-good remote config checksum.
+- Last known-good local gateway config checksum.
+- Docker image versions.
+- Runtime asset versions and checksums.
+- Environment network modes.
+- Environment image/tool profile.
+- Environment workspace path and mount path.
+- Environment project manifest path and last applied checksum.
+- Environment/project secret references.
+- Environment identity reference and identity policy result.
+- Environment identity broker grant state.
+- Environment sidecar gateway generation.
+- Environment last egress verification.
+- Environment snapshots and backup metadata.
+- Profile package manifest and generation.
+- Profile build network mode used for last build.
+- Raw Docker access flag per environment.
+- Identity profiles, broker state, and account-sensitive command guard settings.
+- Local event log retention policy.
+
+Private keys and sensitive remote credentials must not be logged.
+
+### Secret Storage
+
+`envd` should be able to remember remote credentials, but plaintext passwords
+must never be stored in normal config files.
+
+Use one portable secret backend:
+
+```text
+~/.local/state/envd/store.db
+```
+
+No macOS Keychain, Linux Secret Service, KWallet, or platform-specific secret
+store should be required. The same vault format should work on macOS and Linux.
+The store filename should not advertise that it contains credentials. The file
+name is not a security boundary, but it should also not be unnecessarily obvious.
+
+Vault behavior:
+
+- Server passwords are stored encrypted by default when provided.
+- The vault is protected by an envd master password.
+- The master password itself is never stored.
+- The master password is passed through a memory-hard KDF such as Argon2id with
+  a random salt.
+- The derived key encrypts/decrypts the vault using an authenticated encryption
+  mode such as XChaCha20-Poly1305 or AES-GCM.
+- A verifier hash can be stored to reject wrong master passwords quickly, but the
+  hash must not be usable as the encryption key.
+- Use vetted encryption libraries; do not implement custom crypto.
+- Never print passwords, private keys, UUIDs, or Reality private keys in logs.
+- Store only secret references in YAML state.
+
+Default remote password behavior:
+
+```text
+remember encrypted in envd vault
+```
+
+SSH keys may still be installed for convenience and reliability, but storing the
+server password is allowed and expected so `envd gateway repair`, server
+switching, and re-bootstrap flows do not require hunting for credentials in other
+tools.
+
+Example:
+
+```bash
+envd gateway install ams1 --host 1.2.3.4 --user root --password
+envd gateway auth set ams1 --password
+envd gateway auth rotate-key ams1
+envd secrets unlock
+envd secrets lock
+envd secrets list
+envd secrets forget remote/ams1/password
+```
+
+If `envd gateway install ... --password` is the first command that needs the
+encrypted store, envd should ask the user to create a master password, save the
+server password, and then continue installing the gateway. It should not stop
+with "run `envd secrets init` first".
+
+Rules:
+
+- Secrets should be scoped by purpose, for example `remote/ams1/password`.
+- The vault should auto-lock after a configurable idle timeout when envd keeps an
+  unlocked process or agent.
+- Single-shot commands may prompt for the master password, decrypt what is
+  needed, then clear sensitive memory before exit.
+- Remembering a server password does not mean remembering the master password.
+- `envd doctor` should report whether required secrets are available or locked,
+  without revealing values.
+- Exporting a full backup should require explicit `--include-secrets`.
+
+This keeps server switching and repair simple without forcing users to dig
+through external notes or apps for credentials every time.
+
+### Project And Environment Secrets
+
+The encrypted store can also hold local development secrets for environments.
+This should stay simple and local; envd should not become a cloud secret manager.
+
+Manifest example:
+
+```yaml
+secrets:
+  required:
+    - GITHUB_TOKEN
+    - DATABASE_URL
+```
+
+Behavior:
+
+- `.envd.yaml` may declare required secret names.
+- Secret values are never stored in the repo.
+- On `envd run`, if required secrets are missing, envd asks for them, stores
+  them encrypted, and continues.
+- Secrets are injected only into the environment that requested them.
+- Secret names can appear in `envd inspect`; values must never appear in normal
+  output or logs.
+- Secrets are not baked into profile images.
+
+Commands:
+
+```bash
+envd secret set books GITHUB_TOKEN
+envd secret list books
+envd secret forget books GITHUB_TOKEN
+```
+
+This removes another common source of dev friction: hunting through notes or
+copying `.env` files between containers.
+
+## Self Management
+
+README should not be the primary installation mechanism. It can document
+bootstrap, but the utility should manage itself after first install.
+
+Expected commands:
+
+```bash
+envd self doctor
+envd self update
+envd self repair
+envd assets fetch
+envd images repair
+```
+
+These commands are explicit maintenance tools. Normal envd commands should still
+repair their own missing prerequisites automatically when that can be done
+safely.
+
+Responsibilities:
+
+- Verify the installed binary matches expected version.
+- Verify config/state directory permissions.
+- Verify Docker access.
+- Verify required assets and images.
+- Recreate required Docker networks.
+- Rebuild or restore missing runtime images.
+- Explain exactly which host dependency is missing.
+
+Docker should be treated as an unreliable external runtime. `envd` must be able
+to recover from deleted containers, deleted images, deleted networks, and stale
+volumes where recovery is safe.
+
+## Docker Image Policy
+
+No unpinned runtime images.
+
+Bad:
+
+```text
+teddysun/xray:latest
+```
+
+Good:
+
+```text
+envd/xray:<pinned-version>
+envd/net-sidecar:<pinned-version>
+envd/sshdev:<pinned-version>
+```
+
+The CLI should expose:
+
+```bash
+envd version
+envd images
+envd gateway upgrade --to <version>
+envd gateway rollback
+```
+
+Runtime images should be reproducible from pinned definitions. If Docker images
+are deleted, the command that needs them should restore them from:
+
+1. Local envd asset cache.
+2. Pinned registry image.
+3. Pinned local build context.
+
+This is not a general Docker cache. It is only for assets `envd` cannot operate
+without.
+
+### Environment Image Identity
+
+Each environment should be backed by a declarative image spec, not by whatever
+Docker image ID exists at runtime.
+
+Problem to avoid:
+
+```text
+NAME                 STATE    STATUS            IMAGE
+vibeanalysis         active   Up About an hour  sshdev:24.04
+books                active   Up About an hour  9df44ebfc908
+vpntest              active   Up About an hour  e22e7bf90fc0
+bet1                 active   Up About an hour  808d31ef8bc4
+```
+
+This means the environments are still running, but envd cannot clearly explain
+what they were built from. That makes repair, migration, audit, and rebuilds
+fragile.
+
+Desired model:
+
+- `envd` stores an environment spec when the environment is created.
+- Docker labels point back to the envd environment ID.
+- Image tags are stable and human-readable.
+- Image digests are recorded when available.
+- Anonymous image IDs are treated as drift.
+- `envd repair <name>` restores the declared image, not an arbitrary latest
+  image.
+
+Example tags:
+
+```text
+envd/dev-default:2026.06.05-1
+envd/dev-web:2026.06.05-1
+envd/net-sidecar:2026.06.05-1
+envd/xray-gateway:26.2.6-envd.1
+```
+
+This gives envd the ability to recover after `docker image prune` without
+guessing what an environment used to be.
+
+## Dev Image And Tool Profiles
+
+The default dev image should include a practical baseline toolset so every new
+environment is useful immediately.
+
+Baseline tools:
+
+- bash, zsh optional later
+- git, openssh-client, curl, wget
+- ca-certificates
+- build-essential, pkg-config
+- python3, pip
+- node LTS tooling optional via profile
+- go optional via profile
+- docker CLI and compose plugin
+- common debug tools: iproute2, dnsutils or drill, netcat, jq, less, vim
+
+Tooling should be managed by profiles, not by editing Dockerfiles manually every
+time:
+
+```bash
+envd profile list
+envd profile create web --from default --add node:lts --add pnpm
+envd profile create go --from default --add go:stable
+envd run app1 --profile web
+```
+
+Profile images should build lazily when first used. Explicit image/profile build
+commands may exist for prewarming or debugging, but they are not required normal
+UX.
+
+Profile rules:
+
+- Profiles produce pinned image definitions.
+- Images are tagged with profile and version.
+- Rebuilding a profile should not mutate existing environments unless requested.
+- Existing environments can be migrated by controlled recreate with volumes
+  preserved.
+
+This keeps new environments fast while avoiding hidden mutable state.
+
+### Package Lifecycle
+
+Runtime package installs inside a dev container are useful for experimentation,
+but they should not become the long-term source of truth.
+
+Problem:
+
+```bash
+apt install ffmpeg
+npm install -g pnpm
+pip install poetry
+```
+
+If the user repeats those commands in every environment, envd should make it easy
+to promote them into a reusable profile instead of silently accumulating
+container drift.
+
+Desired workflow:
+
+```bash
+envd pkg add default apt:ffmpeg
+envd pkg add web npm:pnpm
+envd pkg add python pip:poetry
+envd run app1 --profile web
+```
+
+`pkg add` updates the profile manifest and marks the profile as dirty. The next
+command that needs the profile should build or update the image automatically.
+The user should not need to run a separate build command in the normal path.
+
+Promotion workflow:
+
+```bash
+envd pkg suggest books
+envd pkg promote books --to web
+envd migrate books --profile web
+```
+
+`pkg promote` should show suggestions, ask what to keep, update the target
+profile, and mark it dirty. `envd migrate` then builds the profile if needed and
+recreates the environment safely with volumes preserved.
+
+Package sources:
+
+- `apt:<package>`
+- `npm:<package>`
+- `pip:<package>`
+- `go:<package>`
+- `binary:<url>@<checksum>`
+- `script:<name>` only for envd-managed reviewed scripts
+
+Rules:
+
+- Profiles should store package intent, not only a generated Dockerfile.
+- Generated Dockerfiles are build artifacts.
+- Package changes create profile generations.
+- Dirty profiles are built lazily by `envd run`, `envd migrate`, and
+  `envd repair`.
+- Existing environments are not mutated until the user runs a controlled
+  migration.
+- `envd profile build <name>` may exist only as an explicit prebuild/debug
+  command, not as required UX.
+- `envd pkg suggest <env>` can inspect apt history, dpkg state, global npm
+  packages, pipx/pip globals, and common tool paths, but suggestions are
+  best-effort and must be confirmed.
+- `envd inspect <env>` should show runtime drift from the declared profile.
+
+### Image Storage And Cleanup
+
+Profile generations should not create unbounded image noise.
+
+Storage rules:
+
+- Docker layer sharing should be used instead of rebuilding everything from
+  scratch.
+- BuildKit cache mounts should be used for apt, npm, pip, Go, and similar
+  package caches.
+- Env images should be tagged by profile and generation.
+- Older generations should be kept only while environments reference them.
+- Unreferenced envd-owned images can be removed by `envd images prune`.
+- `envd images` should explain which images are active, repairable, cached, or
+  garbage-collectable.
+
+Example:
+
+```text
+IMAGE                       ROLE      USED BY       STATUS
+envd/dev-web:2026.06.05-1   profile   books         active
+envd/dev-web:2026.06.04-1   profile   -             pruneable
+envd/net-sidecar:...        runtime   all sealed    protected
+```
+
+This keeps images reproducible without forcing every small package change to
+become permanent storage bloat.
+
+### Package Network Policy
+
+Package installation has its own network tradeoff. Some package downloads should
+use the sealed gateway for privacy/censorship resistance. Some heavy public
+downloads may be acceptable through direct networking to save VPN traffic.
+
+The safe default is sealed:
+
+```bash
+envd pkg add web apt:ffmpeg
+envd run app1 --profile web
+```
+
+Explicit direct build/download mode can be attached to the command that triggers
+the build:
+
+```bash
+envd run app1 --profile web --build-network direct
+envd migrate books --profile web --build-network direct
+```
+
+Rules:
+
+- Direct package/build networking must be explicit.
+- Direct build/download jobs must run in isolated builder containers, not inside
+  an active sealed dev environment.
+- Direct jobs should not get the dev environment's secrets by default.
+- Direct jobs may use envd-managed package caches.
+- Active sealed environments stay sealed while direct package/build jobs run.
+- `envd doctor` should be able to distinguish "profile build used direct
+  network" from "sealed environment leaked".
+
+This gives the user a controlled way to save gateway traffic for heavy public
+downloads without weakening the sealed runtime guarantee.
+
+## Identity And Account Protection
+
+The tool should not depend on macOS-specific host assumptions for Git, SSH,
+GitHub, AI coding tools, or other account-backed developer workflows.
+
+Within an envd-managed protected environment, identity exposure should be
+deterministic:
+
+```text
+sealed network healthy + identity policy passes -> broker can use identity
+anything else -> broker denies identity
+```
+
+This guarantee applies to the envd-managed path:
+
+- envd-created environment.
+- sealed networking enabled and verified.
+- no raw host Docker socket unless explicitly accepted as a risk.
+- no direct host credential mounts.
+- identity attached through the envd broker.
+- account-sensitive commands using envd-managed Git/SSH/credential helpers.
+
+Outside this boundary, envd should warn and mark the environment risky, but it
+cannot guarantee what arbitrary host mounts, raw Docker containers, or manually
+copied credential files do.
+
+`envd` should manage identities as first-class objects:
+
+```bash
+envd identity create work
+envd identity set work --git-name "Name" --git-email "me@example.com"
+envd identity key import work ~/.ssh/id_ed25519
+envd identity token set work github
+envd run dev1 --identity work
+```
+
+Identity contents:
+
+- Git name/email/signing config.
+- SSH keys or references.
+- GitHub/GitLab tokens if used.
+- Tool-specific tokens such as AI coding assistant credentials when explicitly
+  stored.
+- Allowed network policy.
+- Allowed egress country/ASN/IP policy.
+
+Identity network policy:
+
+```bash
+envd identity policy set work --require sealed
+envd identity policy set work --expect-country NL --strict
+envd identity policy set work --deny-direct
+```
+
+Default identity policy:
+
+```text
+require sealed
+deny direct
+deny unknown egress
+```
+
+Rules:
+
+- Account credentials must not be injected into direct environments by default.
+- Account credentials must not be injected if the sealed route is unhealthy.
+- Account credentials must not be injected if strict egress policy fails.
+- Account credentials must not be baked into images.
+- Long-lived account credentials must not be copied into environment
+  filesystems in the protected identity path.
+- Long-lived account credentials must not be exposed as persistent environment
+  variables.
+- Identity secrets live in the encrypted envd store.
+- Host Git/SSH config can be imported once, but runtime should use envd-managed
+  identity config.
+- Linux and macOS behavior should be equivalent.
+
+Example safe failure:
+
+```text
+FAIL identity work blocked
+Reason: env dev1 is direct, but identity requires sealed networking.
+Action: envd network set dev1 sealed
+```
+
+### Identity Broker
+
+Wrappers are useful, but they are not strong enough by themselves. The stronger
+default is an envd identity broker:
+
+```text
+tool inside env -> envd identity broker -> policy check -> credential operation
+```
+
+The broker should expose only the minimum capability needed:
+
+- SSH signing/auth through an envd-managed SSH agent socket.
+- Git HTTPS credentials through a credential helper.
+- Tool tokens through short-lived environment variables or stdin only when
+  policy passes.
+- Optional command wrappers as an additional UX layer.
+
+Concrete Git/SSH model:
+
+- `~/.ssh/id_*` files are not copied into the container.
+- `.gitconfig` inside the container is generated by envd and points to envd
+  helpers.
+- `SSH_AUTH_SOCK` points to an envd broker socket, not the host's raw agent.
+- Git HTTPS uses `credential.helper = envd credential-helper`.
+- The broker performs the actual key/token operation only after policy passes.
+- If policy fails during a long-running environment session, the broker revokes
+  the grant; future Git/SSH operations fail even if the shell is still open.
+
+Broker rules:
+
+- Private keys and long-lived tokens stay in the encrypted envd store or an
+  envd-controlled agent, not in the container filesystem.
+- Broker sockets are mounted only into environments with an identity attached.
+- Broker grants are scoped to environment ID, identity, command class, and
+  gateway generation.
+- Grants are revoked when network mode changes, gateway generation changes,
+  egress policy fails, or `doctor` marks the environment unsafe.
+- If the broker cannot verify policy, it denies access.
+- Direct raw access to host `~/.ssh`, `~/.gitconfig`, or tool credential files is
+  disabled by default.
+- If the user explicitly mounts host credential files, enables raw Docker, or
+  copies credentials manually, envd must mark the environment outside the
+  protected identity boundary.
+
+Example:
+
+```text
+git push -> SSH agent request -> broker checks dev1:
+  network sealed: ok
+  gateway generation current: ok
+  egress country NL: ok
+  identity work allows git: ok
+result: allow signing/auth
+```
+
+Unsafe example:
+
+```text
+git push -> SSH agent request -> broker checks dev1:
+  network direct: fail
+result: deny
+```
+
+This is what makes identity protection resistant to bugs in shell startup files,
+copied dotfiles, or users accidentally running the right command from the wrong
+network mode.
+
+### Identity Verification
+
+envd cannot honestly promise mathematical "100% protection", but it can make
+identity exposure fail-closed and testable.
+
+Required checks:
+
+- No private key files exist in the container filesystem by default.
+- No long-lived token files exist in the container filesystem by default.
+- No raw host credential mounts are present.
+- No persistent environment variables contain long-lived account tokens.
+- SSH auth goes through the envd broker socket when an identity is attached.
+- Git credential helper is envd-managed.
+- Account-sensitive wrappers are installed and first in PATH where practical.
+- Broker denies access when the environment is direct.
+- Broker denies access when sealed route is unhealthy.
+- Broker denies access when egress policy fails.
+- Broker grants are revoked after gateway switch until revalidation succeeds.
+- `envd ps` shows identity status.
+- `envd doctor --identity` runs negative tests to confirm unsafe access is
+  blocked.
+
+Command:
+
+```bash
+envd doctor --identity dev1
+```
+
+Example output:
+
+```text
+Identity work                 OK
+Private key files             OK  none found
+Git credential helper         OK  envd
+SSH agent broker              OK
+Direct network denial         OK
+Wrong egress denial           OK
+Gateway switch revocation     OK
+```
+
+### Account-Sensitive Command Guard
+
+`envd` should reduce accidental account exposure from commands such as:
+
+- `git push`
+- `git pull`
+- `gh auth`
+- `npm publish`
+- `pip upload`
+- AI coding tools that contact account-backed services.
+
+Inside managed environments, envd can install lightweight wrappers for common
+account-sensitive commands. The wrappers should check envd state before allowing
+the command to receive credentials.
+
+Guard behavior:
+
+1. Check environment network mode.
+2. Check sealed route health.
+3. Check egress IP/country/ASN policy.
+4. Check identity policy.
+5. Allow command only if policy passes.
+
+If policy fails, the wrapper should block by default:
+
+```text
+Blocked: git push would use identity work from an unsafe network.
+Network: direct
+Required: sealed, egress country NL
+```
+
+Explicit overrides should be noisy and temporary:
+
+```bash
+envd allow dev1 git --once
+envd identity policy set personal --allow-direct
+```
+
+These guardrails are not a replacement for provider-side account security, but
+they prevent common local mistakes: running account tools from direct networking,
+wrong egress country, stale gateway, or an unsealed raw Docker context.
+
+## Migration From Current System
+
+The new Go implementation does not need to preserve Bash internals.
+
+However, migration should preserve user data:
+
+- Existing Docker volumes.
+- Existing environment names where feasible.
+- Existing SSH config entries where safe.
+- Existing remote Xray credentials if imported.
+
+The old Bash script can remain temporarily as implementation reference, but the
+new Go CLI should not shell out to it for normal operations.
+
+## Immediate Build Plan
+
+1. Create Go CLI skeleton.
+2. Implement config/state model.
+3. Implement environment specs and `envd ps` from envd state plus Docker state.
+4. Implement image identity, profile tags, and image drift detection.
+5. Implement runtime asset/image manager.
+6. Implement local gateway manager through a provider interface.
+7. Implement `envd proxy` and `envd proxy test`.
+8. Implement `envd doctor --deep`.
+9. Implement sealed environment creation.
+10. Implement direct/offline environment modes and safe mode changes.
+11. Implement interactive `envd gateway install <name>` with internal
+    inspect/plan/apply/verify phases.
+12. Implement `gateway inspect`, `gateway repair`, `gateway prune`, `--adopt`,
+    and `--replace` as advanced controls.
+13. Implement atomic `envd gateway use <name>` switching and rollback.
+14. Implement user URI generation.
+15. Implement dev image profiles.
+16. Implement package manifest, lazy profile builds, generations, and image
+    pruning.
+17. Implement package promotion suggestions from existing environments.
+18. Implement workspace/project manifest support.
+19. Implement snapshots, backup, and restore.
+20. Implement event log and `envd why`.
+21. Implement identity profiles, identity broker, and account-sensitive command
+    guards.
+22. Implement raw Docker socket detection and warnings.
+23. Remove Bash dependency.
+
+The first milestone is not feature parity. The first milestone is reliable
+environment identity, gateway/proxy diagnostics, and sealed environment
+creation. A user should be able to create one sealed environment, see exact
+network state in `envd ps`, recover after image deletion, and identify the
+failing network layer without manual curl/ping debugging.
