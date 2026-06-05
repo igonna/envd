@@ -46,6 +46,8 @@ Core user promises:
 - Docker image purges are repairable for envd-owned images.
 - Secrets are remembered in an encrypted envd store.
 - Developer identities and account credentials are protected by network policy.
+- A maintained hosting catalog helps users get a replacement gateway quickly
+  instead of researching providers from zero during an outage.
 - Projects can declare non-secret envd intent in the repo when useful.
 - Risky migrations can preserve recoverable volume snapshots.
 - envd records an event log so "what changed?" is answerable.
@@ -266,6 +268,317 @@ Candidate protocol selection should be evidence-based:
 
 If verification fails, envd should leave the previous working strategy active and
 report the failing layer.
+
+### Censorship Readiness And Network Intelligence
+
+envd should not assume that today's working protocol, VPS provider, country, or
+ASN will keep working forever. It should track real reachability signals and make
+gateway decisions evidence-based.
+
+Goals:
+
+- Know whether the active gateway works from the current network.
+- Know whether failures are local Docker/envd issues, gateway issues, provider
+  blocking, protocol blocking, DNS manipulation, or broad network disruption.
+- Help the user choose a new gateway/provider before the current one becomes a
+  single point of failure.
+- Track censorship trends without pretending to predict the future perfectly.
+
+Non-goals:
+
+- No port scanning.
+- No abusive scanning of third-party networks.
+- No hidden telemetry.
+- No promise that any protocol will work under total whitelist-only isolation.
+
+Commands:
+
+```bash
+envd internet status
+envd internet report
+envd internet sources
+envd hosting update
+envd hosting check
+envd hosting list
+envd hosting shortlist
+envd gateway prepare
+envd gateway risk ams1
+envd provider token set provider-a
+envd gateway create ams2 --provider provider-a --region nl
+```
+
+`envd internet status` should summarize the user's current network:
+
+```text
+Network:        RU, ASxxxxx
+Direct web:     partial
+DNS integrity:  suspicious
+Gateway ams1:   ok, NL ASyyyyy, xray/reality
+Docker Hub:     ok through sealed gateway
+Telegram:       blocked direct, ok through gateway
+Risk:           medium
+```
+
+Signal types:
+
+- Direct HTTP/TLS reachability to a small curated set of well-known domains.
+- DNS consistency checks against trusted resolvers.
+- Active gateway success/failure by real HTTPS probes.
+- Sealed container egress identity and leak checks.
+- Hosting/provider website and API reachability from the user's network.
+- User-owned gateway reachability by TCP/TLS/provider handshake.
+- Optional manually imported external reports.
+
+Hosting checks should be lightweight reachability checks, not scans:
+
+```text
+Hetzner website reachable: yes
+Hetzner API reachable:     yes
+Gateway IP reachable:      yes
+Provider ASN reputation:   warning, many failures in local history
+```
+
+Provider/hosting catalog:
+
+- Large built-in researched catalog of VPS providers and regions.
+- Optional remote catalog updates signed or checksum-verified by envd releases.
+- Catalog data lives in the repository as maintained data, not hardcoded logic.
+- Local private catalog overlay is an escape hatch, not the normal workflow.
+- Store provider country, ASN, pricing notes, API endpoint, and historical local
+  success rate.
+- Store payment notes, including whether cards, crypto, PayPal, bank transfer,
+  or local/regional payment methods are known to be supported.
+- Store whether the provider has an API that envd can use after the user supplies
+  an API token.
+- Store manual signup URL and minimal recommended VPS size.
+- Do not recommend a provider solely because it is cheap.
+- Prefer provider diversity: country, ASN, upstream network, and payment/account
+  separation when possible.
+- Do not only list the most famous providers. Well-known providers may be
+  targeted first, so the catalog should include a broad, maintained spread of
+  smaller reputable providers too.
+- Catalog entries should be versioned and updateable by `envd self update` or
+  `envd hosting update`.
+- Catalog entries should have confidence levels: `verified`, `community`,
+  `user`, `stale`, `unknown`.
+- The default catalog should be good enough that most users never manually add a
+  provider.
+
+Catalog sources:
+
+```text
+built-in      researched catalog shipped with envd release
+updated       signed/checksum-verified catalog update
+local         private user override, exceptional path
+imported      user-imported catalog file, exceptional path
+```
+
+Catalog maintenance model:
+
+- Provider research is project work, not normal user work.
+- Use AI-assisted research plus human review to maintain broad provider data.
+- Include famous providers, regional providers, smaller reputable providers, and
+  payment-friendly providers where known.
+- Include providers that sell foreign-region VPS from constrained payment
+  regions when reliable information is available.
+- Re-check provider homepage, signup URL, API URL, regions, rough minimum plan,
+  payment metadata, ASN, and country.
+- Mark stale entries instead of silently deleting them.
+- Ship catalog snapshots with envd releases.
+- Allow signed/checksum-verified catalog refreshes between binary releases.
+- Keep the catalog transparent and inspectable.
+
+Repository layout idea:
+
+```text
+data/hosting/providers.yaml
+data/hosting/regions.yaml
+data/hosting/schema.json
+data/hosting/sources.md
+```
+
+User expectation:
+
+```text
+The user should not research providers from zero during an outage.
+envd should already have a broad shortlist and local reachability history.
+```
+
+Provider entry shape:
+
+```yaml
+id: senko-digital
+name: Senko Digital
+homepage: https://example.com
+signup_url: https://example.com/signup
+api_url: null
+countries_sold_from:
+  - RU
+regions:
+  - code: nl
+    country: NL
+    city: Amsterdam
+    asn: ASxxxxx
+payments:
+  - local-card
+  - crypto
+  - bank-transfer
+min_plan:
+  cpu: 1
+  ram_mb: 1024
+  disk_gb: 10
+notes:
+  - regional provider
+confidence: user
+```
+
+Catalog commands:
+
+```bash
+envd hosting update
+envd hosting add
+envd hosting edit senko-digital
+envd hosting import providers.yaml
+envd hosting export --local providers.yaml
+envd hosting history
+```
+
+`hosting add`, `edit`, `import`, and `export` are advanced escape hatches. The
+normal path should use the maintained catalog.
+
+Gateway acquisition flow:
+
+```bash
+envd hosting list --region europe --payment crypto
+envd hosting check
+envd hosting shortlist
+envd gateway prepare
+```
+
+`envd hosting shortlist` should rank providers by:
+
+- Reachability from the current network.
+- API/website reachability.
+- Country and ASN diversity versus existing gateways.
+- Local historical success/failure rate.
+- Payment compatibility metadata.
+- Minimum VPS cost and resource fit.
+- Whether the provider is already overused by the user's gateways.
+
+Example:
+
+```text
+Provider      Region  ASN      Website  API  Payment      Risk       Notes
+provider-a    NL      AS111    ok       ok   card,crypto  medium     common ASN
+provider-b    FI      AS222    ok       -    card         low        manual setup
+provider-c    RS      AS333    fail     -    crypto       unknown    website blocked
+```
+
+`envd hosting check` should remember previous results:
+
+```text
+Checked: 2026-06-05 12:30
+Reachable providers: 38/57
+Reachable APIs:      12/19
+Payment fit:         21/57
+New failures:        provider-c, provider-d
+Recovered:           provider-e
+```
+
+History view:
+
+```text
+Provider        Last 7 checks       Trend
+provider-a      ok ok ok ok ok ok   stable
+provider-c      ok fail fail fail   degrading
+provider-e      fail fail ok ok     recovered
+```
+
+This lets the user see what changed since the last check instead of redoing
+research manually.
+
+`envd gateway prepare` should guide the user through creating the next gateway:
+
+```text
+1. Pick provider/region.
+2. Open signup/create-server URL.
+3. Show recommended VPS size and OS image.
+4. After the user enters IP/root/password, continue with gateway install.
+```
+
+If a provider API token is configured, envd may automate VPS creation:
+
+```bash
+envd provider token set provider-a
+envd gateway create ams2 --provider provider-a --region nl
+```
+
+Rules:
+
+- No hidden account creation.
+- No storing provider payment credentials.
+- Provider API tokens live in the encrypted store.
+- Manual flow must stay first-class because many providers do not have useful
+  APIs or payment automation.
+- The goal is "new gateway in minutes", not "envd becomes a cloud reseller".
+- The catalog should support private local overrides so the user can add
+  providers that are not in the built-in list.
+- Local/private catalog entries should never be uploaded automatically.
+- Public catalogs should avoid claiming a provider is guaranteed safe or
+  unblockable; they are starting points for local reachability checks.
+- A broad catalog is useful, but envd should still recommend provider/ASN
+  diversity instead of concentrating everyone on the same "best" provider.
+
+Readiness score:
+
+```text
+gateway health      current tunnel works
+strategy health     current protocol works
+provider risk       provider/ASN historically blocked or degraded
+region risk         country/region has recent reachability failures
+diversity           user has more than one viable gateway
+identity safety     account credentials only available in protected envs
+```
+
+Example:
+
+```text
+Gateway ams1
+Health:        ok
+Strategy:      censorship-resistant xray/reality
+Provider risk: elevated, ASN had 3 failures this month
+Diversity:     weak, no backup gateway
+Action:        install second gateway on a different provider/ASN
+```
+
+Preparedness rules:
+
+- envd should recommend at least two gateways on different providers/ASNs for
+  users who depend on sealed networking daily.
+- Gateway switch should stay atomic and verified.
+- Strategy updates should be pinned and explicit.
+- If the current protocol starts failing but the remote server is reachable,
+  envd should classify it as possible protocol/DPI failure.
+- If many unrelated foreign hosts fail direct but the gateway still works, envd
+  should classify it as local censorship/network degradation.
+- If only one provider ASN fails, envd should classify it as possible provider
+  or subnet blocking.
+- If only DNS differs, envd should classify it as DNS manipulation.
+- If strict egress or identity policies cannot be verified, envd should fail
+  closed for sealed environments and account credentials.
+
+Hard limit:
+
+```text
+If the local network allows only a government-controlled whitelist and blocks all
+unknown foreign TCP/UDP destinations, no normal VPS-based gateway can be made
+reliably reachable from that network. envd can detect this condition, preserve
+sealed fail-closed behavior, and suggest alternatives, but it cannot guarantee
+connectivity in principle.
+```
+
+This section exists so envd adapts based on measurements instead of being frozen
+around one protocol or one hosting provider.
 
 ### Sealed Dev Environment
 
@@ -515,6 +828,8 @@ Rules:
 - No direct-network fallback.
 - No silent Docker socket exposure.
 - No managed Compose in v2 core.
+- No expectation that users manually research VPS providers during outages.
+  envd ships and updates a maintained hosting catalog.
 
 If implementation pressure adds a command to the happy path, that is a design
 smell. The command that has enough context should do the work lazily or explain
@@ -753,6 +1068,23 @@ HTTP:  127.0.0.1:11081
 Status: OK
 Remote egress: x.x.x.x
 ```
+
+### Internet And Hosting Intelligence
+
+```bash
+envd internet status
+envd internet report
+envd internet sources
+envd hosting check
+envd hosting list
+envd gateway risk ams1
+```
+
+These commands summarize censorship/reachability signals, hosting/provider
+reachability, gateway risk, and whether the user has enough gateway diversity.
+They should not be required in normal daily use, but they are useful for planning
+and for understanding whether failures are local, provider-specific,
+protocol-specific, or broad network disruption.
 
 ### Runtime Assets
 
@@ -1132,6 +1464,7 @@ Events to record:
 - Identity credentials injected or blocked by policy.
 - Account-sensitive command blocked or allowed by override.
 - Identity broker grant created, denied, or revoked.
+- Internet status or hosting/provider risk changed.
 - Image or asset auto-repair happened.
 - Doctor found a new failure.
 
@@ -1351,6 +1684,14 @@ State should include:
 - Remote memory and disk capacity.
 - Active remote provider service.
 - Installed envd-owned provider services.
+- Hosting provider catalog entries.
+- Hosting provider catalog source versions.
+- Hosting provider payment/reachability metadata.
+- User-added hosting provider overrides.
+- Hosting check snapshots and trend history.
+- Provider API token references.
+- Local internet measurement history.
+- Gateway/provider/ASN risk scores.
 - Xray version.
 - Server public endpoint.
 - Local proxy endpoints.
@@ -1490,6 +1831,58 @@ envd secret forget books GITHUB_TOKEN
 
 This removes another common source of dev friction: hunting through notes or
 copying `.env` files between containers.
+
+## Installation And Bootstrap
+
+The first install should be one obvious command from the repository:
+
+```bash
+./install.sh
+```
+
+`install.sh` should compile and install the Go `envd` binary. It is the bootstrap
+step only. After envd is installed, normal setup is owned by envd itself.
+
+Installer behavior:
+
+1. Detect OS and architecture.
+2. Verify required build tools.
+3. If Go is missing, either use a pinned local/toolchain download flow or fail
+   with one exact command to install Go.
+4. Build the envd binary from source.
+5. Install to a user-writable path when possible, such as `~/.local/bin`.
+6. Use `/usr/local/bin` only when requested or when permissions allow.
+7. Verify the installed binary runs.
+8. Print the next useful command, not a wall of README steps.
+
+Examples:
+
+```bash
+./install.sh
+./install.sh --prefix ~/.local
+./install.sh --system
+./install.sh --dry-run
+./install.sh --uninstall
+```
+
+Rules:
+
+- No Homebrew-only install path.
+- No macOS-only assumptions.
+- No manual copying of shell snippets into profile files unless the user asks for
+  shell completions.
+- If `PATH` needs updating, print the exact line and explain it.
+- The script should be idempotent.
+- Re-running it should upgrade or repair the local binary.
+- The installed binary should be able to run `envd self doctor` immediately.
+
+Expected first experience:
+
+```bash
+./install.sh
+envd gateway install ams1 --host 1.2.3.4 --user root --password
+envd run books
+```
 
 ## Self Management
 
@@ -2023,33 +2416,37 @@ new Go CLI should not shell out to it for normal operations.
 
 ## Immediate Build Plan
 
-1. Create Go CLI skeleton.
-2. Implement config/state model.
-3. Implement environment specs and `envd ps` from envd state plus Docker state.
-4. Implement image identity, profile tags, and image drift detection.
-5. Implement runtime asset/image manager.
-6. Implement local gateway manager through a provider interface.
-7. Implement `envd proxy` and `envd proxy test`.
-8. Implement `envd doctor --deep`.
-9. Implement sealed environment creation.
-10. Implement direct/offline environment modes and safe mode changes.
-11. Implement interactive `envd gateway install <name>` with internal
+1. Create source-built `install.sh` bootstrap.
+2. Create Go CLI skeleton.
+3. Implement config/state model.
+4. Implement environment specs and `envd ps` from envd state plus Docker state.
+5. Implement image identity, profile tags, and image drift detection.
+6. Implement runtime asset/image manager.
+7. Implement local gateway manager through a provider interface.
+8. Implement `envd proxy` and `envd proxy test`.
+9. Implement `envd doctor --deep`.
+10. Implement sealed environment creation.
+11. Implement direct/offline environment modes and safe mode changes.
+12. Implement interactive `envd gateway install <name>` with internal
     inspect/plan/apply/verify phases.
-12. Implement `gateway inspect`, `gateway repair`, `gateway prune`, `--adopt`,
+13. Implement `gateway inspect`, `gateway repair`, `gateway prune`, `--adopt`,
     and `--replace` as advanced controls.
-13. Implement atomic `envd gateway use <name>` switching and rollback.
-14. Implement user URI generation.
-15. Implement dev image profiles.
-16. Implement package manifest, lazy profile builds, generations, and image
+14. Implement atomic `envd gateway use <name>` switching and rollback.
+15. Create maintained hosting catalog data files.
+16. Implement `envd internet status`, hosting catalog updates, gateway
+    acquisition helper, and gateway risk scoring.
+17. Implement user URI generation.
+18. Implement dev image profiles.
+19. Implement package manifest, lazy profile builds, generations, and image
     pruning.
-17. Implement package promotion suggestions from existing environments.
-18. Implement workspace/project manifest support.
-19. Implement snapshots, backup, and restore.
-20. Implement event log and `envd why`.
-21. Implement identity profiles, identity broker, and account-sensitive command
+20. Implement package promotion suggestions from existing environments.
+21. Implement workspace/project manifest support.
+22. Implement snapshots, backup, and restore.
+23. Implement event log and `envd why`.
+24. Implement identity profiles, identity broker, and account-sensitive command
     guards.
-22. Implement raw Docker socket detection and warnings.
-23. Remove Bash dependency.
+25. Implement raw Docker socket detection and warnings.
+26. Remove Bash dependency.
 
 The first milestone is not feature parity. The first milestone is reliable
 environment identity, gateway/proxy diagnostics, and sealed environment
