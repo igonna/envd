@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "id": "hetzner",
+      "name": "Hetzner",
+      "homepage": "https://www.hetzner.com",
+      "signup_url": "https://accounts.hetzner.com/signUp",
+      "api_url": "https://api.hetzner.cloud/v1/locations",
+      "countries_sold_from": ["DE"],
+      "regions": [
+        { "code": "fsn1", "country": "DE", "city": "Falkenstein", "asn": "AS24940" },
+        { "code": "hel1", "country": "FI", "city": "Helsinki", "asn": "AS24940" }
+      ],
+      "payments": ["card", "paypal"],
+      "min_plan": { "cpu": 1, "ram_mb": 2048, "disk_gb": 20 },
+      "notes": ["well-known provider", "useful baseline, not diversity by itself"],
+      "confidence": "verified"
+    },
+    {
+      "id": "ovhcloud",
+      "name": "OVHcloud",
+      "homepage": "https://www.ovhcloud.com",
+      "signup_url": "https://www.ovhcloud.com/manager/",
+      "api_url": "https://eu.api.ovh.com/1.0/",
+      "countries_sold_from": ["FR"],
+      "regions": [
+        { "code": "gra", "country": "FR", "city": "Gravelines", "asn": "AS16276" },
+        { "code": "waw", "country": "PL", "city": "Warsaw", "asn": "AS16276" }
+      ],
+      "payments": ["card", "paypal"],
+      "min_plan": { "cpu": 1, "ram_mb": 2048, "disk_gb": 20 },
+      "notes": ["large European provider", "different ASN from Hetzner"],
+      "confidence": "verified"
+    },
+    {
+      "id": "netcup",
+      "name": "netcup",
+      "homepage": "https://www.netcup.com",
+      "signup_url": "https://www.netcup.com/en/server/",
+      "api_url": null,
+      "countries_sold_from": ["DE"],
+      "regions": [
+        { "code": "de", "country": "DE", "city": "Nuremberg", "asn": "AS197540" }
+      ],
+      "payments": ["card", "paypal", "bank-transfer"],
+      "min_plan": { "cpu": 1, "ram_mb": 1024, "disk_gb": 20 },
+      "notes": ["manual setup", "smaller ASN than the largest hyperscalers"],
+      "confidence": "community"
+    },
+    {
+      "id": "timeweb-cloud",
+      "name": "Timeweb Cloud",
+      "homepage": "https://timeweb.cloud",
+      "signup_url": "https://timeweb.cloud/",
+      "api_url": "https://api.timeweb.cloud/api/v1/",
+      "countries_sold_from": ["RU"],
+      "regions": [
+        { "code": "nl", "country": "NL", "city": "Amsterdam", "asn": "unknown" },
+        { "code": "pl", "country": "PL", "city": "Warsaw", "asn": "unknown" }
+      ],
+      "payments": ["local-card", "card"],
+      "min_plan": { "cpu": 1, "ram_mb": 1024, "disk_gb": 15 },
+      "notes": ["regional payment path", "verify current region availability before use"],
+      "confidence": "community"
+    }
+  ]
+}

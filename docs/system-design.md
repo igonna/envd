@@ -156,6 +156,12 @@ internal HTTP:  xray:2089
 The internal ports should avoid common user proxy ports like `1080` and `1081`
 because host apps often already use those ports.
 
+Host proxy equivalence is a tested contract, not an assumption: `envd proxy
+test` verifies the host SOCKS/HTTP protocol path, and
+`scripts/verify-host-proxy-equivalence.sh` verifies a Linux Docker client can
+reach the same host-published SOCKS and HTTP CONNECT endpoints through
+`host.docker.internal`.
+
 ### Provider Layer
 
 Xray is the first provider, not the permanent architecture boundary.
@@ -591,8 +597,28 @@ The sidecar:
 - Routes default traffic through sing-box.
 - sing-box forwards to the local Xray gateway SOCKS inbound.
 - iptables default policy is drop.
+- ip6tables default policy is drop as well. IPv6 must not become a bypass if a
+  host Docker engine enables IPv6 later.
 - Only loopback, established traffic, SSH ingress, TUN traffic, and Xray gateway
   ports are allowed.
+- Resolves the local gateway container before sealing and gives sing-box the
+  resolved upstream address, so later sealed DNS changes do not depend on
+  Docker's embedded resolver.
+- Owns sealed DNS through sing-box DNS routing over the same proxy path. The dev
+  container must not keep Docker's `127.0.0.11` resolver as its effective DNS,
+  because that can bypass the tunnel when the gateway is down.
+- Installs the default-drop kill-switch before waiting for the upstream gateway
+  port or starting sing-box. A sidecar that is still waiting for the tunnel is
+  allowed to reach only the configured local gateway path.
+- Raw Docker sidecar restart creates a new network namespace. Existing dev
+  containers remain fail-closed in the old namespace until envd reconciles them.
+  `envd start <env>` must restart the dev container after the sidecar is healthy
+  so it rejoins the current sealed namespace.
+- Docker network removal/recreation must not create a direct-egress window. An
+  already-running sidecar that loses its Docker network may keep using the
+  existing tunnel or fail closed, but it must not gain a host-routed default path.
+  Recovery is a controlled sidecar/dev-container recreate, not unsafe hot
+  reconnect.
 
 If Xray is unavailable, outbound traffic fails closed.
 
@@ -1480,6 +1506,12 @@ envd-managed project Docker engine, not the host Docker daemon. The user still
 uses standard Docker and Compose commands. envd does not reimplement Compose
 semantics.
 
+Implemented backend: sealed environments start an envd-owned rootless Docker
+project daemon from `envd-project-docker:27-rootless`. The daemon shares the
+sealed sidecar network namespace, listens only inside that namespace, and the
+dev container receives `DOCKER_HOST=tcp://127.0.0.1:2375`. The host Docker
+socket is not mounted into the dev container.
+
 Project engine rules:
 
 - The host Docker socket is not mounted by default.
@@ -1500,6 +1532,12 @@ Project engine rules:
 - Compose features that break isolation, such as host networking, raw host
   Docker socket mounts, privileged host access, or arbitrary device mounts, are
   blocked by default.
+
+`scripts/verify-project-docker.sh` is the release gate for this subsystem. It
+creates a sealed env, verifies `docker` and `docker compose` use the managed
+endpoint, verifies project-container egress matches gateway egress, proves
+published project ports are not reachable from the host, disconnects the sidecar
+from the gateway network, and proves project Docker egress fails closed.
 
 This makes common Compose development safe without inventing an `envd compose`
 command.
@@ -1523,16 +1561,18 @@ shell. envd should create, repair, stop, and clean up the sealed project Docker
 engine automatically when it has enough context. If it cannot, `envd doctor
 --deep` explains why.
 
-Implementation options:
+Backend decision:
 
-- Rootless Docker project daemon.
-- containerd/nerdctl-compatible project engine if Docker Compose compatibility is
-  sufficient.
-- Privileged Docker-in-Docker only as an explicit compatibility backend, not the
-  secure default.
+- The initial secure backend should be a rootless Docker project daemon managed
+  by envd.
+- containerd/nerdctl remains a later option only if Docker Compose compatibility
+  is sufficient for real projects.
+- Privileged Docker-in-Docker is allowed only as an explicit compatibility
+  backend, never as the secure default.
 
-The backend is an implementation detail. The invariant is that the Docker API
-endpoint used inside envd is envd-managed, sealed, protected, and fail-closed.
+The backend is otherwise an implementation detail. The invariant is that the
+Docker API endpoint used inside envd is envd-managed, sealed, protected, and
+fail-closed.
 
 ### Raw Host Docker
 
@@ -1814,17 +1854,21 @@ The preferred VS Code integration is an SSH `ProxyCommand`, not a durable SSH
 server exposed on the network:
 
 ```sshconfig
-Host envd-8f6c2a91
-  HostName envd-8f6c2a91
-  User envd
-  ProxyCommand envd ssh-proxy --target 8f6c2a91
+Host envd-books
+  HostName envd
+  User dev
+  Port 22
+  ProxyCommand envd ssh-proxy books
+  StrictHostKeyChecking accept-new
+  UserKnownHostsFile ~/.ssh/envd_known_hosts
 ```
 
 Rules:
 
-- `envd code <env>` may create or refresh a VS Code Remote SSH target.
-- Generated SSH targets should use opaque aliases by default. Human env names
-  stay in encrypted envd state.
+- `envd code <env>` prints or launches a VS Code Remote SSH target that uses
+  `envd ssh-proxy <env>`.
+- Generated SSH targets should use envd-owned aliases and never expose a durable
+  host SSH listener.
 - The proxy must require envd to be unlocked.
 - The proxy must verify the target environment is running, required storage
   policy is satisfied, network policy is valid, and the caller is local.
@@ -2034,15 +2078,25 @@ Implementation options:
 - macOS: encrypted APFS sparse image or a portable encrypted filesystem layer.
 - Cross-platform recovery export may exist later, but is not normal UX.
 
-Final backend model:
+Implemented and planned backend model:
 
 ```text
 envd storage API        portable behavior and semantics
-macOS live backend      encrypted APFS sparse image
-Linux live backend      LUKS2/dm-crypt-backed image
+macOS at-rest backend   encrypted APFS sparse image
+Linux at-rest backend   LUKS2/dm-crypt-backed image
+active storage          envd-owned temporary Docker volumes while unlocked/running
 recovery points         envd-managed encrypted local restore points
-fallback live backend   none by default; fail closed if native backend unavailable
+fallback backend        none by default; fail closed if native backend unavailable
 ```
+
+Docker runtimes do not reliably use host encrypted filesystem mounts as normal
+project storage across platforms. envd therefore treats APFS/LUKS images as the
+protected at-rest store: `envd start` hydrates fresh envd-owned Docker volumes
+from the image, and `envd stop`/`envd lock` exports those volumes back into the
+encrypted image, removes the active container/volumes, and detaches/closes the
+image. While the environment is running, data is inside active Docker volumes and
+should be treated as unlocked plaintext. After stop/lock, env-owned persistent
+data is only in the encrypted APFS/LUKS image.
 
 Rationale:
 
@@ -2073,8 +2127,9 @@ Performance and reliability:
 - Prefer mature OS/filesystem encryption or encrypted disk images over custom
   per-file crypto.
 - Use vetted encryption primitives and libraries only.
-- Expect low overhead for normal source-code and package-manager workloads when
-  using native filesystem/disk encryption.
+- Expect low overhead for normal source-code and package-manager workloads. The
+  APFS/LUKS at-rest backend pays most cost on start/stop/lock export/import
+  rather than on every file operation while the environment is running.
 - Large database workloads, many-small-file workloads, and FUSE-style encrypted
   filesystems may have noticeable overhead.
 - `envd inspect` and `envd doctor --deep` should show backend type, mount state,
@@ -2618,6 +2673,26 @@ Example:
 ```bash
 envd gateway install ams1 --host 1.2.3.4 --user root --password
 ```
+
+Current implementation supports dry-run/probe and explicit apply:
+
+```bash
+envd gateway install ams1 --host 1.2.3.4 --user root --password --probe --dry-run
+envd gateway install ams1 --host 1.2.3.4 --user root --password --yes
+```
+
+The dry-run/probe path performs real SSH password authentication, pins the
+remote host-key fingerprint, detects OS, architecture, memory, disk, init
+system, and firewall, inspects existing envd/Xray provider state without
+changing it, generates envd-owned Xray Reality material locally, and stores the
+remote password only after the SSH probe succeeds.
+
+The `--yes` path applies only after a successful probe. It installs pinned
+envd-owned Xray Reality material, writes the systemd service where available,
+opens the configured port only for supported detected firewalls, verifies the
+remote process, checks local TCP reachability to the remote gateway port, stores
+the local gateway profile, and rolls back a previous envd-owned config if
+verification fails.
 
 If `envd gateway install ... --password` is the first stateful command, envd
 should create the encrypted state store, ask the user to create a master
@@ -3443,6 +3518,10 @@ Legacy storage migration policy:
 - Existing Docker volumes are plain storage.
 - Migration should import legacy Docker volume data into envd-managed protected
   storage only when the user explicitly requests protected storage.
+- The explicit command is `envd migrate protected <env> --yes` after adoption.
+  It preserves the human env name, creates a new envd-owned opaque ID, imports
+  legacy `*-home` and `*-repo` data into protected storage, and leaves the
+  original legacy Docker volumes untouched.
 - If protected import is unsafe or unsupported, leave the legacy volume untouched
   and mark the migrated environment `plain`.
 - A migrated environment must not claim protected storage while any active
@@ -3526,7 +3605,7 @@ Post-v1 resilience/censorship milestone:
 - User URI generation.
 - Gateway chains.
 
-Post-v1 project Docker milestone:
+Release-gated project Docker milestone:
 
 - Sealed project Docker endpoint for standard `docker` and `docker compose`
   inside envd shells.

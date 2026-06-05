@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://envd.local/schema/hosting-catalog.json",
+  "title": "envd hosting catalog",
+  "type": "object",
+  "required": ["version", "providers"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "type": "integer", "minimum": 1 },
+    "providers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/provider" }
+    }
+  },
+  "$defs": {
+    "provider": {
+      "type": "object",
+      "required": ["id", "name", "homepage", "regions", "confidence"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,63}$" },
+        "name": { "type": "string" },
+        "homepage": { "type": "string", "format": "uri" },
+        "signup_url": { "type": "string", "format": "uri" },
+        "api_url": { "type": ["string", "null"], "format": "uri" },
+        "countries_sold_from": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "regions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/region" }
+        },
+        "payments": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "min_plan": { "$ref": "#/$defs/min_plan" },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["verified", "community", "user", "stale", "unknown"]
+        }
+      }
+    },
+    "region": {
+      "type": "object",
+      "required": ["code", "country"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "string" },
+        "country": { "type": "string" },
+        "city": { "type": "string" },
+        "asn": { "type": "string" }
+      }
+    },
+    "min_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": { "type": "integer", "minimum": 1 },
+        "ram_mb": { "type": "integer", "minimum": 128 },
+        "disk_gb": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

@@ -1,50 +1,60 @@
-# Dev Environment Infrastructure
+# envd
 
-Self-contained Docker development environments behind Xray (VLESS + Reality), with full-tunnel routing.
-
-## What this setup gives you
-
-- Centralized VPN/proxy config in one place: `vpn-gateway/.env`
-- Disposable dev containers with persistent `/home/<user>` and `/repo`
-- SSH access with agent forwarding
-- Per-dev sidecar network namespace (`<name>-net`) that routes all container traffic through Xray
-- Kill-switch behavior in sidecar: if Xray is unavailable, outbound traffic is blocked
-- Docker CLI inside dev containers with optional host daemon access via mounted socket
-
-## Repository structure
-
-```text
-envd/
-├── bin/
-│   └── envd                    # CLI tool for managing dev containers
-├── dev-containers/
-│   ├── net-sidecar/
-│   │   ├── Dockerfile             # sidecar image (sing-box + kill-switch)
-│   │   └── entrypoint.sh
-│   └── sshdev/
-│       ├── Dockerfile             # dev container image
-│       └── entrypoint.sh
-└── vpn-gateway/
-    ├── Dockerfile.render
-    ├── compose.yml
-    └── config.template.json
-```
+`envd` manages sealed Docker development environments behind a local Xray
+gateway. The normal CLI is the Go binary built by `./install.sh`; the old Bash
+CLI has been removed.
 
 ## Requirements
 
-- macOS with Docker Desktop, or Linux with Docker Engine and the Docker Compose plugin
-- `bash`, `ssh`, `ssh-keygen`, `nc`, `awk`
-- SSH key for GitHub (`~/.ssh/ghub_key` recommended)
-- Linux hosts need permission to use Docker, usually by running as root or adding your user to the `docker` group.
+- Docker Desktop on macOS or Docker Engine with Compose plugin on Linux.
+- Either local Go or Docker for building the `envd` binary.
+- A configured `vpn-gateway/.env` for the current local Xray gateway.
 
-## 1) Configure VPN gateway
+## Host Platforms
+
+- macOS arm64 is the currently tested host platform.
+- macOS amd64 is supported by the installer and builds a native `darwin/amd64`
+  binary, but is not part of the current local smoke-test environment.
+- Linux amd64 and Linux arm64 pass the repeatable cross-platform build/test
+  verifier. Full Linux host-proxy and sealed kill-switch host equivalence remain
+  separate release gates.
+
+## Install
+
+```bash
+./install.sh
+```
+
+The installer builds `cmd/envd` and installs `envd` to
+`${ENVD_INSTALL_DIR:-$HOME/.local/bin}`. If that directory is not on `PATH`, the
+installer prints the exact export line to add.
+
+Verify:
+
+```bash
+envd version
+envd help
+```
+
+Cross-platform Linux verification:
+
+```bash
+scripts/verify-cross-platform.sh
+```
+
+This runs Go tests/builds and stateless CLI smokes for Linux amd64/arm64, then
+builds the dev and sidecar runtime images for both platforms.
+
+## Gateway
 
 Create `vpn-gateway/.env`:
 
 ```bash
+XRAY_BIND_IP=127.0.0.1
+XRAY_SOCKS_PORT=11080
 XRAY_INBOUND_PORT=2088
 XRAY_HTTP_PROXY_PORT=2089
-XRAY_HTTP_PROXY_HOST_PORT=1081
+XRAY_HTTP_PROXY_HOST_PORT=11081
 XRAY_SERVER_IP=YOUR_SERVER_IP
 XRAY_SERVER_PORT=443
 XRAY_UUID=YOUR_UUID
@@ -54,284 +64,339 @@ XRAY_SHORT_ID=YOUR_SHORT_ID
 XRAY_FINGERPRINT=firefox
 ```
 
-Notes:
-- `XRAY_HTTP_PROXY_PORT` is optional unless you need HTTP proxy inbound for host apps.
-- `compose.yml` keeps backward compatibility with the old typoed variable name `XRAY_HTTP_RPOXY_PORT`.
-- `XRAY_BIND_IP=127.0.0.1` exposes the proxy to the host only. Use `XRAY_BIND_IP=0.0.0.0` only when containers or other machines must reach the HTTP proxy through the host.
-- `XRAY_SOCKS_PORT` and `XRAY_HTTP_PROXY_HOST_PORT` are host-published ports. Keep them different from ports used by other host proxy apps if host traffic should not share the envd gateway.
-- `XRAY_FINGERPRINT=firefox` avoids the current `chrome` Reality/Vision instability seen with Xray 26.2.6 in this setup.
-
-Start gateway:
+Start it:
 
 ```bash
-cd vpn-gateway
-docker compose up -d --build
+docker compose -f vpn-gateway/compose.yml up -d --build
 ```
 
-Verify from host:
+Check it:
 
 ```bash
-curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
+envd gateway render
+envd proxy
+envd proxy test
+envd gateway egress
 ```
 
-Expected: remote server IP (not your local ISP IP).
-
-If a Docker build already has direct internet, do not pass host HTTP proxy
-build args by default:
+Optionally import the current local gateway config into encrypted envd state and
+activate it for envd-managed commands:
 
 ```bash
-docker compose build
+envd gateway import-local ams1 --yes
+envd gateway use ams1
 ```
 
-Only add these after the HTTP proxy path is verified from a container:
+Gateway switches remember the previous active gateway and can roll back after
+verifying the old target again:
 
 ```bash
-curl -Iv --proxy http://host.docker.internal:1081 https://registry-1.docker.io/v2/
+envd gateway rollback
 ```
 
-Expected for Docker Hub is a real HTTP response such as `401 Unauthorized`.
-A timeout after `CONNECT registry-1.docker.io:443` means Xray accepted the HTTP
-proxy connection but did not complete the tunnel, so `HTTP_PROXY` or
-`HTTPS_PROXY` build args can make `RUN apk add`, `go mod download`, or
-`npm install` hang even when direct networking works.
-
-Inside an `envd` dev container, prefer the sidecar path instead of
-`host.docker.internal`:
+Remote gateway install prints an install/adopt/replace plan. `--dry-run` never
+mutates the server:
 
 ```bash
-curl -Iv --socks5-hostname xray:2088 https://registry-1.docker.io/v2/
-curl -Iv --proxy http://xray:2089 https://registry-1.docker.io/v2/
+envd gateway install ams1 --host 1.2.3.4 --user root --password --dry-run
 ```
 
-`host.docker.internal` is a host-Docker address. From an `envd` container it is
-also subject to the full-tunnel sidecar routing, which can create confusing
-proxy loops or timeouts.
-
-## 2) Build images
-
-Build dev container image:
+Add `--probe` to make a real SSH password-auth connection, pin the host-key
+fingerprint, inspect OS/arch/resources/init/firewall and existing Xray/envd
+provider state, generate envd-owned Xray Reality server material locally when
+absent, and store the remote password only after the probe succeeds:
 
 ```bash
-cd dev-containers/sshdev
-docker build -t sshdev:24.04 .
+envd gateway install ams1 --host 1.2.3.4 --user root --password --probe --dry-run
 ```
 
-Build sidecar image:
+Use `--yes` to apply after a successful probe. envd installs the pinned
+envd-owned Xray Reality config, updates systemd/firewall where supported,
+verifies the remote process and local TCP reachability, stores the local gateway
+profile, and leaves activation explicit:
 
 ```bash
-cd dev-containers/net-sidecar
-docker build -t devnet-sidecar:1 .
+envd gateway install ams1 --host 1.2.3.4 --user root --password --yes
+envd gateway use ams1
 ```
 
-## 3) Install `envd` CLI
-
-macOS with Homebrew on Apple Silicon:
+Generate an app import URI for a gateway:
 
 ```bash
-sudo cp bin/envd /opt/homebrew/bin/envd
-sudo chmod +x /opt/homebrew/bin/envd
+envd user uri ams1
 ```
 
-Linux, or Intel macOS with Homebrew/default local bin:
+The URI contains gateway credentials and is printed only on explicit request
+after unlocking encrypted state.
+
+Assess gateway/provider risk from encrypted gateway state and local hosting
+history:
 
 ```bash
-sudo cp bin/envd /usr/local/bin/envd
-sudo chmod +x /usr/local/bin/envd
+envd gateway risk ams1
 ```
 
-Verify:
+Gateway chain definitions can be recorded, but activation is fail-closed until
+the multi-hop backend exists:
 
 ```bash
-envd help
+envd gateway chain create work --entry reg1 --exit ams1
+envd gateway chain status work
 ```
 
-## 4) Create and use a dev environment
+## Diagnose
 
 ```bash
-envd run dev1
+envd doctor --deep
 ```
 
-This creates:
+`doctor --deep` checks Docker, runtime images, gateway rendering, gateway port
+mappings, SOCKS/HTTP proxy handshakes, sealed-container DNS/TLS/Docker Hub, and
+sealed/project-Docker egress against gateway egress. Diagnostic failures are
+mapped to a layer and include a concrete next action.
 
-- Dev container: `dev1`
-- Network sidecar: `dev1-net`
-- Linux user: `dev1`
-- Volumes: `dev1-home`, `dev1-repo`
-- Repo path mapping: `/repo` symlink to `/home/dev1/repo` (for better tool compatibility)
-- Local SSH port mapping on `dev1-net`
-- SSH config entry for `dev1`
-- Git identity auto-propagated from host global Git config (if set)
-- GitHub SSH key auto-copied from host into container `~/.ssh/github_key` (if detected)
-- Automations mount (read-only): `dev-containers/automations` -> `/automations`
-- Docker socket mount (if found): host socket -> `/var/run/docker.sock` (for Docker CLI access)
+The host proxy parity gate is repeatable with
+`scripts/verify-host-proxy-equivalence.sh`; it checks both the host proxy path
+and the Linux Docker-client path through `host.docker.internal`.
 
-New dev environments now default to a looser seccomp profile so current Codex editing behavior works out of the box:
+The sealed project Docker gate is repeatable with
+`scripts/verify-project-docker.sh`; it proves `docker` and `docker compose`
+inside an envd shell use the envd-managed endpoint and fail closed with the
+sealed gateway path.
+
+For a fast direct-vs-gateway internet snapshot with encrypted local history:
 
 ```bash
-envd run dev1
+envd internet status
+envd internet report
 ```
 
-Notes:
-- Default applied at create time: `--security-opt seccomp=unconfined`
-- This only affects newly created environments.
-- Existing containers need to be recreated because Docker security options are fixed at container creation time.
-- To override the default for a new env: `ENVD_DEV_SECURITY_OPT='seccomp=profile.json' envd run dev1`
-- To disable the override entirely for a new env: `ENVD_DEV_SECURITY_OPT=none envd run dev1`
-- If you installed `envd` to `/opt/homebrew/bin/envd` or `/usr/local/bin/envd`, recopy `bin/envd` after updating this repo.
-
-Docker daemon access controls:
-- Default: enabled (auto-detects socket from `/var/run/docker.sock` or `~/.docker/run/docker.sock`)
-- Disable per creation: `ENVD_DOCKER_ACCESS=0 envd run dev1`
-- Force specific socket path: `ENVD_DOCKER_SOCK=/path/to/docker.sock envd run dev1`
-
-GitHub SSH key controls:
-- Default: enabled (`ENVD_COPY_GITHUB_KEY=1`) and auto-detects from `ssh -G github.com` identity files
-- Disable per creation: `ENVD_COPY_GITHUB_KEY=0 envd run dev1`
-- Force specific key path: `ENVD_GITHUB_KEY=~/.ssh/github_key envd run dev1`
-- Refresh for an existing environment: `envd key sync dev1`
-- Refresh using a specific key file: `envd key sync dev1 ~/.ssh/another_github_key`
-
-Run mounted automation scripts inside container:
+For a provider reachability snapshot and next-gateway shortlist:
 
 ```bash
-/automations/example.sh
+envd hosting check
+envd hosting shortlist
 ```
 
-Connect:
+envd ships a small conservative hosting catalog and supports a private JSON
+overlay at `${ENVD_DATA_DIR:-$HOME/.local/share/envd}/hosting/local.json` or
+`ENVD_HOSTING_CATALOG`.
+
+Signed catalog updates are accepted only after Ed25519 detached-signature
+verification:
 
 ```bash
-envd exec dev1
+envd hosting update --url providers.json --sig providers.json.sig --key catalog.pub
 ```
 
-or:
+## Environments
+
+Create a sealed plain-storage environment:
 
 ```bash
-ssh dev1
+envd run books
 ```
 
-## 5) Validate full-tunnel behavior
-
-Inside container:
+Open a shell or run a command:
 
 ```bash
-envd exec dev1
-env | grep -Ei 'proxy|all_proxy' || true
-curl -s https://api.ipify.org
+envd shell books
+envd shell books whoami
 ```
 
-Expected:
-- No proxy env vars are required for tooling.
-- Public IP should be the VPN/Xray egress IP.
+Inspect and list:
 
-Kill-switch behavior check:
+```bash
+envd ps
+envd inspect books
+```
 
-1. Stop Xray (`cd vpn-gateway && docker compose stop xray`)
-2. Try outbound request from `dev1` (`curl https://example.com`)
+Change network mode explicitly:
 
-Expected: request fails (no direct leak).
+```bash
+envd network set books sealed
+envd network set books direct
+envd network set books offline
+```
 
-## 6) CLI commands
+Risky env-owned volume operations, such as network-mode recreate or profile
+migration, create encrypted automatic recovery points. They are pruned
+invisibly, and `envd rm <env> --yes` removes that environment's recovery points.
+
+Define reusable package profiles. Profiles store package intent in encrypted
+state; profile images are generated lazily when first used:
+
+```bash
+envd pkg add web apt:ffmpeg
+envd pkg add web npm:pnpm
+envd pkg add tools tool:rg
+envd run app --profile web
+```
+
+Project defaults can live in `.envd.yaml` in the current project directory:
+
+```yaml
+network: sealed
+storage: plain
+profile: web
+```
+
+Existing envd-owned environments can be recreated onto a profile while keeping
+their envd-owned volumes:
+
+```bash
+envd migrate books --profile web
+```
+
+If you experimented inside an environment, envd can suggest package intent from
+post-creation apt installs and global npm packages, then promote those into a
+profile:
+
+```bash
+envd pkg suggest books
+envd pkg promote books --to web
+```
+
+## Editor Access
+
+Generate a VS Code Remote SSH target that connects through envd policy checks
+instead of exposing a durable host SSH port:
+
+```bash
+envd code books --print
+```
+
+The generated SSH config uses:
 
 ```text
-Usage:
-  envd [command]
-
-Management Commands:
-  ps                           List environments
-  run <name>                   Create a new environment
-  start <name>                 Start an environment
-  stop <name>                  Stop an environment
-  restart <name>               Restart an environment
-  rm <name>                    Remove an environment
-  backup <name> [archive]      Backup environment volumes
-  restore <name> <archive>     Restore environment volumes
-  exec <name> [cmd...]         Run command / open shell in environment
-
-Key Commands:
-  key sync <name> [key-path]   Refresh GitHub SSH key inside environment
-
-Service Commands:
-  service ls [env]                             List services
-  service catalog                              List available service types
-  service create <env> <service> [instance]    Add/start a service instance
-  service create-custom <env> <service> [instance]
-  service start <env> <service> [instance]     Alias of service create
-  service stop <env> <service> [instance]
-  service rm <env> <service> [instance]
-  service inspect <env> <service|container> [instance]
-
-Port Commands:
-  port ls [env]                                List port mappings
-  port open <env> <container-port> [host-port] Open/map a port
-  port close <env> <container-port> [host-port] Close/unmap a port
+ProxyCommand envd ssh-proxy books
 ```
 
-`envd start/stop/restart <name>` manage both `<name>` and `<name>-net`.
-`envd ps` includes `STATE` as `active` or `stopped`.
-For services, most workflows only need `service create` and `service rm`.
-Use `[instance]` to run multiple services of the same type in one environment.
-Legacy aliases still work (`list/new/ssh/cd/sync-key/refresh-key/svc-*/port-*`).
+`envd ssh-proxy <env>` refuses blocked, offline, stopped, or unknown
+environments and proxies stdio to the container SSH daemon only after encrypted
+state is unlocked. SSH authentication through the identity broker is still a
+separate post-v1 item.
 
-Service containers (share `<name>-net` namespace):
+## Identities
+
+Store SSH identity material in encrypted envd state with a sealed-only policy:
 
 ```bash
-envd service create dev1 postgres main
-envd service create dev1 postgres analytics
-ENVD_SVC_PORT=5544 ENVD_POSTGRES_USER=reporter ENVD_POSTGRES_PASSWORD=reportpw ENVD_POSTGRES_DB=reports envd service create dev1 postgres reporting
-envd service ls dev1
-envd service inspect dev1 postgres analytics
-envd service rm dev1 postgres reporting
+envd identity add github --ssh-key ~/.ssh/id_ed25519
+envd identity list
+envd doctor --identity
 ```
 
-Supported service names:
-- `postgres`
-- `redis`
-- `mongodb` (or `mongo`)
-- `elasticsearch` (or `es`)
-
-Discover options and connection details:
+Store a Git HTTPS token in encrypted state without passing the token on argv:
 
 ```bash
-envd service catalog
-envd service create-custom dev1 postgres reporting
-envd service inspect dev1 postgres reporting
-# also works with container name from service ls output:
-envd service inspect dev1 dev1-svc-postgres-reporting
+envd identity add githubhttps --git-https --username alice --token-file ~/.config/envd/github.token
+git config credential.helper '!envd identity credential-helper books githubhttps'
 ```
 
-To change credentials/version of an existing service, recreate it:
+The identity broker policy/socket exists and fails closed on direct networking,
+unhealthy sealed routes, and stale gateway generations:
 
 ```bash
-envd service rm dev1 postgres reporting
-envd service create-custom dev1 postgres reporting
+envd identity broker check books github --class ssh
 ```
 
-Expose app ports to the host on demand:
+For diagnostics or local convenience, envd can write wrappers that call the
+broker before delegating to real `ssh`/`git`:
 
 ```bash
-envd port open dev1 3000
-# then open http://127.0.0.1:3000 on the host
-envd port ls dev1
-envd port close dev1 3000
+envd identity wrappers books github --dir .envd/wrappers
 ```
 
-## 7) Persistence model
+Put that directory first in `PATH` only when you want the convenience behavior.
+The wrappers are not the security boundary; broker denial still works when they
+are bypassed.
 
-Persists:
-- Installed packages in container writable layer
-- `/home/<user>` named volume
-- `/repo` named volume
-- Container restart on host reboot when Docker starts containers with `--restart unless-stopped`
+SSH auth can also go through a broker-gated envd SSH agent socket:
 
-Does not persist:
-- Container after `envd rm <name>`
-- Volumes after `envd rm <name>`
+```bash
+envd identity ssh-agent books github --socket /tmp/envd-github.sock
+ssh -o IdentityAgent=/tmp/envd-github.sock git@github.com
+```
 
-## 8) Security model
+The agent loads the encrypted SSH key only after broker policy passes and
+re-checks policy for agent list/sign operations. Stored identities are validated
+and kept out of containers.
 
-- Dev containers use sidecar network namespace.
-- Outbound is forced through sidecar TUN routing to Xray socks inbound.
-- Sidecar iptables policy defaults to drop.
-- Only Xray upstream, loopback, established traffic, SSH ingress, and TUN path are allowed.
-- No private SSH keys are stored in dev containers.
-- Docker socket access (if enabled) grants high privilege on host Docker daemon. Disable with `ENVD_DOCKER_ACCESS=0` when not needed.
+Remove an envd-owned environment and its envd-owned Docker volumes:
+
+```bash
+envd rm books --yes
+```
+
+Lock envd-owned workloads:
+
+```bash
+envd lock
+```
+
+`envd lock` stops environments recorded in encrypted envd state. Active
+`envd shell` / one-shot sessions end because their target containers stop. In
+the current plain-storage mode, lock does not make Docker volumes encrypted or
+protected.
+
+Optionally run the idle supervisor. It unlocks envd state once, wakes on
+envd-managed Docker events or the next idle deadline, and stops workloads that
+have not been used through envd for at least the idle threshold:
+
+```bash
+envd supervisor run --idle 3h
+```
+
+## Migration
+
+Legacy containers created by the old Bash CLI can be discovered without
+mutation:
+
+```bash
+envd migrate inspect
+```
+
+Adopt legacy containers into encrypted state as `legacy` + `plain`:
+
+```bash
+envd migrate adopt --yes
+```
+
+Explicitly import one adopted legacy plain environment into protected storage:
+
+```bash
+envd migrate protected books --yes
+```
+
+This creates a new envd-owned protected environment record for `books`, imports
+the old `books-home` and `books-repo` volume data, and leaves the original legacy
+Docker volumes untouched.
+
+Gateway credentials are not imported by migration. Gateway inspection is
+read-only:
+
+```bash
+envd migrate gateway inspect
+```
+
+## State
+
+Stateful commands create or unlock encrypted state under
+`${ENVD_STATE_DIR:-$HOME/.local/state/envd}/state.enc`. The master password is
+prompted interactively or read from `ENVD_MASTER_PASSWORD` for tests/automation.
+The master password is never stored.
+
+## Current v1 Limits
+
+- Remote `envd gateway install --yes` applies envd-owned Xray Reality config,
+  systemd/firewall changes where supported, process verification, TCP
+  reachability verification, and envd-owned rollback on failed verification.
+- Protected storage is available explicitly with `--storage protected`.
+  macOS uses an encrypted APFS sparse image; Linux uses a LUKS2/dm-crypt-backed
+  image. Both act as at-rest stores and hydrate temporary envd-owned Docker
+  volumes while the environment is running.
+- Identity broker and sealed project Docker are implemented, but they remain
+  security-sensitive subsystems with explicit release gates.
+- Existing legacy Docker volumes are plain storage; envd does not claim they are
+  protected or encrypted.

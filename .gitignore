@@ -1,1 +1,9 @@
 .env*
+build/
+/envd
+*.test
+coverage.out
+envd-*-state.*/
+envd-doctor-home.*/
+envd-*-home/
+envd-*-repo/

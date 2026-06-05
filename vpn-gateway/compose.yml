@@ -18,7 +18,8 @@ services:
     networks: [inside]
 
   xray:
-    image: teddysun/xray:latest
+    # Xray 26.2.6 multi-arch OCI index. Do not use mutable latest here.
+    image: teddysun/xray@sha256:5ced88b51b157890fbadeb5dc6d70f157f5d577cd5d93ec09b30d14b86b07fde
     restart: unless-stopped
     depends_on:
       render:

@@ -8,6 +8,14 @@ REPO_DIR="${REPO_DIR:-${HOME_DIR}/repo}"
 GIT_USER_NAME="${GIT_USER_NAME:-}"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-}"
 
+if [ "${ENVD_SEALED_DNS:-}" = "1" ]; then
+  cat > /etc/resolv.conf <<'EOF'
+nameserver 1.1.1.1
+nameserver 9.9.9.9
+options ndots:0
+EOF
+fi
+
 if ! id -u "$DEV_USER" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "$DEV_USER"
   echo "${DEV_USER} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${DEV_USER}"
