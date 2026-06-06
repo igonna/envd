@@ -728,22 +728,11 @@ Next command: envd init
 
 `)
 	case "gateway":
-		fmt.Fprint(a.stdout, `Usage:
-  envd gateway install NAME --host HOST --user USER --password [--yes] [--replace] [--verbose]
-  envd gateway install NAME --host HOST --user USER --password --probe --dry-run
-  envd gateway list
-  envd gateway use NAME
-  envd gateway status
-  envd gateway inspect
-  envd gateway render
-  envd gateway egress
-  envd gateway rollback
-
-`)
+		a.printGatewayHelp()
 	case "proxy":
-		fmt.Fprint(a.stdout, "Usage:\n  envd proxy\n  envd proxy test\n")
+		a.printProxyHelp()
 	case "start":
-		fmt.Fprint(a.stdout, "Usage: envd start ENV [--network sealed|direct|offline] [--storage plain|protected] [--profile PROFILE]\n")
+		a.printStartHelp()
 	case "shell":
 		fmt.Fprint(a.stdout, "Usage:\n  envd shell ENV\n  envd shell ENV COMMAND [args]\n")
 	case "list":
@@ -757,27 +746,27 @@ Next command: envd init
 	case "lock":
 		fmt.Fprint(a.stdout, "Usage: envd lock\n\nStops envd-managed workloads, hides envd SSH targets, and clears cached unlock.\n")
 	case "doctor":
-		fmt.Fprint(a.stdout, "Usage:\n  envd doctor\n  envd doctor --deep\n")
+		a.printDoctorHelp()
 	case "why":
 		fmt.Fprint(a.stdout, "Usage: envd why ENV\n")
 	case "events":
 		fmt.Fprint(a.stdout, "Usage: envd events\n")
 	case "internet":
-		fmt.Fprint(a.stdout, "Usage:\n  envd internet status\n  envd internet report\n")
+		a.printInternetHelp()
 	case "hosting":
-		fmt.Fprint(a.stdout, "Usage:\n  envd hosting check\n  envd hosting shortlist\n  envd hosting update --url PROVIDERS_JSON --sig SIG --key PUBKEY\n")
+		a.printHostingHelp()
 	case "network":
-		fmt.Fprint(a.stdout, "Usage: envd network set ENV sealed|direct|offline\n")
+		a.printNetworkHelp()
 	case "pkg":
-		fmt.Fprint(a.stdout, "Usage:\n  envd pkg add PROFILE apt:PACKAGE\n  envd pkg add PROFILE npm:PACKAGE\n  envd pkg add PROFILE tool:NAME\n  envd pkg suggest ENV\n  envd pkg promote ENV --to PROFILE\n")
+		a.printPkgHelp()
 	case "ssh-proxy":
 		fmt.Fprint(a.stdout, "Usage: envd ssh-proxy ENV\n")
 	case "identity":
-		fmt.Fprint(a.stdout, "Usage:\n  envd identity add NAME --ssh-key PATH\n  envd identity list\n  envd identity broker check ENV IDENTITY --class ssh\n")
+		a.printIdentityHelp()
 	case "migrate":
-		fmt.Fprint(a.stdout, "Usage:\n  envd migrate inspect\n  envd migrate adopt --yes\n  envd migrate protected ENV --yes\n")
+		a.printMigrateHelp()
 	case "supervisor":
-		fmt.Fprint(a.stdout, "Usage:\n  envd supervisor run [--idle 3h]\n  envd supervisor tick [--idle 3h]\n")
+		a.printSupervisorHelp()
 	case "user":
 		fmt.Fprint(a.stdout, "Usage: envd user uri GATEWAY\n")
 	case "version":
@@ -796,7 +785,7 @@ func (a app) runProxy(args []string, st *envdState) error {
 		case "test":
 			return a.runProxyTest(args[1:], st)
 		case "help", "-h", "--help":
-			fmt.Fprint(a.stdout, "Usage: envd proxy [test]\n")
+			a.printProxyHelp()
 			return nil
 		default:
 			return fmt.Errorf("unknown proxy subcommand %q", args[0])
@@ -940,7 +929,7 @@ func recordDoctorEvents(st *envdState, currentFailures map[string]string) {
 
 func (a app) runGateway(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd gateway <install|use|list|status|inspect|render|egress|rollback|risk|chain>\n")
+		a.printGatewayHelp()
 		return nil
 	}
 	switch args[0] {
@@ -954,6 +943,14 @@ func (a app) runGateway(args []string, st *envdState) error {
 		return a.runGatewayRender(st)
 	case "egress":
 		return a.runGatewayEgress(st)
+	case "share":
+		return a.runGatewayShare(args[1:], st)
+	case "shares":
+		return a.runGatewayShares(args[1:], st)
+	case "uri":
+		return a.runGatewayURI(args[1:], st)
+	case "revoke":
+		return a.runGatewayRevoke(args[1:], st)
 	case "risk":
 		return a.runGatewayRisk(args[1:], st)
 	case "install":
@@ -967,6 +964,191 @@ func (a app) runGateway(args []string, st *envdState) error {
 	default:
 		return fmt.Errorf("unknown gateway subcommand %q", args[0])
 	}
+}
+
+func (a app) printGatewayHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd gateway COMMAND [args]
+
+Start:
+  envd gateway install NAME --host HOST --user USER --password --yes
+  envd gateway install NAME --host HOST --user USER --password --probe --dry-run
+  envd gateway use NAME
+
+Manage:
+  envd gateway list
+  envd gateway status
+  envd gateway inspect
+  envd gateway rollback
+
+App Access:
+  envd gateway share NAME [LABEL]
+  envd gateway uri NAME SHARE
+  envd gateway shares NAME
+  envd gateway revoke NAME SHARE
+
+Diagnostics:
+  envd gateway egress
+  envd gateway render
+
+`)
+}
+
+func (a app) printGatewayChainHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd gateway chain COMMAND [args]
+
+Commands:
+  create NAME --entry ENTRY --exit EXIT
+  status NAME
+
+`)
+}
+
+func (a app) printStartHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd start ENV [flags]
+
+Flags:
+  --network sealed|direct|offline
+  --storage plain|protected
+  --profile PROFILE
+
+Default:
+  sealed network, plain storage
+
+`)
+}
+
+func (a app) printProxyHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd proxy
+  envd proxy test
+
+Commands:
+  proxy        show local SOCKS/HTTP proxy endpoints
+  proxy test   test local proxy handshakes
+
+`)
+}
+
+func (a app) printDoctorHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd doctor
+  envd doctor --deep
+
+Checks:
+  host Docker, embedded images, gateway runtime, proxy ports, and env repair
+
+Deep:
+  also runs real direct/gateway reachability probes
+
+`)
+}
+
+func (a app) printInternetHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd internet COMMAND
+
+Commands:
+  status       check direct and gateway reachability
+  report       show recent reachability history
+
+`)
+}
+
+func (a app) printHostingHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd hosting COMMAND [args]
+
+Commands:
+  check        test provider reachability from this machine
+  shortlist    show reachable/diverse provider candidates
+  update       install a signed provider catalog update
+
+Update:
+  envd hosting update --url PROVIDERS_JSON --sig SIG --key PUBKEY
+
+`)
+}
+
+func (a app) printNetworkHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd network set ENV MODE
+
+Modes:
+  sealed       route through gateway and fail closed
+  direct       use normal Docker networking
+  offline      no outbound network
+
+`)
+}
+
+func (a app) printPkgHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd pkg COMMAND [args]
+
+Add:
+  envd pkg add PROFILE apt:PACKAGE
+  envd pkg add PROFILE npm:PACKAGE
+  envd pkg add PROFILE tool:NAME
+
+Promote:
+  envd pkg suggest ENV
+  envd pkg promote ENV --to PROFILE
+
+`)
+}
+
+func (a app) printIdentityHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd identity COMMAND [args]
+
+Manage:
+  envd identity add NAME --ssh-key PATH
+  envd identity list
+
+Broker:
+  envd identity broker check ENV IDENTITY --class ssh
+
+Internal:
+  wrappers, credential-helper, ssh-agent, broker
+
+`)
+}
+
+func (a app) printIdentityBrokerHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd identity broker COMMAND [args]
+
+Commands:
+  check ENV IDENTITY --class ssh
+  serve
+
+`)
+}
+
+func (a app) printMigrateHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd migrate COMMAND [args]
+
+Commands:
+  inspect              discover legacy envd containers/config
+  adopt --yes          record legacy envs in envd state
+  protected ENV --yes  move an env to protected storage
+
+`)
+}
+
+func (a app) printSupervisorHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd supervisor COMMAND [args]
+
+Commands:
+  run [--idle 3h]      run the low-duty idle stopper loop
+  tick [--idle 3h]     run one idle-stopper pass
+
+`)
 }
 
 func (a app) runGatewayList(args []string, st *envdState) error {
@@ -1636,7 +1818,7 @@ func (a app) networkEnv(args []string, st *envdState, password []byte) error {
 
 func (a app) runPkg(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage:\n  envd pkg add PROFILE apt:PACKAGE\n  envd pkg add PROFILE npm:PACKAGE\n  envd pkg add PROFILE tool:NAME\n  envd pkg suggest ENV\n  envd pkg promote ENV --to PROFILE\n")
+		a.printPkgHelp()
 		return nil
 	}
 	switch args[0] {
@@ -2495,7 +2677,7 @@ type workloadRunning func(envRef) (bool, error)
 
 func (a app) runSupervisor(args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd supervisor <run|tick> [--idle 3h]\n")
+		a.printSupervisorHelp()
 		return nil
 	}
 	mode := args[0]
@@ -3176,7 +3358,7 @@ func shellWords(value string) string {
 
 func (a app) runMigrate(args []string, st *envdState, password []byte) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd migrate inspect|adopt --yes|protected ENV --yes|ENV --profile PROFILE\n")
+		a.printMigrateHelp()
 		return nil
 	}
 	switch args[0] {
@@ -4452,7 +4634,7 @@ func uniqueStrings(values []string) []string {
 
 func (a app) runGatewayChain(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd gateway chain <create|status>\n")
+		a.printGatewayChainHelp()
 		return nil
 	}
 	switch args[0] {
@@ -4667,9 +4849,231 @@ func (a app) runUserURI(args []string, st *envdState) error {
 	return nil
 }
 
+func (a app) runGatewayShare(args []string, st *envdState) error {
+	if len(args) < 1 || len(args) > 2 {
+		return fmt.Errorf("usage: envd gateway share NAME [LABEL]")
+	}
+	gatewayName := args[0]
+	label := "phone"
+	if len(args) == 2 {
+		label = args[1]
+	}
+	shareName, err := nextGatewayShareName(st, gatewayName, label)
+	if err != nil {
+		return err
+	}
+	rec, ok := st.RemoteGateways[gatewayName]
+	if !ok {
+		return fmt.Errorf("gateway %q is not remotely managed by envd; cannot add/remove app users", gatewayName)
+	}
+	uuid := randomUUID()
+	now := time.Now().UTC()
+	share := gatewayShareRecord{Name: shareName, UUID: uuid, CreatedAt: now, UpdatedAt: now}
+	shares := append([]gatewayShareRecord(nil), st.GatewayShares[gatewayName]...)
+	shares = append(shares, share)
+	updated, err := remoteGatewayConfigWithShares(rec.Material.ConfigJSON, shares)
+	if err != nil {
+		return err
+	}
+	rec.Material.ConfigJSON = updated
+	if err := a.applyRemoteGatewayConfig(rec); err != nil {
+		return layerErr("remote gateway", err)
+	}
+	rec.UpdatedAt = now
+	st.RemoteGateways[gatewayName] = rec
+	st.GatewayShares[gatewayName] = shares
+	st.addEvent("gateway", gatewayName, "shared app user "+shareName)
+	cfg := gatewayRecordFromRemoteInstall(rec, now).toConfig()
+	uri, err := gatewayUserURIForUUID(gatewayShareURILabel(gatewayName, shareName), cfg, uuid)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.stdout, "Share: %s\n", shareName)
+	fmt.Fprintln(a.stdout, uri)
+	return nil
+}
+
+func (a app) runGatewayShares(args []string, st *envdState) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: envd gateway shares NAME")
+	}
+	gatewayName := args[0]
+	rec, ok := st.Gateways[gatewayName]
+	if !ok {
+		return fmt.Errorf("gateway %q not found", gatewayName)
+	}
+	fmt.Fprintf(a.stdout, "%-18s %-10s %-20s\n", "SHARE", "TYPE", "CREATED")
+	fmt.Fprintf(a.stdout, "%-18s %-10s %-20s\n", "default", "built-in", rec.CreatedAt.Format("2006-01-02 15:04"))
+	for _, share := range st.GatewayShares[gatewayName] {
+		fmt.Fprintf(a.stdout, "%-18s %-10s %-20s\n", share.Name, "app", share.CreatedAt.Format("2006-01-02 15:04"))
+	}
+	return nil
+}
+
+func (a app) runGatewayURI(args []string, st *envdState) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: envd gateway uri NAME SHARE")
+	}
+	gatewayName, shareName := args[0], args[1]
+	uri, err := gatewayShareURI(st, gatewayName, shareName)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(a.stdout, uri)
+	return nil
+}
+
+func (a app) runGatewayRevoke(args []string, st *envdState) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: envd gateway revoke NAME SHARE")
+	}
+	gatewayName, shareName := args[0], args[1]
+	if shareName == "default" {
+		return fmt.Errorf("cannot revoke built-in default gateway user")
+	}
+	rec, ok := st.RemoteGateways[gatewayName]
+	if !ok {
+		return fmt.Errorf("gateway %q is not remotely managed by envd; cannot add/remove app users", gatewayName)
+	}
+	shares := st.GatewayShares[gatewayName]
+	next := make([]gatewayShareRecord, 0, len(shares))
+	found := false
+	for _, share := range shares {
+		if share.Name == shareName {
+			found = true
+			continue
+		}
+		next = append(next, share)
+	}
+	if !found {
+		return fmt.Errorf("share %q not found on gateway %q", shareName, gatewayName)
+	}
+	updated, err := remoteGatewayConfigWithShares(rec.Material.ConfigJSON, next)
+	if err != nil {
+		return err
+	}
+	rec.Material.ConfigJSON = updated
+	if err := a.applyRemoteGatewayConfig(rec); err != nil {
+		return layerErr("remote gateway", err)
+	}
+	rec.UpdatedAt = time.Now().UTC()
+	st.RemoteGateways[gatewayName] = rec
+	st.GatewayShares[gatewayName] = next
+	st.addEvent("gateway", gatewayName, "revoked app user "+shareName)
+	fmt.Fprintf(a.stdout, "Revoked: %s\n", shareName)
+	return nil
+}
+
+func nextGatewayShareName(st *envdState, gatewayName, label string) (string, error) {
+	clean := strings.ToLower(strings.TrimSpace(label))
+	clean = regexp.MustCompile(`[^a-z0-9_.-]+`).ReplaceAllString(clean, "-")
+	clean = strings.Trim(clean, "-.")
+	if clean == "" {
+		clean = "share"
+	}
+	if len(clean) > 32 {
+		clean = clean[:32]
+	}
+	used := map[string]bool{"default": true}
+	for _, share := range st.GatewayShares[gatewayName] {
+		used[share.Name] = true
+	}
+	if !used[clean] {
+		return clean, nil
+	}
+	for i := 2; i < 1000; i++ {
+		name := fmt.Sprintf("%s-%d", clean, i)
+		if !used[name] {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("too many shares named like %q", clean)
+}
+
+func remoteGatewayConfigWithShares(configJSON string, shares []gatewayShareRecord) (string, error) {
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		return "", fmt.Errorf("parse remote xray config: %w", err)
+	}
+	inbounds, ok := cfg["inbounds"].([]any)
+	if !ok || len(inbounds) == 0 {
+		return "", fmt.Errorf("remote xray config has no inbounds")
+	}
+	inbound, ok := inbounds[0].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("remote xray inbound has invalid shape")
+	}
+	settings, ok := inbound["settings"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("remote xray inbound settings have invalid shape")
+	}
+	clients, ok := settings["clients"].([]any)
+	if !ok || len(clients) == 0 {
+		return "", fmt.Errorf("remote xray config has no clients")
+	}
+	base := clients[0]
+	next := []any{base}
+	for _, share := range shares {
+		next = append(next, map[string]any{"id": share.UUID, "flow": "xtls-rprx-vision"})
+	}
+	settings["clients"] = next
+	raw, err := json.MarshalIndent(cfg, "", "    ")
+	if err != nil {
+		return "", err
+	}
+	return string(raw) + "\n", nil
+}
+
+func (a app) applyRemoteGatewayConfig(rec remoteGatewayRecord) error {
+	if strings.TrimSpace(rec.Password) == "" {
+		return fmt.Errorf("remote password is missing; rerun gateway install with --password")
+	}
+	plan := gatewayInstallPlan{Name: rec.Name, Host: rec.Host, User: rec.User, Provider: rec.Provider, Strategy: rec.Strategy, Mode: rec.Mode}
+	client, err := dialRemoteGateway(plan, rec.Password, rec.HostKeySHA256)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	if err := runSSHCommandNoOutput(client, remoteInstallXrayScript(rec.Material)); err != nil {
+		return err
+	}
+	if rec.Inspection.InitSystem == "systemd" {
+		if err := runSSHCommandNoOutput(client, remoteSystemdInstallScript(rec.Material)); err != nil {
+			return err
+		}
+	}
+	if err := runSSHCommandNoOutput(client, remoteProviderVerifyScript(rec.Inspection.InitSystem)); err != nil {
+		return err
+	}
+	return verifyRemoteGatewayReachable(rec.Host, rec.Material.Port)
+}
+
 func gatewayUserURI(name string, cfg gatewayConfig) (string, error) {
+	return gatewayUserURIForUUID(name, cfg, cfg.Raw["XRAY_UUID"])
+}
+
+func gatewayShareURI(st *envdState, gatewayName, shareName string) (string, error) {
+	rec, ok := st.Gateways[gatewayName]
+	if !ok {
+		return "", fmt.Errorf("gateway %q not found", gatewayName)
+	}
+	if shareName == "default" {
+		return gatewayUserURI(gatewayName, rec.toConfig())
+	}
+	for _, share := range st.GatewayShares[gatewayName] {
+		if share.Name == shareName {
+			return gatewayUserURIForUUID(gatewayShareURILabel(gatewayName, shareName), rec.toConfig(), share.UUID)
+		}
+	}
+	return "", fmt.Errorf("share %q not found on gateway %q; list shares with: envd gateway shares %s", shareName, gatewayName, gatewayName)
+}
+
+func gatewayShareURILabel(gatewayName, shareName string) string {
+	return gatewayName + "-" + shareName
+}
+
+func gatewayUserURIForUUID(name string, cfg gatewayConfig, uuid string) (string, error) {
 	required := []string{
-		"XRAY_UUID",
 		"XRAY_PUBLIC_KEY",
 		"XRAY_SNI",
 		"XRAY_SHORT_ID",
@@ -4678,6 +5082,9 @@ func gatewayUserURI(name string, cfg gatewayConfig) (string, error) {
 		if strings.TrimSpace(cfg.Raw[key]) == "" {
 			return "", fmt.Errorf("gateway %q cannot generate URI: missing %s", name, key)
 		}
+	}
+	if strings.TrimSpace(uuid) == "" {
+		return "", fmt.Errorf("gateway %q cannot generate URI: missing user UUID", name)
 	}
 	if cfg.ServerIP == "" || cfg.ServerPort == "" {
 		return "", fmt.Errorf("gateway %q cannot generate URI: missing server address", name)
@@ -4699,12 +5106,12 @@ func gatewayUserURI(name string, cfg gatewayConfig) (string, error) {
 	q.Set("fp", fingerprint)
 	q.Set("pbk", cfg.Raw["XRAY_PUBLIC_KEY"])
 	q.Set("sid", cfg.Raw["XRAY_SHORT_ID"])
-	return "vless://" + cfg.Raw["XRAY_UUID"] + "@" + net.JoinHostPort(cfg.ServerIP, cfg.ServerPort) + "?" + q.Encode() + "#" + url.QueryEscape(name), nil
+	return "vless://" + uuid + "@" + net.JoinHostPort(cfg.ServerIP, cfg.ServerPort) + "?" + q.Encode() + "#" + url.QueryEscape(name), nil
 }
 
 func (a app) runInternet(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd internet <status|report>\n")
+		a.printInternetHelp()
 		return nil
 	}
 	switch args[0] {
@@ -4849,7 +5256,7 @@ func httpStatusDetail(status int, body string) string {
 
 func (a app) runHosting(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd hosting <check|shortlist|update>\n")
+		a.printHostingHelp()
 		return nil
 	}
 	switch args[0] {
@@ -4892,7 +5299,7 @@ func (a app) runHostingShortlist(args []string, st *envdState) error {
 
 func (a app) runIdentity(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd identity <add|list|wrappers|credential-helper|ssh-agent|broker>\n")
+		a.printIdentityHelp()
 		return nil
 	}
 	switch args[0] {
@@ -5233,7 +5640,7 @@ func (p policySSHAgent) Signers() ([]ssh.Signer, error) {
 
 func (a app) runIdentityBroker(args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd identity broker <check|serve>\n")
+		a.printIdentityBrokerHelp()
 		return nil
 	}
 	switch args[0] {

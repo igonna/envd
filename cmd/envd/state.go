@@ -39,23 +39,24 @@ type encryptedEnvelope struct {
 }
 
 type envdState struct {
-	SchemaVersion     int                            `json:"schema_version"`
-	CreatedAt         time.Time                      `json:"created_at"`
-	GatewayGeneration int                            `json:"gateway_generation"`
-	ActiveGateway     string                         `json:"active_gateway,omitempty"`
-	PreviousGateway   string                         `json:"previous_gateway,omitempty"`
-	Gateways          map[string]gatewayRecord       `json:"gateways,omitempty"`
-	RemoteGateways    map[string]remoteGatewayRecord `json:"remote_gateways,omitempty"`
-	GatewayChains     map[string]gatewayChainRecord  `json:"gateway_chains,omitempty"`
-	Events            []stateEvent                   `json:"events"`
-	Environments      map[string]envRecord           `json:"environments,omitempty"`
-	Profiles          map[string]profileRecord       `json:"profiles,omitempty"`
-	Identities        map[string]identityRecord      `json:"identities,omitempty"`
-	RecoveryPoints    []recoveryPointRecord          `json:"recovery_points,omitempty"`
-	Assets            map[string]assetRecord         `json:"assets,omitempty"`
-	DoctorFailures    map[string]string              `json:"doctor_failures,omitempty"`
-	InternetChecks    []internetCheckRecord          `json:"internet_checks,omitempty"`
-	HostingChecks     []hostingCheckRecord           `json:"hosting_checks,omitempty"`
+	SchemaVersion     int                             `json:"schema_version"`
+	CreatedAt         time.Time                       `json:"created_at"`
+	GatewayGeneration int                             `json:"gateway_generation"`
+	ActiveGateway     string                          `json:"active_gateway,omitempty"`
+	PreviousGateway   string                          `json:"previous_gateway,omitempty"`
+	Gateways          map[string]gatewayRecord        `json:"gateways,omitempty"`
+	RemoteGateways    map[string]remoteGatewayRecord  `json:"remote_gateways,omitempty"`
+	GatewayShares     map[string][]gatewayShareRecord `json:"gateway_shares,omitempty"`
+	GatewayChains     map[string]gatewayChainRecord   `json:"gateway_chains,omitempty"`
+	Events            []stateEvent                    `json:"events"`
+	Environments      map[string]envRecord            `json:"environments,omitempty"`
+	Profiles          map[string]profileRecord        `json:"profiles,omitempty"`
+	Identities        map[string]identityRecord       `json:"identities,omitempty"`
+	RecoveryPoints    []recoveryPointRecord           `json:"recovery_points,omitempty"`
+	Assets            map[string]assetRecord          `json:"assets,omitempty"`
+	DoctorFailures    map[string]string               `json:"doctor_failures,omitempty"`
+	InternetChecks    []internetCheckRecord           `json:"internet_checks,omitempty"`
+	HostingChecks     []hostingCheckRecord            `json:"hosting_checks,omitempty"`
 }
 
 type stateEvent struct {
@@ -177,6 +178,13 @@ type gatewayRecord struct {
 	ImportedFromLocal bool              `json:"imported_from_local"`
 	CreatedAt         time.Time         `json:"created_at"`
 	UpdatedAt         time.Time         `json:"updated_at"`
+}
+
+type gatewayShareRecord struct {
+	Name      string    `json:"name"`
+	UUID      string    `json:"uuid"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type remoteGatewayRecord struct {
@@ -1010,6 +1018,9 @@ func (s *envdState) ensureDefaults() {
 	}
 	if s.RemoteGateways == nil {
 		s.RemoteGateways = map[string]remoteGatewayRecord{}
+	}
+	if s.GatewayShares == nil {
+		s.GatewayShares = map[string][]gatewayShareRecord{}
 	}
 	if s.GatewayChains == nil {
 		s.GatewayChains = map[string]gatewayChainRecord{}

@@ -1632,10 +1632,125 @@ func TestGatewayUserURI(t *testing.T) {
 	}
 }
 
+func TestGatewayShareURILabelUsesHyphen(t *testing.T) {
+	cfg := gatewayConfig{
+		ServerIP:   "1.2.3.4",
+		ServerPort: "443",
+		Raw: map[string]string{
+			"XRAY_PUBLIC_KEY": "pub",
+			"XRAY_SNI":        "www.example.com",
+			"XRAY_SHORT_ID":   "abcd",
+		},
+	}
+	uri, err := gatewayUserURIForUUID(gatewayShareURILabel("frankfurt2", "mac"), cfg, "11111111-1111-4111-8111-111111111111")
+	if err != nil {
+		t.Fatalf("gatewayUserURIForUUID failed: %v", err)
+	}
+	if !strings.Contains(uri, "#frankfurt2-mac") {
+		t.Fatalf("share URI should use hyphen label: %s", uri)
+	}
+	if strings.Contains(uri, "%2F") {
+		t.Fatalf("share URI should not encode slash in label: %s", uri)
+	}
+}
+
+func TestGatewayShareURIReprintsExistingShare(t *testing.T) {
+	st := &envdState{
+		Gateways: map[string]gatewayRecord{
+			"frankfurt2": {
+				Name:       "frankfurt2",
+				ServerIP:   "1.2.3.4",
+				ServerPort: "443",
+				Raw: map[string]string{
+					"XRAY_UUID":        "00000000-0000-4000-8000-000000000000",
+					"XRAY_PUBLIC_KEY":  "pub",
+					"XRAY_SNI":         "www.example.com",
+					"XRAY_SHORT_ID":    "abcd",
+					"XRAY_FINGERPRINT": "firefox",
+				},
+			},
+		},
+		GatewayShares: map[string][]gatewayShareRecord{
+			"frankfurt2": {
+				{Name: "mac", UUID: "11111111-1111-4111-8111-111111111111"},
+			},
+		},
+	}
+	uri, err := gatewayShareURI(st, "frankfurt2", "mac")
+	if err != nil {
+		t.Fatalf("gatewayShareURI failed: %v", err)
+	}
+	if !strings.Contains(uri, "vless://11111111-1111-4111-8111-111111111111@1.2.3.4:443?") {
+		t.Fatalf("share URI used wrong UUID or address: %s", uri)
+	}
+	if !strings.Contains(uri, "#frankfurt2-mac") {
+		t.Fatalf("share URI used wrong label: %s", uri)
+	}
+}
+
+func TestGatewayShareURIReprintsDefaultShare(t *testing.T) {
+	st := &envdState{
+		Gateways: map[string]gatewayRecord{
+			"frankfurt2": {
+				Name:       "frankfurt2",
+				ServerIP:   "1.2.3.4",
+				ServerPort: "443",
+				Raw: map[string]string{
+					"XRAY_UUID":        "00000000-0000-4000-8000-000000000000",
+					"XRAY_PUBLIC_KEY":  "pub",
+					"XRAY_SNI":         "www.example.com",
+					"XRAY_SHORT_ID":    "abcd",
+					"XRAY_FINGERPRINT": "firefox",
+				},
+			},
+		},
+	}
+	uri, err := gatewayShareURI(st, "frankfurt2", "default")
+	if err != nil {
+		t.Fatalf("gatewayShareURI failed: %v", err)
+	}
+	if !strings.Contains(uri, "vless://00000000-0000-4000-8000-000000000000@1.2.3.4:443?") {
+		t.Fatalf("default URI used wrong UUID or address: %s", uri)
+	}
+	if !strings.Contains(uri, "#frankfurt2") {
+		t.Fatalf("default URI used wrong label: %s", uri)
+	}
+}
+
 func TestGatewayUserURIMissingRequiredValue(t *testing.T) {
 	_, err := gatewayUserURI("ams1", gatewayConfig{ServerIP: "1.2.3.4", ServerPort: "443", Raw: map[string]string{}})
-	if err == nil || !strings.Contains(err.Error(), "missing XRAY_UUID") {
+	if err == nil || !strings.Contains(err.Error(), "missing XRAY_PUBLIC_KEY") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	_, err = gatewayUserURIForUUID("ams1", gatewayConfig{ServerIP: "1.2.3.4", ServerPort: "443", Raw: map[string]string{
+		"XRAY_PUBLIC_KEY": "pub",
+		"XRAY_SNI":        "www.example.com",
+		"XRAY_SHORT_ID":   "abcd",
+	}}, "")
+	if err == nil || !strings.Contains(err.Error(), "missing user UUID") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRemoteGatewayConfigWithShares(t *testing.T) {
+	material, err := generateRemoteGatewayMaterial(gatewayInstallPlan{Name: "ams1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := remoteGatewayConfigWithShares(material.ConfigJSON, []gatewayShareRecord{
+		{Name: "phone", UUID: "11111111-1111-4111-8111-111111111111"},
+		{Name: "tablet", UUID: "22222222-2222-4222-8222-222222222222"},
+	})
+	if err != nil {
+		t.Fatalf("remoteGatewayConfigWithShares failed: %v", err)
+	}
+	for _, want := range []string{material.UUID, "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"} {
+		if !strings.Contains(updated, want) {
+			t.Fatalf("updated config missing %q:\n%s", want, updated)
+		}
+	}
+	if strings.Count(updated, `"flow": "xtls-rprx-vision"`) != 3 {
+		t.Fatalf("expected three VLESS clients:\n%s", updated)
 	}
 }
 
