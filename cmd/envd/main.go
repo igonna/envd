@@ -246,6 +246,8 @@ func (a app) run(args []string) error {
 		return a.runInit(args[1:])
 	case "unlock":
 		return a.runUnlock(args[1:])
+	case "status":
+		return a.runStatus(args[1:])
 	case "password":
 		return a.runPassword(args[1:])
 	case "reset-state":
@@ -392,18 +394,53 @@ func (a app) runUnlock(args []string) error {
 	if err != nil {
 		return err
 	}
-	restored, failed, restoreErr := a.restoreUnlockedEnvs()
-	if cached {
-		fmt.Fprintf(a.stdout, "Unlocked: access restored; password cached for %s\n", ttl.Round(time.Second))
-	} else {
-		fmt.Fprintln(a.stdout, "Unlocked: access restored; cache disabled")
-	}
-	fmt.Fprintf(a.stdout, "Environments: %d available\n", restored)
+	restoreApp := a
+	restoreApp.stdout = io.Discard
+	restored, failed, restoreErr := restoreApp.restoreUnlockedEnvs()
+	_ = ttl
+	_ = cached
+	fmt.Fprintf(a.stdout, "Unlocked: %d envs\n", restored)
 	if failed > 0 {
-		fmt.Fprintf(a.stdout, "Failed: %d environments need manual start\n", failed)
+		fmt.Fprintf(a.stdout, "Failed: %d\n", failed)
 	}
 	if restoreErr != nil {
 		return restoreErr
+	}
+	return nil
+}
+
+func (a app) runStatus(args []string) error {
+	if len(args) > 0 && isHelpArg(args[0]) {
+		fmt.Fprint(a.stdout, "Usage: envd status\n\nShows non-secret runtime access state without opening encrypted state.\n")
+		return nil
+	}
+	if len(args) != 0 {
+		return fmt.Errorf("usage: envd status")
+	}
+	access, err := loadRuntimeAccess()
+	if err != nil {
+		return err
+	}
+	accessState := "locked"
+	if !access.Locked && len(access.Routes) > 0 {
+		accessState = "unlocked"
+	}
+	cacheState := "expired"
+	if _, ok := cachedMasterPassword(); ok {
+		cacheState = "active"
+	}
+	gatewayState := dockerContainerStatus("vpn-gateway-xray-1")
+	fmt.Fprintf(a.stdout, "Access:       %s\n", accessState)
+	fmt.Fprintf(a.stdout, "SSH routes:   %d\n", len(access.Routes))
+	fmt.Fprintf(a.stdout, "Master cache: %s\n", cacheState)
+	fmt.Fprintf(a.stdout, "Gateway:      %s\n", gatewayState)
+	if len(access.Routes) > 0 {
+		names := make([]string, 0, len(access.Routes))
+		for name := range access.Routes {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		fmt.Fprintf(a.stdout, "Envs:         %s\n", strings.Join(names, ", "))
 	}
 	return nil
 }
@@ -614,6 +651,7 @@ Start:
 
 Setup:
   init                 create encrypted state
+  status               show lock/access/cache state
   lock                 stop envd-managed workloads
   unlock               restore access after lock
   password             change master password
@@ -663,6 +701,8 @@ func (a app) printCommandHelp(args []string) error {
 		fmt.Fprint(a.stdout, "Usage: envd init\n\nCreates encrypted envd state and asks for the master password twice.\n")
 	case "unlock":
 		fmt.Fprint(a.stdout, "Usage: envd unlock\n\nRestores envd SSH targets/workloads after lock and caches the master password briefly.\n")
+	case "status":
+		fmt.Fprint(a.stdout, "Usage: envd status\n\nShows non-secret runtime access state without opening encrypted state.\n")
 	case "password":
 		fmt.Fprint(a.stdout, `Usage: envd password change
 
@@ -1210,7 +1250,8 @@ func (a app) runEnv(args []string, st *envdState) error {
 		message += " with profile " + profile + " generation " + strconv.Itoa(profileGeneration)
 	}
 	st.addEvent("env", name, message)
-	if err := ensureEnvSSHConfig(name, currentEnvdExecutable()); err != nil {
+	ref := envRef{Name: name, ID: id, UserName: "dev", DevName: devName, NetName: netName, ProjectDockerName: projectDockerContainerName(id), Network: network}
+	if err := repairEnvSSHAccessForRef(ref); err != nil {
 		return err
 	}
 
@@ -1584,6 +1625,10 @@ func (a app) networkEnv(args []string, st *envdState, password []byte) error {
 		rec.UpdatedAt = time.Now().UTC()
 		st.Environments[name] = rec
 	}
+	ref.Network = mode
+	if err := repairEnvSSHAccessForRef(ref); err != nil {
+		return err
+	}
 	st.addEvent("env", name, "network changed "+current+" -> "+mode)
 	fmt.Fprintf(a.stdout, "Network changed: %s -> %s\n", name, mode)
 	return nil
@@ -1812,7 +1857,7 @@ func (a app) createDevContainer(envName, userName, id, devName, netName, storage
 	if err := dockerRun(argsRun...); err != nil {
 		return err
 	}
-	ref := envRef{Name: envName, UserName: userName, DevName: devName}
+	ref := envRef{Name: envName, UserName: userName, DevName: devName, Network: networkMode}
 	return ensureEnvAuthorizedKey(ref)
 }
 
@@ -2015,17 +2060,121 @@ func (a app) lockEnvdWithStopper(args []string, st *envdState, stop workloadStop
 	st.addEvent("lock", "", fmt.Sprintf("completed: stopped %d workloads; failed %d", stopped, failed))
 	_ = clearCachedMasterPassword()
 	_ = hideEnvSSHConfig()
-	fmt.Fprintf(a.stdout, "Locked: stopped %d envd-managed workloads\n", stopped)
+	_ = lockRuntimeAccess()
+	fmt.Fprintf(a.stdout, "Locked: %d envs\n", stopped)
 	if failed > 0 {
-		fmt.Fprintf(a.stdout, "Failed: %d workloads need manual inspection\n", failed)
+		fmt.Fprintf(a.stdout, "Failed: %d\n", failed)
 		return fmt.Errorf("lock completed with %d failures", failed)
 	}
-	fmt.Fprintln(a.stdout, "Storage: plain env storage remains plain; protected storage is closed when configured")
 	return nil
 }
 
 func hideEnvSSHConfig() error {
 	return syncEnvSSHConfigNames(nil, currentEnvdExecutable())
+}
+
+type runtimeAccessState struct {
+	Locked    bool                       `json:"locked"`
+	UpdatedAt time.Time                  `json:"updated_at"`
+	Routes    map[string]runtimeSSHRoute `json:"routes,omitempty"`
+}
+
+type runtimeSSHRoute struct {
+	Name      string    `json:"name"`
+	ID        string    `json:"id"`
+	DevName   string    `json:"dev_name"`
+	UserName  string    `json:"user_name"`
+	Network   string    `json:"network"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func runtimeAccessPath() (string, error) {
+	dir, err := envdDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "runtime", "access.json"), nil
+}
+
+func loadRuntimeAccess() (runtimeAccessState, error) {
+	path, err := runtimeAccessPath()
+	if err != nil {
+		return runtimeAccessState{}, err
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return runtimeAccessState{Locked: true, Routes: map[string]runtimeSSHRoute{}}, nil
+	}
+	if err != nil {
+		return runtimeAccessState{}, err
+	}
+	var access runtimeAccessState
+	if err := json.Unmarshal(raw, &access); err != nil {
+		return runtimeAccessState{}, err
+	}
+	if access.Routes == nil {
+		access.Routes = map[string]runtimeSSHRoute{}
+	}
+	return access, nil
+}
+
+func saveRuntimeAccess(access runtimeAccessState) error {
+	path, err := runtimeAccessPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	access.UpdatedAt = time.Now().UTC()
+	raw, err := json.MarshalIndent(access, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o600)
+}
+
+func lockRuntimeAccess() error {
+	return saveRuntimeAccess(runtimeAccessState{Locked: true, Routes: map[string]runtimeSSHRoute{}})
+}
+
+func publishRuntimeRoute(ref envRef, network string) error {
+	access, err := loadRuntimeAccess()
+	if err != nil {
+		return err
+	}
+	if access.Routes == nil {
+		access.Routes = map[string]runtimeSSHRoute{}
+	}
+	userName := ref.UserName
+	if userName == "" {
+		userName = "dev"
+	}
+	access.Locked = false
+	access.Routes[ref.Name] = runtimeSSHRoute{
+		Name:      ref.Name,
+		ID:        ref.ID,
+		DevName:   ref.DevName,
+		UserName:  userName,
+		Network:   networkOrSealed(network),
+		UpdatedAt: time.Now().UTC(),
+	}
+	return saveRuntimeAccess(access)
+}
+
+func runtimeRoute(name string) (runtimeSSHRoute, error) {
+	access, err := loadRuntimeAccess()
+	if err != nil {
+		return runtimeSSHRoute{}, err
+	}
+	if access.Locked {
+		return runtimeSSHRoute{}, fmt.Errorf("envd access is locked; run envd unlock")
+	}
+	route, ok := access.Routes[name]
+	if !ok {
+		return runtimeSSHRoute{}, fmt.Errorf("environment %q is not published for SSH; run envd start %s", name, name)
+	}
+	return route, nil
 }
 
 func stopEnvWorkload(ref envRef) error {
@@ -2700,17 +2849,8 @@ func projectDockerExecEnvArgs(id string) []string {
 }
 
 func (a app) runSSHProxy(args []string) error {
-	var dockerArgs []string
-	if err := a.withState(func(st *envdState) error {
-		prepared, err := prepareSSHProxyDockerArgs(args, st)
-		if err != nil {
-			return err
-		}
-		touchEnvUsed(st, args[0], time.Now().UTC())
-		st.addEvent("ssh-proxy", args[0], "opened envd-controlled SSH proxy")
-		dockerArgs = prepared
-		return nil
-	}); err != nil {
+	dockerArgs, err := prepareSSHProxyDockerArgs(args)
+	if err != nil {
 		return err
 	}
 	cmd := exec.Command("docker", dockerArgs...)
@@ -2720,35 +2860,27 @@ func (a app) runSSHProxy(args []string) error {
 	return cmd.Run()
 }
 
-func prepareSSHProxyDockerArgs(args []string, st *envdState) ([]string, error) {
+func prepareSSHProxyDockerArgs(args []string) ([]string, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("usage: envd ssh-proxy ENV")
 	}
 	name := args[0]
-	ref, err := resolveEnvRef(st, name)
+	route, err := runtimeRoute(name)
 	if err != nil {
 		return nil, err
 	}
-	if rec, ok := st.Environments[name]; ok {
-		if rec.BlockedReason != "" {
-			return nil, fmt.Errorf("environment %q is blocked fail-closed: %s", name, rec.BlockedReason)
-		}
-		if rec.Network == "offline" {
-			return nil, fmt.Errorf("environment %q is offline; SSH proxy denied", name)
-		}
+	if route.Network == "offline" {
+		return nil, fmt.Errorf("environment %q is offline; SSH proxy denied", name)
 	}
-	env, err := inspectEnvByRef(st, ref)
-	if err != nil {
-		return nil, err
-	}
-	if env.Dev.State.Status != "running" {
+	if dockerContainerStatus(route.DevName) != "running" {
 		return nil, fmt.Errorf("environment %q is not running; start it first with: envd start %s", name, name)
 	}
+	ref := envRef{Name: route.Name, ID: route.ID, UserName: route.UserName, DevName: route.DevName, Network: route.Network}
 	if err := ensureEnvAuthorizedKey(ref); err != nil {
 		return nil, err
 	}
 	return []string{
-		"exec", "-i", ref.DevName,
+		"exec", "-i", route.DevName,
 		"bash", "-lc", "exec 3<>/dev/tcp/127.0.0.1/22; cat <&3 & cat >&3; kill $! 2>/dev/null || true",
 	}, nil
 }
@@ -3126,6 +3258,10 @@ func (a app) runMigrateEnvProfile(args []string, st *envdState, password []byte)
 	rec.GatewayGeneration = st.GatewayGeneration
 	rec.UpdatedAt = time.Now().UTC()
 	st.Environments[name] = rec
+	ref.Network = mode
+	if err := repairEnvSSHAccessForRef(ref); err != nil {
+		return err
+	}
 	st.addEvent("env", name, fmt.Sprintf("migrated to profile %s generation %d", profileName, generation))
 	_ = pruneProfileImages(st)
 	fmt.Fprintf(a.stdout, "Migrated: %s\n", name)
@@ -6237,9 +6373,11 @@ func repairEnvSSHAccessForRef(ref envRef) error {
 		return err
 	}
 	if containerExists(ref.DevName) && dockerContainerStatus(ref.DevName) == "running" {
-		return ensureEnvAuthorizedKey(ref)
+		if err := ensureEnvAuthorizedKey(ref); err != nil {
+			return err
+		}
 	}
-	return nil
+	return publishRuntimeRoute(ref, networkOrSealed(ref.Network))
 }
 
 func ensureEnvAuthorizedKey(ref envRef) error {
@@ -7140,6 +7278,7 @@ type envRef struct {
 	DevName           string
 	NetName           string
 	ProjectDockerName string
+	Network           string
 	HomeVol           string
 	RepoVol           string
 	ProjectDockerVol  string
@@ -7270,6 +7409,7 @@ func resolveEnvRef(st *envdState, name string) (envRef, error) {
 				DevName:           rec.ID,
 				NetName:           rec.ID + "-net",
 				ProjectDockerName: rec.ID + "-docker",
+				Network:           networkOrSealed(rec.Network),
 				HomeVol:           rec.ID + "-home",
 				RepoVol:           rec.ID + "-repo",
 				ProjectDockerVol:  rec.ID + "-docker",
@@ -7288,6 +7428,7 @@ func resolveEnvRef(st *envdState, name string) (envRef, error) {
 			DevName:           devContainerName(rec.ID),
 			NetName:           netContainerName(rec.ID),
 			ProjectDockerName: projectDockerContainerName(rec.ID),
+			Network:           networkOrSealed(rec.Network),
 			HomeVol:           homeVolumeName(rec.ID),
 			RepoVol:           repoVolumeName(rec.ID),
 			ProjectDockerVol:  projectDockerVolumeName(rec.ID),
@@ -7308,6 +7449,7 @@ func resolveEnvRef(st *envdState, name string) (envRef, error) {
 			DevName:           name,
 			NetName:           name + "-net",
 			ProjectDockerName: name + "-docker",
+			Network:           "sealed",
 			HomeVol:           name + "-home",
 			RepoVol:           name + "-repo",
 			ProjectDockerVol:  name + "-docker",
@@ -7375,6 +7517,7 @@ func legacyRefForEnv(env envInspect) envRef {
 		DevName:           devName,
 		NetName:           devName + "-net",
 		ProjectDockerName: devName + "-docker",
+		Network:           env.networkMode(),
 		HomeVol:           devName + "-home",
 		RepoVol:           devName + "-repo",
 		ProjectDockerVol:  devName + "-docker",

@@ -126,8 +126,44 @@ func TestUnlockValidatesExistingState(t *testing.T) {
 	if err := a.run([]string{"unlock"}); err != nil {
 		t.Fatalf("unlock failed: %v", err)
 	}
-	if !strings.Contains(out.String(), "Unlocked: access restored") {
+	if !strings.Contains(out.String(), "Unlocked:") {
 		t.Fatalf("unlock output = %q", out.String())
+	}
+}
+
+func TestRuntimeAccessPublishAndLock(t *testing.T) {
+	t.Setenv("ENVD_DATA_DIR", t.TempDir())
+	ref := envRef{Name: "books", ID: "abc123", UserName: "dev", DevName: "envd-abc123-dev", Network: "sealed"}
+	if _, err := runtimeRoute("books"); err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Fatalf("missing runtime access should be locked, got %v", err)
+	}
+	if err := publishRuntimeRoute(ref, "sealed"); err != nil {
+		t.Fatalf("publish runtime route failed: %v", err)
+	}
+	route, err := runtimeRoute("books")
+	if err != nil {
+		t.Fatalf("runtime route not readable: %v", err)
+	}
+	if route.DevName != ref.DevName || route.Network != "sealed" {
+		t.Fatalf("unexpected route: %+v", route)
+	}
+	if err := lockRuntimeAccess(); err != nil {
+		t.Fatalf("lock runtime access failed: %v", err)
+	}
+	if _, err := runtimeRoute("books"); err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Fatalf("locked runtime route should be denied, got %v", err)
+	}
+}
+
+func TestStatusDoesNotNeedEncryptedState(t *testing.T) {
+	t.Setenv("ENVD_DATA_DIR", t.TempDir())
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	if err := a.run([]string{"status"}); err != nil {
+		t.Fatalf("status without state failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Access:") || !strings.Contains(out.String(), "Master cache:") {
+		t.Fatalf("status output missing expected fields: %q", out.String())
 	}
 }
 
@@ -1306,7 +1342,7 @@ func TestLockStopsAllRecordedWorkloads(t *testing.T) {
 	if strings.Join(stopped, ",") != "envd-def456-dev/envd-def456-net,envd-abc123-dev/envd-abc123-net" {
 		t.Fatalf("unexpected stop order/refs: %+v", stopped)
 	}
-	if !strings.Contains(out.String(), "Locked: stopped 2 envd-managed workloads") {
+	if !strings.Contains(out.String(), "Locked: 2 envs") {
 		t.Fatalf("unexpected lock output: %q", out.String())
 	}
 	if len(st.Events) != 3 || !strings.Contains(st.Events[2].Message, "completed: stopped 2 workloads; failed 0") {
@@ -1350,7 +1386,7 @@ func TestLockReportsFailedWorkloadAndKeepsGoing(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "lock completed with 1 failures") {
 		t.Fatalf("expected lock failure, got %v", err)
 	}
-	if !strings.Contains(out.String(), "Failed: 1 workloads need manual inspection") {
+	if !strings.Contains(out.String(), "Failed: 1") {
 		t.Fatalf("unexpected lock output: %q", out.String())
 	}
 	if len(st.Events) != 3 || !strings.Contains(st.Events[1].Message, "failed to stop workload") {
