@@ -38,7 +38,11 @@ layer to debug first.
 Core user promises:
 
 - New dev environments are useful immediately.
-- First run initializes envd automatically.
+- `envd init` is the explicit one-time step that creates encrypted state and the
+  master password.
+- The master password can be changed without deleting encrypted state.
+- Interactive unlock may be cached only in memory for a short TTL; `envd lock`
+  clears it immediately.
 - Sealed networking is the default and fails closed.
 - The active gateway and remote server are inspectable and switchable.
 - Remote server setup is reconciled, not installed blindly.
@@ -101,8 +105,16 @@ repair, it should be questioned.
   normal Docker images.
 - Runtime install/bootstrap should be owned by `envd`, not copied from README
   snippets.
-- There is no setup/init ritual in normal UX. Normal commands must lazily
-  initialize required encrypted state themselves.
+- Encrypted state creation is explicit: stateful commands must not create a
+  master password implicitly. If state is missing, they tell the user to run
+  `envd init`.
+- Master password rotation must re-encrypt existing state in place after the
+  current password successfully unlocks it. Reset is only for forgotten
+  passwords.
+- Master password rotation must request the current password explicitly, even
+  when the short-lived unlock cache is active.
+- Non-secret runtime repair remains lazy: normal commands may restore assets,
+  images, caches, and generated runtime files when safe.
 - Secrets must not be stored in world-readable files.
 - `doctor --deep` must test real traffic, not just container liveness.
 - Network mode changes must be explicit and must stop/recreate affected
@@ -666,19 +678,21 @@ Rules:
 
 ## Command Model
 
-Every command should perform implicit startup:
+Every command should perform safe startup:
 
 1. If the command is stateless, such as `help`, `version`, or shell completion,
    run without opening envd state.
-2. For every stateful command, ensure config and state directories exist with
-   safe permissions.
-3. Ensure the encrypted envd state store exists before writing operational
-   state.
-4. Ask for master password setup if no encrypted store exists.
+2. `envd init` is the only command that may create encrypted envd state and ask
+   for master password creation.
+3. For every other stateful command, ensure config and state directories exist
+   with safe permissions.
+4. If encrypted state is missing, fail with the smallest next action:
+   `envd init`.
 5. Ask for master password unlock if encrypted state must be read or updated.
-6. Continue the original command after initialization/unlock.
+6. Continue the original command after unlock.
 
-The user should not need a separate setup ritual before normal use.
+The user should not accidentally create a forgotten master password from an
+ordinary command like `envd ps`.
 
 ### Lazy Reconciliation UX
 
@@ -687,10 +701,10 @@ implicitly when it is safe.
 
 Principles:
 
-- Do not force users to run separate `init`, `fetch`, `verify`, `build`, `plan`,
-  or `apply` commands in the happy path.
-- If an asset, image, profile build, gateway config, or state directory is
-  missing, the command that needs it should restore or create it.
+- Except for explicit `envd init`, do not force users to run separate `fetch`,
+  `verify`, `build`, `plan`, or `apply` commands in the happy path.
+- If an asset, image, profile build, gateway config, or non-secret runtime
+  directory is missing, the command that needs it should restore or create it.
 - If a change is risky, show a concise plan and ask before applying.
 - If a command cannot safely repair automatically, explain the exact blocker and
   the smallest next action, usually `envd doctor --deep` or an inline
@@ -704,15 +718,16 @@ Examples:
 envd run books
 ```
 
-May lazily create config directories, fetch runtime assets, build the selected
+May lazily create runtime directories, fetch runtime assets, build the selected
 profile image, start the gateway, create the sidecar, and verify sealed routing.
+If encrypted state is missing, it fails and tells the user to run `envd init`.
 
 ```bash
 envd gateway install ams1 --host 1.2.3.4 --user root --password
 ```
 
-May lazily create the encrypted state store, save credentials, inspect the
-server, show a plan, apply after confirmation, and verify the gateway.
+Requires encrypted state created by `envd init`, then saves credentials, inspects
+the server, shows a plan, applies after confirmation, and verifies the gateway.
 
 ```bash
 envd pkg add web apt:ffmpeg
@@ -773,14 +788,19 @@ envd why books
 envd lock
 ```
 
-No init command is required. The first stateful command creates or unlocks
-encrypted envd state automatically. There is no required unlock ritual; after
-`envd lock`, the next stateful command asks for the master password and resumes
-if policy allows.
+`envd init` is required once to create encrypted envd state and the master
+password intentionally. After that, stateful commands unlock existing state with
+the master password. If state is missing, ordinary commands must fail with
+`envd init` guidance instead of creating a password implicitly.
+
+`envd password change` unlocks state with the current master password, asks for
+the new password twice, and re-encrypts the same state. It must not delete
+gateways, environments, identities, recovery points, or event history.
 
 ### Primary Happy Path
 
 ```bash
+envd init
 envd gateway install ams1 --host 1.2.3.4 --user root --password
 envd gateway use ams1
 envd run books
@@ -799,6 +819,7 @@ they must not become required rituals.
 Normal commands:
 
 ```bash
+envd init
 envd gateway install <name> --host <ip> --user root --password
 envd gateway use <name>
 envd run <env>
@@ -839,7 +860,8 @@ normal operation.
 
 Rules:
 
-- No init/setup command in normal use.
+- One explicit `envd init` is required before stateful use; no other setup
+  rituals are required in normal use.
 - No required profile/image build command in normal use.
 - No required manual image repair after Docker prune.
 - No proxy environment variables inside sealed environments.
@@ -884,8 +906,8 @@ context.
 
 `gateway install` behavior:
 
-1. Lazily initialize envd state.
-2. Create or unlock the encrypted state store.
+1. Require encrypted state; if missing, tell the user to run `envd init`.
+2. Unlock the encrypted state store.
 3. Save the server password encrypted.
 4. Connect over SSH.
 5. Inspect OS, architecture, memory, disk, systemd, ports, and existing provider
@@ -2711,10 +2733,9 @@ remote process, checks local TCP reachability to the remote gateway port, stores
 the local gateway profile, and rolls back a previous envd-owned config if
 verification fails.
 
-If `envd gateway install ... --password` is the first stateful command, envd
-should create the encrypted state store, ask the user to create a master
-password, save the server password, and then continue installing the gateway. It
-should not stop with "run `envd secrets init` first".
+If `envd gateway install ... --password` is the first stateful command and
+encrypted state is missing, envd should stop with a concise `run envd init`
+message. Gateway install must not create a master password implicitly.
 
 If the stored SSH password or key stops working, the gateway command that needs
 access should ask for replacement credentials, store them encrypted after
@@ -3487,7 +3508,9 @@ Supervisor/idle gate:
 
 Encrypted-state gate:
 
-- Stateful envd commands must create or unlock encrypted state before reading or
+- `envd init` must create encrypted state explicitly before operational metadata
+  exists.
+- Stateful envd commands must unlock existing encrypted state before reading or
   writing operational state.
 - Human environment names, project paths, gateway hosts, identity names, and
   event history must not be written to plaintext host files or Docker metadata.
@@ -3560,7 +3583,7 @@ v1 baseline:
 
 1. Create source-built `install.sh` bootstrap.
 2. Create Go CLI skeleton.
-3. Implement encrypted config/state model and implicit first-run initialization.
+3. Implement encrypted config/state model and explicit `envd init`.
 4. Implement environment specs and `envd ps` from envd state plus Docker state.
 5. Implement image identity, profile tags, drift detection, and automatic image
    deletion recovery.

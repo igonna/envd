@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -9,9 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +25,7 @@ import (
 )
 
 const stateSchemaVersion = 1
+const defaultUnlockTTL = 5 * time.Minute
 
 type encryptedEnvelope struct {
 	Version     int    `json:"version"`
@@ -268,13 +273,16 @@ func (s stateStore) withStatePasswordMode(stderr io.Writer, saveOnFnErr bool, fn
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return err
 	}
+	if !fileExists(s.path) {
+		return fmt.Errorf("envd is not initialized; run `envd init` first")
+	}
 	unlock, err := s.lock()
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	password, err := readMasterPassword(stderr, !fileExists(s.path))
+	password, err := readMasterPassword(stderr)
 	if err != nil {
 		return err
 	}
@@ -287,6 +295,7 @@ func (s stateStore) withStatePasswordMode(stderr io.Writer, saveOnFnErr bool, fn
 
 	st, err := s.loadOrCreate(password)
 	if err != nil {
+		_ = clearCachedMasterPassword()
 		return err
 	}
 	if err := fn(&st, password); err != nil {
@@ -300,27 +309,119 @@ func (s stateStore) withStatePasswordMode(stderr io.Writer, saveOnFnErr bool, fn
 	return s.save(st, password)
 }
 
+func (s stateStore) init(stderr io.Writer) (string, error) {
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return "", err
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	if fileExists(s.path) {
+		return "", fmt.Errorf("envd is already initialized: %s", s.path)
+	}
+	password, err := readNewMasterPassword(stderr)
+	if err != nil {
+		return "", err
+	}
+	clear := func() {
+		for i := range password {
+			password[i] = 0
+		}
+	}
+	defer clear()
+	if err := s.save(initialEnvdState(time.Now().UTC()), password); err != nil {
+		return "", err
+	}
+	_ = cacheMasterPassword(password, unlockTTL())
+	return s.path, nil
+}
+
+func (s stateStore) changePassword(stderr io.Writer) error {
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return err
+	}
+	if !fileExists(s.path) {
+		return fmt.Errorf("envd is not initialized; run `envd init` first")
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	current, err := readMasterPasswordUncached(stderr)
+	if err != nil {
+		return err
+	}
+	defer zeroBytes(current)
+
+	st, err := s.loadOrCreate(current)
+	if err != nil {
+		return err
+	}
+
+	next, err := readChangedMasterPassword(stderr)
+	if err != nil {
+		return err
+	}
+	defer zeroBytes(next)
+	if string(current) == string(next) {
+		return errors.New("new master password must be different from the current password")
+	}
+
+	st.addEvent("state", "", "master password changed")
+	if err := s.save(st, next); err != nil {
+		return err
+	}
+	_ = cacheMasterPassword(next, unlockTTL())
+	return nil
+}
+
+func (s stateStore) reset(now time.Time) (result, path string, err error) {
+	if _, err := os.Stat(s.dir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "missing", "", nil
+		}
+		return "", "", err
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return "", "", err
+	}
+	defer unlock()
+
+	backupPath, err := uniqueStateBackupPath(s.dir, now)
+	if err != nil {
+		return "", "", err
+	}
+	if err := os.Rename(s.dir, backupPath); err != nil {
+		return "", "", err
+	}
+	_ = os.Remove(filepath.Join(backupPath, "state.lock"))
+	return "moved", backupPath, nil
+}
+
+func uniqueStateBackupPath(dir string, now time.Time) (string, error) {
+	base := dir + ".backup." + now.UTC().Format("20060102-150405")
+	for i := 0; i < 100; i++ {
+		candidate := base
+		if i > 0 {
+			candidate = fmt.Sprintf("%s.%d", base, i)
+		}
+		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("could not choose a unique state backup path for %s", dir)
+}
+
 func (s stateStore) loadOrCreate(password []byte) (envdState, error) {
 	if !fileExists(s.path) {
-		now := time.Now().UTC()
-		return envdState{
-			SchemaVersion:  stateSchemaVersion,
-			CreatedAt:      now,
-			Gateways:       map[string]gatewayRecord{},
-			RemoteGateways: map[string]remoteGatewayRecord{},
-			GatewayChains:  map[string]gatewayChainRecord{},
-			Environments:   map[string]envRecord{},
-			Profiles:       map[string]profileRecord{},
-			Identities:     map[string]identityRecord{},
-			RecoveryPoints: []recoveryPointRecord{},
-			Assets:         map[string]assetRecord{},
-			DoctorFailures: map[string]string{},
-			Events: []stateEvent{{
-				Time:    now,
-				Kind:    "state",
-				Message: "encrypted state initialized",
-			}},
-		}, nil
+		return initialEnvdState(time.Now().UTC()), nil
 	}
 
 	raw, err := os.ReadFile(s.path)
@@ -344,6 +445,27 @@ func (s stateStore) loadOrCreate(password []byte) (envdState, error) {
 	}
 	st.ensureDefaults()
 	return st, nil
+}
+
+func initialEnvdState(now time.Time) envdState {
+	return envdState{
+		SchemaVersion:  stateSchemaVersion,
+		CreatedAt:      now,
+		Gateways:       map[string]gatewayRecord{},
+		RemoteGateways: map[string]remoteGatewayRecord{},
+		GatewayChains:  map[string]gatewayChainRecord{},
+		Environments:   map[string]envRecord{},
+		Profiles:       map[string]profileRecord{},
+		Identities:     map[string]identityRecord{},
+		RecoveryPoints: []recoveryPointRecord{},
+		Assets:         map[string]assetRecord{},
+		DoctorFailures: map[string]string{},
+		Events: []stateEvent{{
+			Time:    now,
+			Kind:    "state",
+			Message: "encrypted state initialized",
+		}},
+	}
 }
 
 func (s stateStore) save(st envdState, password []byte) error {
@@ -379,11 +501,42 @@ func (s stateStore) lock() (func(), error) {
 		if !errors.Is(err, os.ErrExist) {
 			return nil, err
 		}
+		if stale, staleErr := staleStateLock(lockPath); staleErr == nil && stale {
+			_ = os.Remove(lockPath)
+			continue
+		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("state is locked by another envd process: %s", lockPath)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func staleStateLock(lockPath string) (bool, error) {
+	raw, err := os.ReadFile(lockPath)
+	if err != nil {
+		return false, err
+	}
+	pidText := strings.TrimSpace(string(raw))
+	if pidText == "" {
+		return true, nil
+	}
+	var pid int
+	if _, err := fmt.Sscanf(pidText, "%d", &pid); err != nil || pid <= 0 {
+		return true, nil
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return true, nil
+	}
+	if runtime.GOOS == "windows" {
+		return false, nil
+	}
+	err = process.Signal(syscall.Signal(0))
+	if err == nil {
+		return false, nil
+	}
+	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH), nil
 }
 
 func encryptEnvelope(plain, password []byte) (encryptedEnvelope, error) {
@@ -469,14 +622,301 @@ func randomBytes(n int) []byte {
 	return b
 }
 
-func readMasterPassword(stderr io.Writer, create bool) ([]byte, error) {
+func readMasterPassword(stderr io.Writer) ([]byte, error) {
 	if v := os.Getenv("ENVD_MASTER_PASSWORD"); v != "" {
 		return []byte(v), nil
 	}
-	prompt := "Master password: "
-	if create {
-		prompt = "Create envd master password: "
+	if cached, ok := cachedMasterPassword(); ok {
+		return cached, nil
 	}
+	pw, err := readPasswordPrompt(stderr, "Master password: ")
+	if err != nil {
+		return nil, err
+	}
+	_ = cacheMasterPassword(pw, unlockTTL())
+	return pw, nil
+}
+
+func readMasterPasswordUncached(stderr io.Writer) ([]byte, error) {
+	if v := os.Getenv("ENVD_MASTER_PASSWORD"); v != "" {
+		return []byte(v), nil
+	}
+	return readPasswordPrompt(stderr, "Current master password: ")
+}
+
+func readNewMasterPassword(stderr io.Writer) ([]byte, error) {
+	if v := os.Getenv("ENVD_MASTER_PASSWORD"); v != "" {
+		return []byte(v), nil
+	}
+	return readConfirmedPassword(stderr, "Create envd master password: ", "Confirm envd master password: ")
+}
+
+func readChangedMasterPassword(stderr io.Writer) ([]byte, error) {
+	if v := os.Getenv("ENVD_NEW_MASTER_PASSWORD"); v != "" {
+		return []byte(v), nil
+	}
+	return readConfirmedPassword(stderr, "New envd master password: ", "Confirm new envd master password: ")
+}
+
+func readConfirmedPassword(stderr io.Writer, firstPrompt, secondPrompt string) ([]byte, error) {
+	first, err := readPasswordPrompt(stderr, firstPrompt)
+	if err != nil {
+		return nil, err
+	}
+	second, err := readPasswordPrompt(stderr, secondPrompt)
+	if err != nil {
+		zeroBytes(first)
+		return nil, err
+	}
+	if string(first) != string(second) {
+		zeroBytes(first)
+		zeroBytes(second)
+		return nil, errors.New("master passwords do not match")
+	}
+	zeroBytes(second)
+	return first, nil
+}
+
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+func unlockTTL() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("ENVD_UNLOCK_TTL"))
+	if raw == "" {
+		return defaultUnlockTTL
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return defaultUnlockTTL
+	}
+	return d
+}
+
+func cachedMasterPassword() ([]byte, bool) {
+	reply, err := unlockAgentRequest("GET\n")
+	if err != nil {
+		return nil, false
+	}
+	reply = strings.TrimSpace(reply)
+	if !strings.HasPrefix(reply, "OK ") {
+		return nil, false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(strings.TrimPrefix(reply, "OK ")))
+	if err != nil || len(raw) == 0 {
+		return nil, false
+	}
+	return raw, true
+}
+
+func cacheMasterPassword(password []byte, ttl time.Duration) error {
+	if ttl <= 0 || len(password) == 0 || os.Getenv("ENVD_DISABLE_UNLOCK_CACHE") == "1" || os.Getenv("ENVD_MASTER_PASSWORD") != "" {
+		return nil
+	}
+	if err := ensureUnlockAgent(); err != nil {
+		return err
+	}
+	encoded := base64.StdEncoding.EncodeToString(password)
+	_, err := unlockAgentRequest(fmt.Sprintf("SET %d %s\n", int64(ttl.Seconds()), encoded))
+	return err
+}
+
+func clearCachedMasterPassword() error {
+	_, err := unlockAgentRequest("CLEAR\n")
+	return err
+}
+
+func unlockAgentRequest(request string) (string, error) {
+	socket, err := unlockAgentSocketPath()
+	if err != nil {
+		return "", err
+	}
+	conn, err := net.DialTimeout("unix", socket, 200*time.Millisecond)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, request); err != nil {
+		return "", err
+	}
+	reply, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return reply, nil
+}
+
+func ensureUnlockAgent() error {
+	socket, err := unlockAgentSocketPath()
+	if err != nil {
+		return err
+	}
+	if conn, err := net.DialTimeout("unix", socket, 100*time.Millisecond); err == nil {
+		_ = conn.Close()
+		return nil
+	}
+	_ = os.Remove(socket)
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		return err
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(exe, "__unlock-agent", socket)
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	_ = cmd.Process.Release()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if conn, err := net.DialTimeout("unix", socket, 100*time.Millisecond); err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return fmt.Errorf("unlock agent did not start")
+}
+
+func unlockAgentSocketPath() (string, error) {
+	if socket := os.Getenv("ENVD_UNLOCK_SOCKET"); socket != "" {
+		return socket, nil
+	}
+	dir := os.Getenv("ENVD_RUNTIME_DIR")
+	if dir == "" {
+		dir = os.Getenv("XDG_RUNTIME_DIR")
+	}
+	if dir == "" {
+		dir = filepath.Join(os.TempDir(), fmt.Sprintf("envd-%d", os.Getuid()))
+	} else {
+		dir = filepath.Join(dir, "envd")
+	}
+	return filepath.Join(dir, "unlock.sock"), nil
+}
+
+func runUnlockAgentCLI(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: envd __unlock-agent <socket>")
+	}
+	return serveUnlockAgent(args[0])
+}
+
+func serveUnlockAgent(socket string) error {
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		return err
+	}
+	_ = os.Remove(socket)
+	oldMask := syscall.Umask(0o077)
+	listener, err := net.Listen("unix", socket)
+	syscall.Umask(oldMask)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	defer os.Remove(socket)
+	_ = os.Chmod(socket, 0o600)
+
+	unixListener, _ := listener.(*net.UnixListener)
+	var password []byte
+	expires := time.Time{}
+	defer zeroBytes(password)
+
+	for {
+		if unixListener != nil {
+			deadline := time.Now().Add(time.Hour)
+			if !expires.IsZero() {
+				until := time.Until(expires)
+				if until <= 0 {
+					return nil
+				}
+				deadline = time.Now().Add(until)
+			}
+			_ = unixListener.SetDeadline(deadline)
+		}
+		conn, err := listener.Accept()
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return nil
+			}
+			return err
+		}
+		exit, err := handleUnlockAgentConn(conn, &password, &expires)
+		_ = conn.Close()
+		if err != nil {
+			continue
+		}
+		if exit {
+			return nil
+		}
+	}
+}
+
+func handleUnlockAgentConn(conn net.Conn, password *[]byte, expires *time.Time) (bool, error) {
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return false, err
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		_, _ = io.WriteString(conn, "ERR empty request\n")
+		return false, nil
+	}
+	if !expires.IsZero() && time.Now().After(*expires) {
+		zeroBytes(*password)
+		*password = nil
+		*expires = time.Time{}
+	}
+	switch fields[0] {
+	case "GET":
+		if len(*password) == 0 || expires.IsZero() {
+			_, _ = io.WriteString(conn, "MISS\n")
+			return false, nil
+		}
+		_, _ = io.WriteString(conn, "OK "+base64.StdEncoding.EncodeToString(*password)+"\n")
+	case "SET":
+		if len(fields) != 3 {
+			_, _ = io.WriteString(conn, "ERR usage\n")
+			return false, nil
+		}
+		ttlSeconds, err := strconv.Atoi(fields[1])
+		if err != nil || ttlSeconds <= 0 {
+			_, _ = io.WriteString(conn, "ERR ttl\n")
+			return false, nil
+		}
+		raw, err := base64.StdEncoding.DecodeString(fields[2])
+		if err != nil || len(raw) == 0 {
+			_, _ = io.WriteString(conn, "ERR password\n")
+			return false, nil
+		}
+		zeroBytes(*password)
+		*password = raw
+		*expires = time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+		_, _ = io.WriteString(conn, "OK\n")
+	case "CLEAR":
+		zeroBytes(*password)
+		*password = nil
+		*expires = time.Time{}
+		_, _ = io.WriteString(conn, "OK\n")
+		return true, nil
+	default:
+		_, _ = io.WriteString(conn, "ERR unknown request\n")
+	}
+	return false, nil
+}
+
+func readPasswordPrompt(stderr io.Writer, prompt string) ([]byte, error) {
 	fmt.Fprint(stderr, prompt)
 	if term.IsTerminal(int(syscall.Stdin)) {
 		pw, err := term.ReadPassword(int(syscall.Stdin))

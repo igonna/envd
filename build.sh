@@ -4,9 +4,10 @@ set -eu
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 dist_dir=${ENVD_DIST_DIR:-"$repo_dir/build/dist"}
 go_image=${ENVD_GO_IMAGE:-"golang:1.22-alpine"}
+go_cache_dir=${ENVD_GO_CACHE_DIR:-"$repo_dir/build/cache/go"}
 targets=${ENVD_TARGETS:-"darwin/arm64 darwin/amd64 linux/arm64 linux/amd64"}
 
-mkdir -p "$dist_dir"
+mkdir -p "$dist_dir" "$go_cache_dir/mod" "$go_cache_dir/build"
 
 build_target() {
   goos=$1
@@ -22,10 +23,14 @@ build_target() {
   elif command -v docker >/dev/null 2>&1; then
     docker run --rm \
       -v "$repo_dir:/src" \
+      -v "$go_cache_dir/mod:/go/pkg/mod" \
+      -v "$go_cache_dir/build:/root/.cache/go-build" \
       -w /src \
       -e CGO_ENABLED=0 \
       -e GOOS="$goos" \
       -e GOARCH="$goarch" \
+      -e GOMODCACHE=/go/pkg/mod \
+      -e GOCACHE=/root/.cache/go-build \
       "$go_image" \
       sh -lc 'PATH=/usr/local/go/bin:$PATH go build -trimpath -o "/src/build/dist/envd-$GOOS-$GOARCH" ./cmd/envd'
   else

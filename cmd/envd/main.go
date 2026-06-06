@@ -206,6 +206,14 @@ const builtInHostingCatalogJSON = `{
 }`
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "__unlock-agent" {
+		if err := runUnlockAgentCLI(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %s\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	root, err := findRepoRoot()
 	if err != nil {
 		root, _ = os.Getwd()
@@ -226,11 +234,27 @@ func (a app) run(args []string) error {
 
 	switch args[0] {
 	case "help", "-h", "--help":
+		if len(args) > 1 {
+			return a.printCommandHelp(args[1:])
+		}
 		a.printHelp()
 		return nil
 	case "version", "--version":
 		fmt.Fprintf(a.stdout, "envd %s\n", version)
 		return nil
+	case "init":
+		return a.runInit(args[1:])
+	case "password":
+		return a.runPassword(args[1:])
+	case "reset-state":
+		return a.runResetState(args[1:])
+	default:
+		if len(args) > 1 && isHelpArg(args[1]) {
+			return a.printCommandHelp([]string{args[0]})
+		}
+	}
+
+	switch args[0] {
 	case "proxy":
 		if len(args) > 1 && isHelpArg(args[1]) {
 			return a.runProxy(args[1:], nil)
@@ -298,6 +322,134 @@ func isHelpArg(arg string) bool {
 	return arg == "help" || arg == "-h" || arg == "--help"
 }
 
+func (a app) runInit(args []string) error {
+	if len(args) > 0 && isHelpArg(args[0]) {
+		fmt.Fprint(a.stdout, "Usage: envd init\n")
+		return nil
+	}
+	if len(args) != 0 {
+		return fmt.Errorf("usage: envd init")
+	}
+	store, err := newStateStore()
+	if err != nil {
+		return err
+	}
+	path, err := store.init(a.stderr)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.stdout, "Initialized encrypted envd state: %s\n", path)
+	return nil
+}
+
+func (a app) runPassword(args []string) error {
+	if len(args) > 0 && isHelpArg(args[0]) {
+		fmt.Fprint(a.stdout, `Usage: envd password change
+
+Unlocks existing encrypted envd state with the current master password, asks for
+a new master password twice, then re-encrypts the same state with the new
+password.
+
+The current password is requested explicitly even if the short-lived unlock
+cache is active.
+
+`)
+		return nil
+	}
+	if len(args) != 1 || args[0] != "change" {
+		return fmt.Errorf("usage: envd password change")
+	}
+	store, err := newStateStore()
+	if err != nil {
+		return err
+	}
+	if err := store.changePassword(a.stderr); err != nil {
+		return err
+	}
+	fmt.Fprintln(a.stdout, "Changed envd master password")
+	return nil
+}
+
+func (a app) runResetState(args []string) error {
+	confirmed := false
+	yes := false
+	if len(args) > 0 && isHelpArg(args[0]) {
+		fmt.Fprint(a.stdout, `Usage: envd reset-state --delete --i-understand-this-deletes-envd-state --yes
+
+Moves encrypted envd state to a timestamped backup and then prints the next
+step. Docker containers and volumes are not deleted.
+
+Requires typing: Remove envd state
+
+`)
+		return nil
+	}
+	for _, arg := range args {
+		switch arg {
+		case "--yes", "-y":
+			yes = true
+		case "--delete":
+			confirmed = true
+		case "--i-understand-this-deletes-envd-state":
+			confirmed = true
+		default:
+			return fmt.Errorf("unknown reset-state option %q", arg)
+		}
+	}
+	if !yes || !confirmed || !hasArg(args, "--delete") || !hasArg(args, "--i-understand-this-deletes-envd-state") {
+		return fmt.Errorf("usage: envd reset-state --delete --i-understand-this-deletes-envd-state --yes")
+	}
+	if err := confirmResetState(a.stderr); err != nil {
+		return err
+	}
+	store, err := newStateStore()
+	if err != nil {
+		return err
+	}
+	result, path, err := store.reset(time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	switch result {
+	case "missing":
+		fmt.Fprintf(a.stdout, "No envd state found at: %s\n", store.dir)
+	case "moved":
+		fmt.Fprintf(a.stdout, "Moved envd state to backup: %s\n", path)
+		fmt.Fprintln(a.stdout, "Next: envd init")
+	default:
+		return fmt.Errorf("unknown reset result %q", result)
+	}
+	return nil
+}
+
+func confirmResetState(stderr io.Writer) error {
+	const phrase = "Remove envd state"
+	if os.Getenv("ENVD_NONINTERACTIVE") == "1" {
+		return nil
+	}
+	fmt.Fprintf(stderr, "This moves encrypted envd state to a backup and resets envd metadata.\n")
+	fmt.Fprintf(stderr, "Docker containers and volumes are not deleted.\n")
+	fmt.Fprintf(stderr, "Type %q to continue: ", phrase)
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if strings.TrimSpace(line) != phrase {
+		return errors.New("reset-state cancelled")
+	}
+	return nil
+}
+
+func hasArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
 func (a app) withState(fn func(*envdState) error) error {
 	store, err := newStateStore()
 	if err != nil {
@@ -336,52 +488,178 @@ func (a app) printHelp() {
 
 Usage:
   envd <command> [args]
+  envd help <command>
 
-Core commands:
-  version              Print envd version without opening state
-  help                 Show this help without opening state
-  proxy                Show current host SOCKS/HTTP proxy endpoints
-  proxy test           Test local SOCKS and HTTP proxy handshakes
-  doctor [--deep]      Diagnose Docker, gateway, and proxy layers
-  gateway status       Show active/local gateway status
-  gateway inspect      Show active/local gateway config summary
-  gateway render       Validate generated local gateway config
-  gateway egress       Show public egress IP through gateway
-  gateway install <name> --host <ip> --user <user> --password --probe --dry-run
-                       Plan and SSH-probe a remote gateway without mutating it
-  gateway use <name>   Verify and activate an encrypted gateway record
-  gateway import-local <name> --yes
-                       Legacy migration from old manual local .env setups
-  gateway rollback     Verify and switch back to the previous active gateway
-  user uri <gateway>    Print an app import URI for a gateway user
-  internet status       Check direct and gateway internet reachability
-  internet report       Show recent encrypted internet reachability history
-  hosting check         Check built-in/private hosting provider reachability
-  hosting shortlist     Show reachable/diverse provider candidates
-  hosting update        Install a signed provider catalog update
-  identity add <name> --ssh-key <path>
-                       Store SSH identity material in encrypted state
-  run <env>            Create a sealed plain-storage environment
-  ps                   List envd-managed environments
-  inspect <env>        Inspect one envd-managed environment
-  shell <env>          Open a shell in an environment
-  ssh-proxy <env>      Proxy SSH stdio to an env through envd policy checks
-  code <env>           Print or launch a VS Code Remote SSH target via envd
-  start <env>          Start an environment and its sidecar
-  stop <env>           Stop an environment and its sidecar
-  rm <env> --yes       Remove an environment and envd-owned volumes
-  lock                 Stop all envd-managed workloads and end envd shells
-  network set <env> <mode>
-                       Change network mode: sealed, direct, offline
-  pkg add <profile> <source:package>
-                       Add apt/npm/tool package intent to a dev image profile
-  supervisor run       Stop idle envd-managed workloads in a low-duty loop
-  migrate inspect      Discover legacy envd containers and gateway config
-  migrate adopt --yes  Record legacy envs as encrypted-state plain legacy envs
-  events               Show encrypted envd event log
-  why <env>            Explain current state from encrypted events
+Quick Start:
+  envd init
+  envd gateway install ams1 --host 1.2.3.4 --user root --password --probe --dry-run
+  envd gateway install ams1 --host 1.2.3.4 --user root --password --yes
+  envd gateway use ams1
+  envd run books
+  envd shell books
+  envd doctor --deep
+
+Commands:
+  init
+        Create encrypted state and master password
+
+  password change
+        Change master password without deleting encrypted state
+
+  reset-state --delete --i-understand-this-deletes-envd-state --yes
+        Move encrypted state to backup after typed confirmation
+
+  gateway install <name> --host <ip> --user <user> --password [--probe] [--dry-run|--yes]
+        Inspect, plan, and install/adopt a remote gateway
+  gateway use <name>
+        Verify and activate a gateway
+  gateway status|inspect|render|egress|rollback
+        Manage and inspect the active gateway
+
+  proxy
+        Show host SOCKS/HTTP proxy endpoints
+  proxy test
+        Test SOCKS and HTTP CONNECT through the host proxy
+
+  run <env> [--network sealed|direct|offline] [--profile <profile>]
+        Create/start an environment
+  shell <env> [command...]
+        Open a shell or run a command inside an environment
+  ps
+        List environments
+  inspect <env>
+        Show environment details
+  start <env>
+        Start an environment
+  stop <env>
+        Stop an environment
+  rm <env> --yes
+        Remove an environment and envd-owned volumes
+  lock
+        Stop envd-managed workloads and clear cached unlock
+
+  doctor [--deep]
+        Diagnose Docker, gateway, proxy, and sealed networking
+  why <env>
+        Explain an environment state
+  events
+        Show encrypted event log
+
+  network set <env> <sealed|direct|offline>
+        Change network mode
+  pkg add <profile> <apt|npm|tool>:<package>
+        Add package intent to a profile
+  code <env> [--print|--launch]
+        Print or launch VS Code Remote SSH config
+
+Other Commands:
+  user, internet, hosting, identity, migrate, supervisor, ssh-proxy, version, help
+
+Options:
+  -h, --help
+        Show help for a command
+
+Run envd help <command> for full command-specific usage.
 
 `)
+}
+
+func (a app) printCommandHelp(args []string) error {
+	if len(args) == 0 {
+		a.printHelp()
+		return nil
+	}
+	switch args[0] {
+	case "init":
+		fmt.Fprint(a.stdout, "Usage: envd init\n\nCreates encrypted envd state and asks for the master password twice.\n")
+	case "password":
+		fmt.Fprint(a.stdout, `Usage: envd password change
+
+Changes the master password without deleting encrypted state.
+
+Prompts:
+  current master password
+  new master password
+  confirmation of new master password
+
+The current password is requested explicitly even if the short-lived unlock
+cache is active.
+
+`)
+	case "reset-state":
+		fmt.Fprint(a.stdout, `Usage: envd reset-state --delete --i-understand-this-deletes-envd-state --yes
+
+Moves encrypted envd state to a timestamped backup when the master password is
+lost. Docker containers and volumes are not deleted.
+
+Requires typing: Remove envd state
+Next command: envd init
+
+`)
+	case "gateway":
+		fmt.Fprint(a.stdout, `Usage:
+  envd gateway install <name> --host <ip> --user <user> --password --probe --dry-run
+  envd gateway install <name> --host <ip> --user <user> --password --yes
+  envd gateway use <name>
+  envd gateway status
+  envd gateway inspect
+  envd gateway render
+  envd gateway egress
+  envd gateway rollback
+
+`)
+	case "proxy":
+		fmt.Fprint(a.stdout, "Usage:\n  envd proxy\n  envd proxy test\n")
+	case "run":
+		fmt.Fprint(a.stdout, "Usage: envd run <env> [--network sealed|direct|offline] [--profile <profile>]\n")
+	case "shell":
+		fmt.Fprint(a.stdout, "Usage:\n  envd shell <env>\n  envd shell <env> <command> [args]\n")
+	case "ps":
+		fmt.Fprint(a.stdout, "Usage: envd ps\n")
+	case "inspect":
+		fmt.Fprint(a.stdout, "Usage: envd inspect <env>\n")
+	case "start":
+		fmt.Fprint(a.stdout, "Usage: envd start <env>\n")
+	case "stop":
+		fmt.Fprint(a.stdout, "Usage: envd stop <env>\n")
+	case "rm":
+		fmt.Fprint(a.stdout, "Usage: envd rm <env> --yes\n")
+	case "lock":
+		fmt.Fprint(a.stdout, "Usage: envd lock\n\nStops envd-managed workloads, active envd shells, and clears cached unlock.\n")
+	case "doctor":
+		fmt.Fprint(a.stdout, "Usage:\n  envd doctor\n  envd doctor --deep\n")
+	case "why":
+		fmt.Fprint(a.stdout, "Usage: envd why <env>\n")
+	case "events":
+		fmt.Fprint(a.stdout, "Usage: envd events\n")
+	case "internet":
+		fmt.Fprint(a.stdout, "Usage:\n  envd internet status\n  envd internet report\n")
+	case "hosting":
+		fmt.Fprint(a.stdout, "Usage:\n  envd hosting check\n  envd hosting shortlist\n  envd hosting update --url <providers.json> --sig <sig> --key <pubkey>\n")
+	case "network":
+		fmt.Fprint(a.stdout, "Usage: envd network set <env> <sealed|direct|offline>\n")
+	case "pkg":
+		fmt.Fprint(a.stdout, "Usage:\n  envd pkg add <profile> <apt|npm|tool>:<package>\n  envd pkg suggest <env>\n  envd pkg promote <env> --to <profile>\n")
+	case "code":
+		fmt.Fprint(a.stdout, "Usage:\n  envd code <env> --print\n  envd code <env> --launch\n")
+	case "ssh-proxy":
+		fmt.Fprint(a.stdout, "Usage: envd ssh-proxy <env>\n")
+	case "identity":
+		fmt.Fprint(a.stdout, "Usage:\n  envd identity add <name> --ssh-key <path>\n  envd identity list\n  envd identity broker check <env> <identity> --class ssh\n")
+	case "migrate":
+		fmt.Fprint(a.stdout, "Usage:\n  envd migrate inspect\n  envd migrate adopt --yes\n  envd migrate protected <env> --yes\n  envd migrate gateway inspect\n")
+	case "supervisor":
+		fmt.Fprint(a.stdout, "Usage:\n  envd supervisor run [--idle 3h]\n  envd supervisor tick [--idle 3h]\n")
+	case "user":
+		fmt.Fprint(a.stdout, "Usage: envd user uri <gateway>\n")
+	case "version":
+		fmt.Fprint(a.stdout, "Usage: envd version\n")
+	case "help":
+		fmt.Fprint(a.stdout, "Usage:\n  envd help\n  envd help <command>\n")
+	default:
+		return fmt.Errorf("unknown help topic %q", args[0])
+	}
+	return nil
 }
 
 func (a app) runProxy(args []string, st *envdState) error {
@@ -1443,6 +1721,7 @@ func (a app) lockEnvdWithStopper(args []string, st *envdState, stop workloadStop
 		stopped++
 	}
 	st.addEvent("lock", "", fmt.Sprintf("completed: stopped %d workloads; failed %d", stopped, failed))
+	_ = clearCachedMasterPassword()
 	fmt.Fprintf(a.stdout, "Locked: stopped %d envd-managed workloads\n", stopped)
 	if failed > 0 {
 		fmt.Fprintf(a.stdout, "Failed: %d workloads need manual inspection\n", failed)
@@ -1785,7 +2064,10 @@ func (a app) runSupervisor(args []string) error {
 	if err := os.MkdirAll(store.dir, 0o700); err != nil {
 		return err
 	}
-	password, err := readMasterPassword(a.stderr, !fileExists(store.path))
+	if !fileExists(store.path) {
+		return fmt.Errorf("envd is not initialized; run `envd init` first")
+	}
+	password, err := readMasterPassword(a.stderr)
 	if err != nil {
 		return err
 	}

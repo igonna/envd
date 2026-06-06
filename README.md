@@ -11,6 +11,9 @@ repo-local compose files, manual `.env` files, or copied Docker contexts.
 ./install.sh
 ```
 
+If `envd` already exists on `PATH`, the installer upgrades that binary. If not,
+it installs to `${ENVD_INSTALL_DIR:-$HOME/.local/bin}`.
+
 Requirements:
 
 - Docker Desktop on macOS or Docker Engine with Compose plugin on Linux.
@@ -22,6 +25,7 @@ Verify:
 ```bash
 envd version
 envd help
+envd init
 ```
 
 Build release-style binaries for common platforms:
@@ -31,8 +35,16 @@ Build release-style binaries for common platforms:
 ```
 
 Outputs go to `build/dist/` for macOS arm64/amd64 and Linux arm64/amd64.
+When Docker is used for builds, Go module/build caches are kept under
+`build/cache/go/` so repeated installs do not redownload dependencies.
 
 ## Normal Flow
+
+Initialize encrypted state once:
+
+```bash
+envd init
+```
 
 Create or adopt a gateway:
 
@@ -75,8 +87,11 @@ envd user uri ams1                 # print app import URI
 envd pkg add web apt:ffmpeg        # add package intent to a profile
 envd run app --profile web         # lazily build/use that profile
 envd code books --print            # print VS Code Remote SSH config
-envd lock                          # stop envd-managed workloads
+envd lock                          # stop workloads and clear cached unlock
 envd rm books --yes                # remove an environment and envd-owned volumes
+envd password change               # change master password without deleting state
+envd reset-state --delete --i-understand-this-deletes-envd-state --yes
+                                   # move unreadable envd state to a backup
 ```
 
 `envd gateway import-local <name> --yes` exists only for migrating old manual
@@ -84,7 +99,7 @@ local gateway `.env` setups into encrypted state.
 
 ## State And Runtime Files
 
-Stateful commands create or unlock encrypted state at:
+`envd init` creates encrypted state at:
 
 ```text
 ${ENVD_STATE_DIR:-$HOME/.local/state/envd}/state.enc
@@ -96,8 +111,38 @@ Runtime data and materialized gateway files live under:
 ${ENVD_DATA_DIR:-$HOME/.local/share/envd}
 ```
 
-The master password is never stored. For tests/automation, `ENVD_MASTER_PASSWORD`
-can provide it non-interactively.
+Stateful commands unlock that state with the master password. The master
+password is never stored. For tests/automation, `ENVD_MASTER_PASSWORD` can
+provide it non-interactively.
+
+Interactive unlock is cached in memory for a short sudo-like window so repeated
+commands do not ask every time. Default TTL is 5 minutes. Override with
+`ENVD_UNLOCK_TTL=10m`, disable with `ENVD_DISABLE_UNLOCK_CACHE=1`, or clear it
+immediately with:
+
+```bash
+envd lock
+```
+
+To change the master password while keeping existing envd state:
+
+```bash
+envd password change
+```
+
+Password rotation asks for the current master password explicitly even when the
+unlock cache is active.
+
+If you forget the master password, envd cannot decrypt `state.enc`. To start
+fresh without deleting Docker containers or volumes:
+
+```bash
+envd reset-state --delete --i-understand-this-deletes-envd-state --yes
+envd init
+```
+
+The reset command also asks you to type `Remove envd state` before it moves the
+state directory to a backup.
 
 ## Repository Layout
 

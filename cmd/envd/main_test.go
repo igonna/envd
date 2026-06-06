@@ -48,21 +48,279 @@ func TestHelpDoesNotNeedState(t *testing.T) {
 	}
 }
 
-func TestEventsInitializesEncryptedState(t *testing.T) {
+func TestStatefulCommandRequiresInit(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("ENVD_STATE_DIR", stateDir)
 	t.Setenv("ENVD_MASTER_PASSWORD", "test-password")
 	var out bytes.Buffer
 	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
 
+	err := a.run([]string{"events"})
+	if err == nil || !strings.Contains(err.Error(), "envd init") {
+		t.Fatalf("expected init error, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "state.enc")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state.enc should not be created by events before init: %v", err)
+	}
+}
+
+func TestInitCreatesEncryptedState(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("ENVD_STATE_DIR", stateDir)
+	t.Setenv("ENVD_MASTER_PASSWORD", "test-password")
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+
+	if err := a.run([]string{"init"}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Initialized encrypted envd state") {
+		t.Fatalf("init output missing state path: %q", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "state.enc")); err != nil {
+		t.Fatalf("state.enc was not created: %v", err)
+	}
+	out.Reset()
 	if err := a.run([]string{"events"}); err != nil {
-		t.Fatalf("events failed: %v", err)
+		t.Fatalf("events after init failed: %v", err)
 	}
 	if !strings.Contains(out.String(), "encrypted state initialized") {
 		t.Fatalf("events output did not include initial state event: %q", out.String())
 	}
+	if err := a.run([]string{"init"}); err == nil || !strings.Contains(err.Error(), "already initialized") {
+		t.Fatalf("second init should fail, got %v", err)
+	}
+}
+
+func TestPasswordChangeReencryptsExistingState(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("ENVD_STATE_DIR", stateDir)
+	t.Setenv("ENVD_MASTER_PASSWORD", "old-password")
+	t.Setenv("ENVD_NEW_MASTER_PASSWORD", "new-password")
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	store := stateStore{dir: stateDir, path: filepath.Join(stateDir, "state.enc")}
+	now := time.Now().UTC()
+	st := initialEnvdState(now)
+	st.ActiveGateway = "ams1"
+	st.Gateways["ams1"] = gatewayRecordFromConfig("ams1", gatewayConfig{ServerIP: "203.0.113.10", ServerPort: "443"}, now)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.save(st, []byte("old-password")); err != nil {
+		t.Fatalf("save old state failed: %v", err)
+	}
+
+	if err := a.run([]string{"password", "change"}); err != nil {
+		t.Fatalf("password change failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Changed envd master password") {
+		t.Fatalf("password change output = %q", out.String())
+	}
+	if _, err := store.loadOrCreate([]byte("old-password")); err == nil {
+		t.Fatalf("old password should not unlock state after password change")
+	}
+	loaded, err := store.loadOrCreate([]byte("new-password"))
+	if err != nil {
+		t.Fatalf("new password did not unlock state: %v", err)
+	}
+	if loaded.ActiveGateway != "ams1" || loaded.Gateways["ams1"].ServerIP != "203.0.113.10" {
+		t.Fatalf("state was not preserved after password change: %+v", loaded)
+	}
+	if len(loaded.Events) == 0 || !strings.Contains(loaded.Events[len(loaded.Events)-1].Message, "master password changed") {
+		t.Fatalf("password change event missing: %+v", loaded.Events)
+	}
+}
+
+func TestPasswordChangeRequiresDifferentPassword(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("ENVD_STATE_DIR", stateDir)
+	t.Setenv("ENVD_MASTER_PASSWORD", "same-password")
+	t.Setenv("ENVD_NEW_MASTER_PASSWORD", "same-password")
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+
+	if err := a.run([]string{"init"}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	err := a.run([]string{"password", "change"})
+	if err == nil || !strings.Contains(err.Error(), "must be different") {
+		t.Fatalf("expected different-password error, got %v", err)
+	}
+}
+
+func TestPasswordChangeRequiresInit(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("ENVD_STATE_DIR", stateDir)
+	t.Setenv("ENVD_MASTER_PASSWORD", "old-password")
+	t.Setenv("ENVD_NEW_MASTER_PASSWORD", "new-password")
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+
+	err := a.run([]string{"password", "change"})
+	if err == nil || !strings.Contains(err.Error(), "envd init") {
+		t.Fatalf("expected init error, got %v", err)
+	}
+}
+
+func TestResetStateMovesStateToBackup(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("ENVD_STATE_DIR", stateDir)
+	t.Setenv("ENVD_MASTER_PASSWORD", "test-password")
+	t.Setenv("ENVD_NONINTERACTIVE", "1")
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+
+	if err := a.run([]string{"init"}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "state.lock"), []byte("999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := a.run([]string{"reset-state", "--delete", "--i-understand-this-deletes-envd-state", "--yes"}); err != nil {
+		t.Fatalf("reset-state failed: %v", err)
+	}
+	if _, err := os.Stat(stateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state dir should have moved, stat err=%v", err)
+	}
+	line := strings.TrimSpace(out.String())
+	if !strings.Contains(line, "Moved envd state to backup:") || !strings.Contains(line, "Next: envd init") {
+		t.Fatalf("unexpected reset output: %q", out.String())
+	}
+	backup := ""
+	for _, part := range strings.Fields(out.String()) {
+		if strings.Contains(part, ".backup.") {
+			backup = part
+			break
+		}
+	}
+	if backup == "" {
+		t.Fatalf("backup path not found in output: %q", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(backup, "state.enc")); err != nil {
+		t.Fatalf("backup state.enc missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(backup, "state.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup should not keep stale lock, stat err=%v", err)
+	}
+}
+
+func TestResetStateRequiresFullConfirmation(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("ENVD_STATE_DIR", stateDir)
+	t.Setenv("ENVD_MASTER_PASSWORD", "test-password")
+	t.Setenv("ENVD_NONINTERACTIVE", "1")
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+
+	if err := a.run([]string{"init"}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	if err := a.run([]string{"reset-state"}); err == nil || !strings.Contains(err.Error(), "--delete --i-understand-this-deletes-envd-state --yes") {
+		t.Fatalf("reset-state without --yes should fail, got %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(stateDir, "state.enc")); err != nil {
-		t.Fatalf("state.enc was not created: %v", err)
+		t.Fatalf("state should remain after refused reset: %v", err)
+	}
+	if err := a.run([]string{"reset-state", "--delete", "--yes"}); err == nil || !strings.Contains(err.Error(), "--i-understand-this-deletes-envd-state") {
+		t.Fatalf("reset-state without phrase should fail, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "state.enc")); err != nil {
+		t.Fatalf("state should remain after refused reset: %v", err)
+	}
+}
+
+func TestConfirmResetStateRequiresTypedPhrase(t *testing.T) {
+	oldStdin := os.Stdin
+	defer func() { os.Stdin = oldStdin }()
+
+	if err := withStdinText("wrong\n", func() error {
+		return confirmResetState(io.Discard)
+	}); err == nil || !strings.Contains(err.Error(), "cancelled") {
+		t.Fatalf("expected cancellation on wrong phrase, got %v", err)
+	}
+	if err := withStdinText("Remove envd state\n", func() error {
+		return confirmResetState(io.Discard)
+	}); err != nil {
+		t.Fatalf("expected exact phrase to confirm, got %v", err)
+	}
+}
+
+func withStdinText(text string, fn func() error) error {
+	oldStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	if _, err := w.WriteString(text); err != nil {
+		_ = r.Close()
+		_ = w.Close()
+		return err
+	}
+	_ = w.Close()
+	os.Stdin = r
+	defer func() {
+		os.Stdin = oldStdin
+		_ = r.Close()
+	}()
+	return fn()
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}
+
+func TestStateLockReclaimsDeadPID(t *testing.T) {
+	stateDir := t.TempDir()
+	store := stateStore{dir: stateDir, path: filepath.Join(stateDir, "state.enc")}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(stateDir, "state.lock")
+	if err := os.WriteFile(lockPath, []byte("999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	unlock, err := store.lock()
+	if err != nil {
+		t.Fatalf("stale lock was not reclaimed: %v", err)
+	}
+	defer unlock()
+
+	raw, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("lock file missing after reclaim: %v", err)
+	}
+	if got := strings.TrimSpace(string(raw)); got != strconv.Itoa(os.Getpid()) {
+		t.Fatalf("lock pid = %q, want current pid", got)
+	}
+}
+
+func TestStateLockDoesNotStealLivePID(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(stateDir, "state.lock")
+	if err := os.WriteFile(lockPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, err := staleStateLock(lockPath)
+	if err != nil {
+		t.Fatalf("live lock check failed: %v", err)
+	}
+	if stale {
+		t.Fatalf("current process lock was treated as stale")
 	}
 }
 
@@ -875,6 +1133,18 @@ func TestLegacyEnvironmentRecordStaysPlainStorage(t *testing.T) {
 }
 
 func TestLockStopsAllRecordedWorkloads(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "unlock.sock")
+	t.Setenv("ENVD_UNLOCK_SOCKET", socket)
+	done := make(chan error, 1)
+	go func() { done <- serveUnlockAgent(socket) }()
+	waitForFile(t, socket)
+	if err := cacheMasterPassword([]byte("cached-password"), time.Minute); err != nil {
+		t.Fatalf("cache password failed: %v", err)
+	}
+	if got, ok := cachedMasterPassword(); !ok || string(got) != "cached-password" {
+		t.Fatalf("expected cached password before lock, ok=%v got=%q", ok, string(got))
+	}
+
 	now := time.Now().UTC()
 	st := envdState{Environments: map[string]envRecord{
 		"books": {ID: "abc123", Network: "sealed", Storage: "plain", CreatedAt: now, UpdatedAt: now},
@@ -898,6 +1168,17 @@ func TestLockStopsAllRecordedWorkloads(t *testing.T) {
 	}
 	if len(st.Events) != 3 || !strings.Contains(st.Events[2].Message, "completed: stopped 2 workloads; failed 0") {
 		t.Fatalf("missing lock completion event: %+v", st.Events)
+	}
+	if got, ok := cachedMasterPassword(); ok {
+		t.Fatalf("lock should clear cached password, got %q", string(got))
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unlock agent failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("unlock agent did not exit after lock cleared cache")
 	}
 }
 
@@ -1311,7 +1592,12 @@ func TestRunGatewayInstallProbeStoresEncryptedRemoteInspection(t *testing.T) {
 	t.Setenv("ENVD_STATE_DIR", stateDir)
 
 	var out bytes.Buffer
-	err := (app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}).run([]string{
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	if err := a.run([]string{"init"}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	out.Reset()
+	err := a.run([]string{
 		"gateway", "install", "ams1",
 		"--host", server.addr,
 		"--user", "root",

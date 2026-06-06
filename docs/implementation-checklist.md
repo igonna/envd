@@ -35,10 +35,15 @@ only where implemented and release-gated.
 ### Encrypted State
 
 - [x] Define envd state directory layout.
-- [x] Create encrypted state store on first stateful command.
-- [x] Prompt for master password when the encrypted store does not exist.
+- [x] Create encrypted state store only through explicit `envd init`.
+- [x] Prompt twice for master password during `envd init`.
+- [x] Stateful commands fail with `envd init` guidance when state is missing.
 - [x] Prompt for master password when encrypted state must be opened.
 - [x] Never store the master password.
+- [x] Add `envd password change` to rotate the master password without deleting
+      encrypted state.
+- [x] Cache interactive unlock in memory for a short TTL.
+- [x] Clear cached unlock on `envd lock`.
 - [x] Store human env names, gateway hosts, project paths, and event history only
       in encrypted state.
 - [x] Store only minimal public host metadata outside encrypted state.
@@ -235,7 +240,8 @@ only where implemented and release-gated.
 
 ### Encrypted-State Gate
 
-- [x] Stateful commands create or unlock encrypted state before reading names,
+- [x] `envd init` creates encrypted state before any encrypted metadata exists.
+- [x] Stateful commands unlock existing encrypted state before reading names,
       paths, gateway hosts, or event history.
 - [x] Plain host files contain no human env names by default.
 - [x] Docker object names are opaque.
