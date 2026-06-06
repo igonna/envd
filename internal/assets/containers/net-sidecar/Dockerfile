@@ -26,7 +26,7 @@ RUN set -eux; \
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=6 \
-  CMD ip link show tun0 >/dev/null 2>&1 || exit 1
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=2 \
+  CMD sh -c 'ip link show "${TUN_IFACE:-tun0}" >/dev/null 2>&1 && test -s /run/envd-xray-addr && nc -z -w 2 "$(cat /run/envd-xray-addr)" "${XRAY_PORT:-2088}"'
 
 ENTRYPOINT ["/entrypoint.sh"]

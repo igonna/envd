@@ -939,6 +939,48 @@ func TestDevContainerArgsBlockHostDockerAndHostAccessByDefault(t *testing.T) {
 	}
 }
 
+func TestSidecarKillSwitchPinsPreTunnelGateway(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "internal", "assets", "containers", "net-sidecar", "entrypoint.sh"))
+	if err != nil {
+		t.Fatalf("read sidecar entrypoint: %v", err)
+	}
+	got := string(raw)
+	for _, want := range []string{
+		`XRAY_ADDR_FILE="/run/envd-xray-addr"`,
+		`printf '%s\n' "${XRAY_ADDR}" >"${XRAY_ADDR_FILE}"`,
+		`-d "${XRAY_ADDR}" --dport "${XRAY_PORT}"`,
+		`-d "${XRAY_ADDR}" --dport "${XRAY_HTTP_PORT}"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sidecar entrypoint missing %q", want)
+		}
+	}
+	if strings.Contains(got, `-o "${uplink_dev}" -p tcp --dport "${XRAY_PORT}"`) {
+		t.Fatalf("sidecar kill-switch allows pre-tunnel port without destination pin")
+	}
+}
+
+func TestSidecarHealthcheckUsesResolvedGatewayIP(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "internal", "assets", "containers", "net-sidecar", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read sidecar Dockerfile: %v", err)
+	}
+	got := string(raw)
+	for _, want := range []string{
+		"--interval=5s",
+		"--retries=2",
+		`test -s /run/envd-xray-addr`,
+		`nc -z -w 2 "$(cat /run/envd-xray-addr)" "${XRAY_PORT:-2088}"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sidecar Dockerfile missing %q", want)
+		}
+	}
+	if strings.Contains(got, `"${XRAY_HOST:-xray}" "${XRAY_PORT:-2088}"`) {
+		t.Fatalf("sidecar healthcheck resolves Docker DNS after resolv.conf is sealed")
+	}
+}
+
 func TestEmbeddedAssetContextMaterializesWithoutRepo(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("ENVD_DATA_DIR", dataDir)

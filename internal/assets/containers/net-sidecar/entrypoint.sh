@@ -7,6 +7,7 @@ XRAY_HTTP_PORT="${XRAY_HTTP_PORT:-2089}"
 SSH_PORT="${SSH_PORT:-22}"
 TUN_IFACE="${TUN_IFACE:-tun0}"
 SINGBOX_CONFIG="/etc/sing-box/config.json"
+XRAY_ADDR_FILE="/run/envd-xray-addr"
 UPLINK_GW=""
 UPLINK_DEV=""
 XRAY_ADDR=""
@@ -84,6 +85,7 @@ resolve_xray_host() {
     echo "Failed to resolve upstream host before sealing: ${XRAY_HOST}" >&2
     return 1
   fi
+  printf '%s\n' "${XRAY_ADDR}" >"${XRAY_ADDR_FILE}"
 }
 
 write_sealed_resolv_conf() {
@@ -124,11 +126,11 @@ apply_killswitch() {
   iptables -A INPUT -i "${TUN_IFACE}" -j ACCEPT
   iptables -A OUTPUT -o "${TUN_IFACE}" -j ACCEPT
 
-  # Allow only upstream SOCKS connection on the pre-tunnel interface.
-  # Matching by interface+port avoids pinning to a single xray container IP.
-  iptables -A OUTPUT -o "${uplink_dev}" -p tcp --dport "${XRAY_PORT}" -j ACCEPT
+  # Allow only the resolved local gateway endpoint before the tunnel is up.
+  # The sidecar is recreated when the gateway endpoint changes.
+  iptables -A OUTPUT -o "${uplink_dev}" -p tcp -d "${XRAY_ADDR}" --dport "${XRAY_PORT}" -j ACCEPT
   if [[ -n "${XRAY_HTTP_PORT}" && "${XRAY_HTTP_PORT}" != "${XRAY_PORT}" ]]; then
-    iptables -A OUTPUT -o "${uplink_dev}" -p tcp --dport "${XRAY_HTTP_PORT}" -j ACCEPT
+    iptables -A OUTPUT -o "${uplink_dev}" -p tcp -d "${XRAY_ADDR}" --dport "${XRAY_HTTP_PORT}" -j ACCEPT
   fi
 
   if command -v ip6tables >/dev/null 2>&1; then
