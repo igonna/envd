@@ -298,6 +298,9 @@ func (s stateStore) withStatePasswordMode(stderr io.Writer, saveOnFnErr bool, fn
 		_ = clearCachedMasterPassword()
 		return err
 	}
+	if err := cacheMasterPassword(password, unlockTTL()); err != nil {
+		return err
+	}
 	if err := fn(&st, password); err != nil {
 		if saveOnFnErr {
 			if saveErr := s.save(st, password); saveErr != nil {
@@ -670,12 +673,7 @@ func readMasterPassword(stderr io.Writer) ([]byte, error) {
 	if cached, ok := cachedMasterPassword(); ok {
 		return cached, nil
 	}
-	pw, err := readPasswordPrompt(stderr, "Master password: ")
-	if err != nil {
-		return nil, err
-	}
-	_ = cacheMasterPassword(pw, unlockTTL())
-	return pw, nil
+	return readPasswordPrompt(stderr, "Master password: ")
 }
 
 func readMasterPasswordUncached(stderr io.Writer) ([]byte, error) {
@@ -958,8 +956,8 @@ func handleUnlockAgentConn(conn net.Conn, password *[]byte, expires *time.Time) 
 }
 
 func readPasswordPrompt(stderr io.Writer, prompt string) ([]byte, error) {
-	fmt.Fprint(stderr, prompt)
 	if term.IsTerminal(int(syscall.Stdin)) {
+		fmt.Fprint(stderr, prompt)
 		pw, err := term.ReadPassword(int(syscall.Stdin))
 		fmt.Fprintln(stderr)
 		if err != nil {
@@ -970,6 +968,23 @@ func readPasswordPrompt(stderr io.Writer, prompt string) ([]byte, error) {
 		}
 		return pw, nil
 	}
+	if tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0); err == nil {
+		defer tty.Close()
+		fmt.Fprint(tty, prompt)
+		pw, err := term.ReadPassword(int(tty.Fd()))
+		fmt.Fprintln(tty)
+		if err != nil {
+			return nil, err
+		}
+		if len(pw) == 0 {
+			return nil, errors.New("empty master password is not allowed")
+		}
+		return pw, nil
+	}
+	if len(os.Args) > 1 && os.Args[1] == "ssh-proxy" {
+		return nil, errors.New("master password is not cached and no terminal is available; run `envd unlock`, then retry SSH")
+	}
+	fmt.Fprint(stderr, prompt)
 	var pw string
 	if _, err := fmt.Fscan(os.Stdin, &pw); err != nil {
 		return nil, err

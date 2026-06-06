@@ -756,6 +756,24 @@ func TestRedactSensitive(t *testing.T) {
 	}
 }
 
+func TestRedactDockerArgsHidesAuthorizedKey(t *testing.T) {
+	args := []string{
+		"run",
+		"-e", "ENVD_AUTHORIZED_KEY=ssh-ed25519 AAAATEST envd",
+		"-e", "DEV_USER=dev",
+	}
+	got := strings.Join(redactDockerArgs(args), " ")
+	if strings.Contains(got, "AAAATEST") {
+		t.Fatalf("authorized key leaked in docker args: %q", got)
+	}
+	if !strings.Contains(got, "ENVD_AUTHORIZED_KEY=<redacted>") {
+		t.Fatalf("authorized key was not redacted: %q", got)
+	}
+	if !strings.Contains(got, "DEV_USER=dev") {
+		t.Fatalf("non-sensitive arg was redacted: %q", got)
+	}
+}
+
 func TestRecordAssetMetadataEvents(t *testing.T) {
 	st := envdState{Assets: map[string]assetRecord{}}
 	meta := assetRecord{Image: "sshdev:24.04", ImageID: "sha256:aaaaaaaaaaaa1111", UpdatedAt: time.Now().UTC()}
@@ -938,7 +956,7 @@ func TestProfileDockerfile(t *testing.T) {
 }
 
 func TestDevContainerArgsBlockHostDockerAndHostAccessByDefault(t *testing.T) {
-	args, err := devContainerRunArgs("dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "plain", "envd-abc123-home", "envd-abc123-repo", "sealed", devImage, "ssh-ed25519 AAAATEST envd")
+	args, err := devContainerRunArgs("books", "dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "plain", "envd-abc123-home", "envd-abc123-repo", "sealed", devImage, "ssh-ed25519 AAAATEST envd")
 	if err != nil {
 		t.Fatalf("devContainerRunArgs failed: %v", err)
 	}
@@ -964,12 +982,13 @@ func TestDevContainerArgsBlockHostDockerAndHostAccessByDefault(t *testing.T) {
 		"-e COMPOSE_PROJECT_NAME=envd_abc123",
 		"-e ENVD_ENV_ID=abc123",
 		"-e ENVD_AUTHORIZED_KEY=ssh-ed25519 AAAATEST envd",
+		"--label envd.name=books",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("dev container args missing %q: %q", want, got)
 		}
 	}
-	args, err = devContainerRunArgs("dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "plain", "envd-abc123-home", "envd-abc123-repo", "direct", devImage, "")
+	args, err = devContainerRunArgs("books", "dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "plain", "envd-abc123-home", "envd-abc123-repo", "direct", devImage, "")
 	if err != nil {
 		t.Fatalf("direct devContainerRunArgs failed: %v", err)
 	}
@@ -1065,12 +1084,13 @@ func TestEmbeddedAssetContextMaterializesWithoutRepo(t *testing.T) {
 }
 
 func TestProjectDockerRunArgsUseSealedNamespaceAndEnvdStorage(t *testing.T) {
-	args := projectDockerRunArgs("abc123", "envd-abc123-docker", "envd-abc123-net", "envd-abc123-docker")
+	args := projectDockerRunArgs("books", "abc123", "envd-abc123-docker", "envd-abc123-net", "envd-abc123-docker")
 	got := strings.Join(args, " ")
 	for _, want := range []string{
 		"--network container:envd-abc123-net",
 		"-v envd-abc123-docker:/var/lib/docker",
 		"--label envd.role=project-docker",
+		"--label envd.name=books",
 		"envd-project-docker:27-rootless",
 		"--storage-driver=vfs",
 		"--dns=1.1.1.1",
@@ -1106,7 +1126,7 @@ func TestParseRunArgsProfile(t *testing.T) {
 }
 
 func TestDevContainerArgsProtectedStorageUsesEnvdVolumes(t *testing.T) {
-	args, err := devContainerRunArgs("dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "protected", "envd-abc123-home", "envd-abc123-repo", "offline", devImage, "")
+	args, err := devContainerRunArgs("books", "dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "protected", "envd-abc123-home", "envd-abc123-repo", "offline", devImage, "")
 	if err != nil {
 		t.Fatalf("protected devContainerRunArgs failed: %v", err)
 	}

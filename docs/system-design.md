@@ -1907,8 +1907,8 @@ Host books
 
 Rules:
 
-- `envd start <env>`, `envd start <env>`, and `envd unlock` install/update normal
-  OpenSSH config for `ssh <env>`.
+- `envd start <env>` and `envd unlock` install/update normal OpenSSH config for
+  `ssh <env>`.
 - Generated SSH config should expose exactly one human target per environment,
   for example `Host books`, and never expose a durable host SSH listener.
 - The proxy must require envd to be unlocked.

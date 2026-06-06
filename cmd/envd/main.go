@@ -431,7 +431,7 @@ func (a app) restoreUnlockedEnvs() (int, int, error) {
 				restored++
 				continue
 			}
-			if err := ensureEnvSSHConfig(name, currentEnvdExecutable()); err != nil {
+			if err := repairEnvSSHAccessForRef(ref); err != nil {
 				failed++
 				failures = append(failures, name+": "+redactSensitive(err.Error()))
 				continue
@@ -840,11 +840,13 @@ func (a app) runDoctor(args []string, st *envdState) error {
 			host := hostForClient(cfg.BindIP)
 			checks = append(checks,
 				a.probeGatewayRender(cfg),
+				a.probeGatewayRuntime(st),
 				a.probeGatewayPortConflicts(cfg),
 				a.probeGatewayPorts(cfg),
 				probeTCP("Host SOCKS TCP", net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort)), 3*time.Second),
 				probeTCP("Host HTTP TCP", net.JoinHostPort(host, strconv.Itoa(cfg.HTTPHostPort)), 3*time.Second),
 			)
+			checks = append(checks, a.probeEnvWorkloads(st)...)
 			if *deep {
 				checks = append(checks,
 					probeSOCKS("Host SOCKS", net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort)), "api.ipify.org:443", 10*time.Second),
@@ -865,12 +867,12 @@ func (a app) runDoctor(args []string, st *envdState) error {
 		if c.Err != nil {
 			ok = false
 			currentFailures[c.Name] = redactSensitive(c.Err.Error())
-			fmt.Fprintf(a.stdout, "%-18s FAIL %s\n", c.Name, redactSensitive(c.Err.Error()))
+			fmt.Fprintf(a.stdout, "%-22s FAIL %s\n", c.Name, redactSensitive(c.Err.Error()))
 			if next := nextActionForError(c.Err); next != "" {
-				fmt.Fprintf(a.stdout, "%-18s      Next: %s\n", "", next)
+				fmt.Fprintf(a.stdout, "%-22s      Next: %s\n", "", next)
 			}
 		} else {
-			fmt.Fprintf(a.stdout, "%-18s OK   %s\n", c.Name, c.Detail)
+			fmt.Fprintf(a.stdout, "%-22s OK   %s\n", c.Name, c.Detail)
 		}
 	}
 	recordDoctorEvents(st, currentFailures)
@@ -991,12 +993,26 @@ func (a app) listEnvs(args []string, st *envdState) error {
 		return err
 	}
 	fmt.Fprintf(a.stdout, "%-18s %-10s %-8s %-8s %-8s %-5s %-18s %-14s %-14s %s\n", "NAME", "STATE", "NET", "VPN", "STORAGE", "GEN", "EGRESS", "IMAGE", "IMAGE_ID", "ISSUE")
+	seen := map[string]bool{}
 	for _, env := range envs {
+		seen[env.Name] = true
 		netState := env.networkMode()
 		vpn := env.netHealth()
 		issue := env.issue(st.GatewayGeneration)
 		fmt.Fprintf(a.stdout, "%-18s %-10s %-8s %-8s %-8s %-5d %-18s %-14s %-14s %s\n",
 			env.Name, env.Dev.State.Status, netState, vpn, "plain", st.GatewayGeneration, env.egressSummary(), shortImage(env.Dev.Config.Image), shortID(env.Dev.Image), issue)
+	}
+	for _, name := range sortedEnvNames(st) {
+		if seen[name] {
+			continue
+		}
+		rec := st.Environments[name]
+		ref, err := resolveEnvRef(st, name)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(a.stdout, "%-18s %-10s %-8s %-8s %-8s %-5d %-18s %-14s %-14s %s\n",
+			name, "missing", networkOrSealed(rec.Network), "blocked", storageOrPlain(rec.Storage), st.GatewayGeneration, "-", shortImage(imageOrDefault(rec.Image)), "-", missingEnvIssue(ref))
 	}
 	return nil
 }
@@ -1096,6 +1112,9 @@ func (a app) runEnv(args []string, st *envdState) error {
 		}
 	}
 	if network == "sealed" {
+		if err := a.ensureActiveGatewayRuntime(st); err != nil {
+			return err
+		}
 		if err := ensureDockerNetwork(gatewayNet); err != nil {
 			return err
 		}
@@ -1153,14 +1172,14 @@ func (a app) runEnv(args []string, st *envdState) error {
 	}
 
 	if network == "sealed" {
-		if err := createSidecar(id, netName); err != nil {
+		if err := createSidecar(name, id, netName); err != nil {
 			return err
 		}
-		if err := a.createProjectDocker(id, projectDockerContainerName(id), netName, dockerVol); err != nil {
+		if err := a.createProjectDocker(name, id, projectDockerContainerName(id), netName, dockerVol); err != nil {
 			return err
 		}
 	}
-	if err := a.createDevContainer("dev", id, devName, netName, storage, homeSource, repoSource, network, image); err != nil {
+	if err := a.createDevContainer(name, "dev", id, devName, netName, storage, homeSource, repoSource, network, image); err != nil {
 		return err
 	}
 	if network == "sealed" {
@@ -1206,9 +1225,6 @@ func (a app) runEnv(args []string, st *envdState) error {
 	if profile != "" {
 		fmt.Fprintf(a.stdout, "Profile: %s generation %d\n", profile, profileGeneration)
 	}
-	if network == "sealed" {
-		fmt.Fprintf(a.stdout, "Sidecar: %s\n", netName)
-	}
 	return nil
 }
 
@@ -1241,11 +1257,20 @@ func (a app) startEnv(args []string, st *envdState) error {
 	networkMode := ""
 	env, err := inspectEnv(st, name)
 	if err != nil {
-		if ref.Storage != "protected" || containerExists(ref.DevName) {
-			return err
-		}
 		if rec, ok := st.Environments[name]; ok {
 			networkMode = rec.Network
+		}
+		if networkMode == "" {
+			networkMode = "sealed"
+		}
+		if ref.Storage != "protected" && !canRepairPlainEnv(ref) {
+			if !ref.Legacy {
+				return plainEnvDataMissingError(ref)
+			}
+			return err
+		}
+		if ref.Storage == "protected" && containerExists(ref.DevName) {
+			return err
 		}
 	} else {
 		networkMode = env.networkMode()
@@ -1262,6 +1287,9 @@ func (a app) startEnv(args []string, st *envdState) error {
 			if rec, ok := st.Environments[name]; ok && rec.Image != "" {
 				image = rec.Image
 			}
+			if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[0]); err != nil {
+				return err
+			}
 			if networkMode == "sealed" {
 				if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[1]); err != nil {
 					return err
@@ -1269,11 +1297,14 @@ func (a app) startEnv(args []string, st *envdState) error {
 				if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[2]); err != nil {
 					return err
 				}
+				if err := a.ensureActiveGatewayRuntime(st); err != nil {
+					return err
+				}
 				if err := ensureDockerNetwork(gatewayNet); err != nil {
 					return err
 				}
 				if !containerExists(ref.NetName) {
-					if err := createSidecar(ref.ID, ref.NetName); err != nil {
+					if err := createSidecar(name, ref.ID, ref.NetName); err != nil {
 						return err
 					}
 				} else {
@@ -1288,7 +1319,7 @@ func (a app) startEnv(args []string, st *envdState) error {
 					return err
 				}
 			}
-			if err := a.createDevContainer(ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, networkMode, image); err != nil {
+			if err := a.createDevContainer(name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, networkMode, image); err != nil {
 				return err
 			}
 			if networkMode == "sealed" {
@@ -1297,7 +1328,7 @@ func (a app) startEnv(args []string, st *envdState) error {
 				}
 			}
 			touchEnvUsed(st, name, time.Now().UTC())
-			if err := ensureEnvSSHConfig(name, currentEnvdExecutable()); err != nil {
+			if err := repairEnvSSHAccessForRef(ref); err != nil {
 				return err
 			}
 			st.addEvent("env", name, "started from protected storage")
@@ -1311,6 +1342,9 @@ func (a app) startEnv(args []string, st *envdState) error {
 			return err
 		}
 		if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[2]); err != nil {
+			return err
+		}
+		if err := a.ensureActiveGatewayRuntime(st); err != nil {
 			return err
 		}
 		if err := ensureDockerNetwork(gatewayNet); err != nil {
@@ -1332,7 +1366,7 @@ func (a app) startEnv(args []string, st *envdState) error {
 				return err
 			}
 			touchEnvUsed(st, name, time.Now().UTC())
-			if err := ensureEnvSSHConfig(name, currentEnvdExecutable()); err != nil {
+			if err := repairEnvSSHAccessForRef(ref); err != nil {
 				return err
 			}
 			st.addEvent("env", name, "recreated sealed runtime before start: "+reason)
@@ -1350,6 +1384,17 @@ func (a app) startEnv(args []string, st *envdState) error {
 		if err := a.ensureProjectDocker(ref); err != nil {
 			return err
 		}
+	} else if !containerExists(ref.DevName) {
+		if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[0]); err != nil {
+			return err
+		}
+		image := devImage
+		if rec, ok := st.Environments[name]; ok && rec.Image != "" {
+			image = rec.Image
+		}
+		if err := a.createDevContainer(name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, networkMode, image); err != nil {
+			return err
+		}
 	}
 	for _, cmd := range devStartCommandsForMode(networkMode, ref.DevName) {
 		if err := dockerRun(cmd...); err != nil {
@@ -1357,7 +1402,7 @@ func (a app) startEnv(args []string, st *envdState) error {
 		}
 	}
 	touchEnvUsed(st, name, time.Now().UTC())
-	if err := ensureEnvSSHConfig(name, currentEnvdExecutable()); err != nil {
+	if err := repairEnvSSHAccessForRef(ref); err != nil {
 		return err
 	}
 	st.addEvent("env", name, "started")
@@ -1366,22 +1411,80 @@ func (a app) startEnv(args []string, st *envdState) error {
 	return nil
 }
 
+func canRepairPlainEnv(ref envRef) bool {
+	if ref.Legacy {
+		return false
+	}
+	return volumeExists(ref.HomeVol) && volumeExists(ref.RepoVol) && volumeExists(ref.ProjectDockerVol)
+}
+
+func plainEnvDataMissingError(ref envRef) error {
+	missing := []string{}
+	for _, vol := range []string{ref.HomeVol, ref.RepoVol, ref.ProjectDockerVol} {
+		if !volumeExists(vol) {
+			missing = append(missing, vol)
+		}
+	}
+	if len(missing) == 0 {
+		return fmt.Errorf("environment %q container is missing and could not be inspected", ref.Name)
+	}
+	return fmt.Errorf("environment %q data was deleted from Docker Desktop: missing volume(s): %s", ref.Name, strings.Join(missing, ", "))
+}
+
+func missingEnvIssue(ref envRef) string {
+	if ref.Storage != "protected" && !canRepairPlainEnv(ref) {
+		missing := []string{}
+		for _, vol := range []string{ref.HomeVol, ref.RepoVol, ref.ProjectDockerVol} {
+			if !volumeExists(vol) {
+				missing = append(missing, vol)
+			}
+		}
+		if len(missing) > 0 {
+			return "data deleted: " + strings.Join(missing, ",")
+		}
+	}
+	return "container missing; run envd start " + ref.Name
+}
+
+func networkOrSealed(network string) string {
+	if strings.TrimSpace(network) == "" {
+		return "sealed"
+	}
+	return network
+}
+
+func imageOrDefault(image string) string {
+	if strings.TrimSpace(image) == "" {
+		return devImage
+	}
+	return image
+}
+
 func (a app) recreateSealedRuntime(st *envdState, name string, ref envRef, reason string) error {
 	image := devImage
 	if rec, ok := st.Environments[name]; ok && rec.Image != "" {
 		image = rec.Image
 	}
+	if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[0]); err != nil {
+		return err
+	}
+	if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[1]); err != nil {
+		return err
+	}
+	if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[2]); err != nil {
+		return err
+	}
 	_ = dockerRun("stop", ref.DevName)
 	_ = dockerRun("rm", "-f", ref.DevName)
 	_ = dockerRun("rm", "-f", ref.ProjectDockerName)
 	_ = dockerRun("rm", "-f", ref.NetName)
-	if err := createSidecar(ref.ID, ref.NetName); err != nil {
+	if err := createSidecar(name, ref.ID, ref.NetName); err != nil {
 		return err
 	}
-	if err := a.createProjectDocker(ref.ID, ref.ProjectDockerName, ref.NetName, ref.ProjectDockerVol); err != nil {
+	if err := a.createProjectDocker(name, ref.ID, ref.ProjectDockerName, ref.NetName, ref.ProjectDockerVol); err != nil {
 		return err
 	}
-	if err := a.createDevContainer(ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, "sealed", image); err != nil {
+	if err := a.createDevContainer(name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, "sealed", image); err != nil {
 		return err
 	}
 	if err := verifySealedEnv(ref.DevName); err != nil {
@@ -1455,10 +1558,10 @@ func (a app) networkEnv(args []string, st *envdState, password []byte) error {
 		_ = dockerRun("rm", "-f", ref.NetName)
 	}
 	if mode == "sealed" {
-		if err := createSidecar(ref.ID, ref.NetName); err != nil {
+		if err := createSidecar(name, ref.ID, ref.NetName); err != nil {
 			return err
 		}
-		if err := a.createProjectDocker(ref.ID, ref.ProjectDockerName, ref.NetName, ref.ProjectDockerVol); err != nil {
+		if err := a.createProjectDocker(name, ref.ID, ref.ProjectDockerName, ref.NetName, ref.ProjectDockerVol); err != nil {
 			return err
 		}
 	}
@@ -1466,7 +1569,7 @@ func (a app) networkEnv(args []string, st *envdState, password []byte) error {
 	if rec, ok := st.Environments[name]; ok && rec.Image != "" {
 		image = rec.Image
 	}
-	if err := a.createDevContainer(ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, mode, image); err != nil {
+	if err := a.createDevContainer(name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, mode, image); err != nil {
 		return err
 	}
 	if mode == "sealed" {
@@ -1668,7 +1771,7 @@ func (a app) suggestEnvPackages(st *envdState, envName string) ([]profilePackage
 	return uniqueProfilePackages(pkgs), nil
 }
 
-func createSidecar(id, netName string) error {
+func createSidecar(envName, id, netName string) error {
 	port, err := pickPort(2223, 2299)
 	if err != nil {
 		return err
@@ -1677,6 +1780,7 @@ func createSidecar(id, netName string) error {
 		"--name", netName,
 		"--label", "envd.managed=true",
 		"--label", "envd.role=net",
+		"--label", "envd.name="+envName,
 		"--label", "envd.id="+id,
 		"--restart", "unless-stopped",
 		"--network", gatewayNet,
@@ -1693,33 +1797,41 @@ func createSidecar(id, netName string) error {
 	return waitForHealthy(netName, 90*time.Second)
 }
 
-func (a app) createDevContainer(userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image string) error {
+func (a app) createDevContainer(envName, userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image string) error {
 	authKey, err := ensureEnvdSSHKey()
 	if err != nil {
 		return err
 	}
-	argsRun, err := devContainerRunArgs(userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image, authKey.PublicKey)
+	if err := removeEnvKnownHost(envName); err != nil {
+		return err
+	}
+	argsRun, err := devContainerRunArgs(envName, userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image, authKey.PublicKey)
 	if err != nil {
 		return err
 	}
-	return dockerRun(argsRun...)
+	if err := dockerRun(argsRun...); err != nil {
+		return err
+	}
+	ref := envRef{Name: envName, UserName: userName, DevName: devName}
+	return ensureEnvAuthorizedKey(ref)
 }
 
-func (a app) createProjectDocker(id, dockerName, netName, dockerVol string) error {
+func (a app) createProjectDocker(envName, id, dockerName, netName, dockerVol string) error {
 	if err := a.ensureRuntimeAsset(runtimeAssets[2]); err != nil {
 		return err
 	}
-	if err := dockerRun(projectDockerRunArgs(id, dockerName, netName, dockerVol)...); err != nil {
+	if err := dockerRun(projectDockerRunArgs(envName, id, dockerName, netName, dockerVol)...); err != nil {
 		return err
 	}
 	return waitForProjectDocker(dockerName, 90*time.Second)
 }
 
-func projectDockerRunArgs(id, dockerName, netName, dockerVol string) []string {
+func projectDockerRunArgs(envName, id, dockerName, netName, dockerVol string) []string {
 	return []string{"run", "-d",
 		"--name", dockerName,
 		"--label", "envd.managed=true",
 		"--label", "envd.role=project-docker",
+		"--label", "envd.name=" + envName,
 		"--label", "envd.id=" + id,
 		"--restart", "unless-stopped",
 		"--privileged",
@@ -1737,7 +1849,7 @@ func projectDockerRunArgs(id, dockerName, netName, dockerVol string) []string {
 
 func (a app) ensureProjectDocker(ref envRef) error {
 	if !containerExists(ref.ProjectDockerName) {
-		return a.createProjectDocker(ref.ID, ref.ProjectDockerName, ref.NetName, ref.ProjectDockerVol)
+		return a.createProjectDocker(ref.Name, ref.ID, ref.ProjectDockerName, ref.NetName, ref.ProjectDockerVol)
 	}
 	if dockerContainerStatus(ref.ProjectDockerName) != "running" {
 		if err := dockerRun("start", ref.ProjectDockerName); err != nil {
@@ -1747,7 +1859,7 @@ func (a app) ensureProjectDocker(ref envRef) error {
 	return waitForProjectDocker(ref.ProjectDockerName, 60*time.Second)
 }
 
-func devContainerRunArgs(userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image, authorizedKey string) ([]string, error) {
+func devContainerRunArgs(envName, userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image, authorizedKey string) ([]string, error) {
 	repoMount := "/home/" + userName + "/repo"
 	if !validStorageMode(storageMode) {
 		return nil, fmt.Errorf("invalid storage mode %q", storageMode)
@@ -1757,6 +1869,7 @@ func devContainerRunArgs(userName, id, devName, netName, storageMode, homeSource
 		"--name", devName,
 		"--label", "envd.managed=true",
 		"--label", "envd.role=dev",
+		"--label", "envd.name=" + envName,
 		"--label", "envd.id=" + id,
 		"--label", "envd.network=" + networkMode,
 		"--label", "envd.storage=" + storageMode,
@@ -2631,6 +2744,9 @@ func prepareSSHProxyDockerArgs(args []string, st *envdState) ([]string, error) {
 	if env.Dev.State.Status != "running" {
 		return nil, fmt.Errorf("environment %q is not running; start it first with: envd start %s", name, name)
 	}
+	if err := ensureEnvAuthorizedKey(ref); err != nil {
+		return nil, err
+	}
 	return []string{
 		"exec", "-i", ref.DevName,
 		"bash", "-lc", "exec 3<>/dev/tcp/127.0.0.1/22; cat <&3 & cat >&3; kill $! 2>/dev/null || true",
@@ -2695,6 +2811,26 @@ func ensureEnvSSHConfig(envName, envdPath string) error {
 	}
 	block := envdSSHHostBlock(envName, envdPath, knownHosts, keyPath)
 	return upsertManagedSSHBlock(envdConfig, envName, block)
+}
+
+func removeEnvKnownHost(envName string) error {
+	if err := validateEnvName(envName); err != nil {
+		return err
+	}
+	_, _, _, knownHosts, _, _, err := sshConfigPaths()
+	if err != nil {
+		return err
+	}
+	if !fileExists(knownHosts) {
+		return nil
+	}
+	alias := "envd-" + envName
+	cmd := exec.Command("ssh-keygen", "-R", alias, "-f", knownHosts)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("remove old SSH host key for %s: %w\n%s", alias, err, strings.TrimSpace(string(out)))
+	}
+	_ = os.Remove(knownHosts + ".old")
+	return nil
 }
 
 func ensureEnvdSSHKey() (envdSSHKey, error) {
@@ -2971,11 +3107,11 @@ func (a app) runMigrateEnvProfile(args []string, st *envdState, password []byte)
 	_ = dockerRun("rm", "-f", ref.DevName)
 	if mode == "sealed" {
 		_ = dockerRun("rm", "-f", ref.NetName)
-		if err := createSidecar(ref.ID, ref.NetName); err != nil {
+		if err := createSidecar(name, ref.ID, ref.NetName); err != nil {
 			return err
 		}
 	}
-	if err := a.createDevContainer(ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, mode, image); err != nil {
+	if err := a.createDevContainer(name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, mode, image); err != nil {
 		return err
 	}
 	if mode == "sealed" {
@@ -6030,6 +6166,108 @@ func (a app) probeGatewayRender(cfg gatewayConfig) probeResult {
 	return probeResult{Name: "Gateway render", Detail: provider.Name() + " config " + strconv.Itoa(len(rendered)) + " bytes"}
 }
 
+func (a app) probeGatewayRuntime(st *envdState) probeResult {
+	if err := a.ensureActiveGatewayRuntime(st); err != nil {
+		return probeResult{Name: "Gateway runtime", Err: err}
+	}
+	return probeResult{Name: "Gateway runtime", Detail: "rendered and running"}
+}
+
+func (a app) probeEnvWorkloads(st *envdState) []probeResult {
+	names := sortedEnvNames(st)
+	if len(names) == 0 {
+		return []probeResult{{Name: "Environments", Detail: "none"}}
+	}
+	results := make([]probeResult, 0, len(names))
+	for _, name := range names {
+		ref, err := resolveEnvRef(st, name)
+		if err != nil {
+			results = append(results, probeResult{Name: "Env " + name, Err: err})
+			continue
+		}
+		rec := st.Environments[name]
+		if envNeedsStart(ref, rec.Network) {
+			repairApp := a
+			repairApp.stdout = io.Discard
+			if err := repairApp.startEnv([]string{name}, st); err != nil {
+				results = append(results, probeResult{Name: "Env " + name, Err: err})
+				continue
+			}
+			results = append(results, probeResult{Name: "Env " + name, Detail: networkOrSealed(rec.Network) + " repaired and running"})
+			continue
+		}
+		if err := repairEnvSSHAccessForRef(ref); err != nil {
+			results = append(results, probeResult{Name: "Env " + name, Err: err})
+			continue
+		}
+		devStatus := dockerContainerStatus(ref.DevName)
+		if devStatus == "missing" {
+			results = append(results, probeResult{Name: "Env " + name, Err: fmt.Errorf("%s", missingEnvIssue(ref))})
+			continue
+		}
+		if rec.Network == "sealed" {
+			netStatus := dockerContainerStatus(ref.NetName)
+			if netStatus == "missing" {
+				results = append(results, probeResult{Name: "Env " + name, Err: fmt.Errorf("sidecar missing; run envd start %s", name)})
+				continue
+			}
+			if netStatus != "running" {
+				results = append(results, probeResult{Name: "Env " + name, Err: fmt.Errorf("sidecar %s; run envd start %s", netStatus, name)})
+				continue
+			}
+		}
+		if devStatus == "running" {
+			results = append(results, probeResult{Name: "Env " + name, Detail: networkOrSealed(rec.Network) + " running"})
+		} else {
+			results = append(results, probeResult{Name: "Env " + name, Detail: networkOrSealed(rec.Network) + " " + devStatus + "; run envd start " + name})
+		}
+	}
+	return results
+}
+
+func repairEnvSSHAccess(name string) error {
+	if err := removeEnvKnownHost(name); err != nil {
+		return err
+	}
+	return ensureEnvSSHConfig(name, currentEnvdExecutable())
+}
+
+func repairEnvSSHAccessForRef(ref envRef) error {
+	if err := repairEnvSSHAccess(ref.Name); err != nil {
+		return err
+	}
+	if containerExists(ref.DevName) && dockerContainerStatus(ref.DevName) == "running" {
+		return ensureEnvAuthorizedKey(ref)
+	}
+	return nil
+}
+
+func ensureEnvAuthorizedKey(ref envRef) error {
+	authKey, err := ensureEnvdSSHKey()
+	if err != nil {
+		return err
+	}
+	userName := ref.UserName
+	if userName == "" {
+		userName = "dev"
+	}
+	script := `
+set -eu
+home_dir="/home/${DEV_USER}"
+ssh_dir="${home_dir}/.ssh"
+authorized_keys="${ssh_dir}/authorized_keys"
+mkdir -p "${ssh_dir}"
+touch "${authorized_keys}"
+if ! grep -qxF "${ENVD_AUTHORIZED_KEY}" "${authorized_keys}" 2>/dev/null; then
+  printf '%s\n' "${ENVD_AUTHORIZED_KEY}" >> "${authorized_keys}"
+fi
+chown -R "${DEV_USER}:${DEV_USER}" "${ssh_dir}"
+chmod 700 "${ssh_dir}"
+chmod 600 "${authorized_keys}"
+`
+	return dockerRun("exec", "-e", "DEV_USER="+userName, "-e", "ENVD_AUTHORIZED_KEY="+authKey.PublicKey, ref.DevName, "sh", "-lc", script)
+}
+
 func (a app) probeGatewayPorts(cfg gatewayConfig) probeResult {
 	if dockerContainerStatus("vpn-gateway-xray-1") == "missing" {
 		return probeResult{Name: "Gateway ports", Err: layerErr("local gateway", fmt.Errorf("vpn-gateway-xray-1 is missing"))}
@@ -6180,9 +6418,22 @@ func dockerContainerStatus(name string) string {
 func dockerRun(args ...string) error {
 	cmd := exec.Command("docker", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("docker %s failed: %w\n%s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("docker %s failed: %w\n%s", strings.Join(redactDockerArgs(args), " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func redactDockerArgs(args []string) []string {
+	redacted := append([]string(nil), args...)
+	for i, arg := range redacted {
+		if strings.HasPrefix(arg, "ENVD_AUTHORIZED_KEY=") {
+			redacted[i] = "ENVD_AUTHORIZED_KEY=<redacted>"
+		}
+		if arg == "-e" && i+1 < len(redacted) && strings.HasPrefix(redacted[i+1], "ENVD_AUTHORIZED_KEY=") {
+			redacted[i+1] = "ENVD_AUTHORIZED_KEY=<redacted>"
+		}
+	}
+	return redacted
 }
 
 func containerExists(name string) bool {
@@ -7911,6 +8162,21 @@ func (a app) materializeGatewayRuntime(cfg gatewayConfig) (string, error) {
 		return "", err
 	}
 	return dir, nil
+}
+
+func (a app) ensureActiveGatewayRuntime(st *envdState) error {
+	cfg, _, err := a.activeGatewayConfig(st)
+	if err != nil {
+		return err
+	}
+	runtimeDir, err := a.materializeGatewayRuntime(cfg)
+	if err != nil {
+		return layerErr("local gateway", err)
+	}
+	if err := startGatewayRuntime(runtimeDir); err != nil {
+		return layerErr("local gateway", err)
+	}
+	return nil
 }
 
 func gatewayRuntimeDir() (string, error) {
