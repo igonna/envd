@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -244,6 +245,8 @@ func (a app) run(args []string) error {
 		return nil
 	case "init":
 		return a.runInit(args[1:])
+	case "unlock":
+		return a.runUnlock(args[1:])
 	case "password":
 		return a.runPassword(args[1:])
 	case "reset-state":
@@ -326,11 +329,6 @@ func (a app) run(args []string) error {
 		return a.runShell(args[1:])
 	case "ssh-proxy":
 		return a.runSSHProxy(args[1:])
-	case "code":
-		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
-			return a.printCommandHelp([]string{"code"})
-		}
-		return a.withState(func(st *envdState) error { return a.runCode(args[1:], st) })
 	case "network":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"network"})
@@ -382,6 +380,87 @@ func (a app) runInit(args []string) error {
 	}
 	fmt.Fprintf(a.stdout, "Initialized encrypted envd state: %s\n", path)
 	return nil
+}
+
+func (a app) runUnlock(args []string) error {
+	if len(args) > 0 && isHelpArg(args[0]) {
+		fmt.Fprint(a.stdout, "Usage: envd unlock\n\nRestores envd SSH targets/workloads after lock and caches the master password briefly.\n")
+		return nil
+	}
+	if len(args) != 0 {
+		return fmt.Errorf("usage: envd unlock")
+	}
+	store, err := newStateStore()
+	if err != nil {
+		return err
+	}
+	_, ttl, cached, err := store.unlock(a.stderr)
+	if err != nil {
+		return err
+	}
+	restored, failed, restoreErr := a.restoreUnlockedEnvs()
+	if cached {
+		fmt.Fprintf(a.stdout, "Unlocked: access restored; password cached for %s\n", ttl.Round(time.Second))
+	} else {
+		fmt.Fprintln(a.stdout, "Unlocked: access restored; cache disabled")
+	}
+	fmt.Fprintf(a.stdout, "Environments: %d available\n", restored)
+	if failed > 0 {
+		fmt.Fprintf(a.stdout, "Failed: %d environments need manual start\n", failed)
+	}
+	if restoreErr != nil {
+		return restoreErr
+	}
+	return nil
+}
+
+func (a app) restoreUnlockedEnvs() (int, int, error) {
+	restored := 0
+	failed := 0
+	var failures []string
+	err := a.withState(func(st *envdState) error {
+		for _, name := range sortedEnvNames(st) {
+			ref, err := resolveEnvRef(st, name)
+			if err != nil {
+				continue
+			}
+			rec := st.Environments[name]
+			if !envCanBeExposedAfterUnlock(ref, rec) {
+				continue
+			}
+			if envNeedsStart(ref, rec.Network) {
+				if err := a.startEnv([]string{name}, st); err != nil {
+					failed++
+					failures = append(failures, name+": "+redactSensitive(err.Error()))
+					continue
+				}
+				restored++
+				continue
+			}
+			if err := ensureEnvSSHConfig(name, currentEnvdExecutable()); err != nil {
+				failed++
+				failures = append(failures, name+": "+redactSensitive(err.Error()))
+				continue
+			}
+			touchEnvUsed(st, name, time.Now().UTC())
+			restored++
+		}
+		return nil
+	})
+	if err != nil {
+		return restored, failed, err
+	}
+	if failed > 0 {
+		return restored, failed, fmt.Errorf("unlock restored %d environments; failed %d: %s", restored, failed, strings.Join(failures, "; "))
+	}
+	return restored, failed, nil
+}
+
+func envCanBeExposedAfterUnlock(ref envRef, rec envRecord) bool {
+	if rec.Storage == "protected" {
+		return true
+	}
+	return containerExists(ref.DevName) || containerExists(ref.NetName) || containerExists(ref.ProjectDockerName)
 }
 
 func (a app) runPassword(args []string) error {
@@ -539,18 +618,42 @@ Start:
   envd run books
   envd shell books
 
-Commands:
+Setup:
   init                 create encrypted state
-  gateway              install/use/list gateways
+  unlock               restore access after lock
+  password             change master password
+  reset-state          reset forgotten-password state
+
+Environment:
   run                  create or start an environment
   shell                open a shell or run a command
   ps                   list environments
-  doctor               diagnose what is broken
+  inspect              show environment details
+  start                start an environment
+  stop                 stop an environment
+  rm                   remove an environment
   lock                 stop envd-managed workloads
-  proxy                show/test local proxy ports
 
-More:
-  code, pkg, network, identity, internet, hosting, migrate, events, why
+Gateway:
+  gateway              install/use/list gateways
+  proxy                show/test local proxy ports
+  user                 print app import URIs
+
+Diagnostics:
+  doctor               diagnose what is broken
+  why                  explain an environment state
+  events               show encrypted event log
+  internet             check direct/gateway reachability
+  hosting              check hosting provider reachability
+
+Advanced:
+  network              change network mode
+  pkg                  manage package profiles
+  identity             manage encrypted identities
+  migrate              adopt legacy envd containers
+  supervisor           stop idle workloads
+  version              print version
+  help                 show help
 
 Run envd help COMMAND for usage.
 
@@ -565,6 +668,8 @@ func (a app) printCommandHelp(args []string) error {
 	switch args[0] {
 	case "init":
 		fmt.Fprint(a.stdout, "Usage: envd init\n\nCreates encrypted envd state and asks for the master password twice.\n")
+	case "unlock":
+		fmt.Fprint(a.stdout, "Usage: envd unlock\n\nRestores envd SSH targets/workloads after lock and caches the master password briefly.\n")
 	case "password":
 		fmt.Fprint(a.stdout, `Usage: envd password change
 
@@ -619,7 +724,7 @@ Next command: envd init
 	case "rm":
 		fmt.Fprint(a.stdout, "Usage: envd rm ENV --yes\n")
 	case "lock":
-		fmt.Fprint(a.stdout, "Usage: envd lock\n\nStops envd-managed workloads, active envd shells, and clears cached unlock.\n")
+		fmt.Fprint(a.stdout, "Usage: envd lock\n\nStops envd-managed workloads, hides envd SSH targets, and clears cached unlock.\n")
 	case "doctor":
 		fmt.Fprint(a.stdout, "Usage:\n  envd doctor\n  envd doctor --deep\n")
 	case "why":
@@ -634,8 +739,6 @@ Next command: envd init
 		fmt.Fprint(a.stdout, "Usage: envd network set ENV sealed|direct|offline\n")
 	case "pkg":
 		fmt.Fprint(a.stdout, "Usage:\n  envd pkg add PROFILE apt:PACKAGE\n  envd pkg add PROFILE npm:PACKAGE\n  envd pkg add PROFILE tool:NAME\n  envd pkg suggest ENV\n  envd pkg promote ENV --to PROFILE\n")
-	case "code":
-		fmt.Fprint(a.stdout, "Usage:\n  envd code ENV --print\n  envd code ENV --launch\n")
 	case "ssh-proxy":
 		fmt.Fprint(a.stdout, "Usage: envd ssh-proxy ENV\n")
 	case "identity":
@@ -1099,11 +1202,15 @@ func (a app) runEnv(args []string, st *envdState) error {
 		message += " with profile " + profile + " generation " + strconv.Itoa(profileGeneration)
 	}
 	st.addEvent("env", name, message)
+	if err := ensureEnvSSHConfig(name, currentEnvdExecutable()); err != nil {
+		return err
+	}
 
 	ok = true
 	fmt.Fprintf(a.stdout, "Created: %s\n", name)
 	fmt.Fprintf(a.stdout, "Network: %s\n", network)
 	fmt.Fprintf(a.stdout, "Storage: %s\n", storage)
+	fmt.Fprintf(a.stdout, "SSH:     ssh %s\n", name)
 	if storage == "protected" {
 		fmt.Fprintf(a.stdout, "Storage backend: %s\n", protected.Backend)
 	}
@@ -1187,8 +1294,12 @@ func (a app) startEnv(args []string, st *envdState) error {
 				}
 			}
 			touchEnvUsed(st, name, time.Now().UTC())
+			if err := ensureEnvSSHConfig(name, currentEnvdExecutable()); err != nil {
+				return err
+			}
 			st.addEvent("env", name, "started from protected storage")
 			fmt.Fprintf(a.stdout, "Started: %s\n", name)
+			fmt.Fprintf(a.stdout, "SSH:     ssh %s\n", name)
 			return nil
 		}
 	}
@@ -1218,9 +1329,13 @@ func (a app) startEnv(args []string, st *envdState) error {
 				return err
 			}
 			touchEnvUsed(st, name, time.Now().UTC())
+			if err := ensureEnvSSHConfig(name, currentEnvdExecutable()); err != nil {
+				return err
+			}
 			st.addEvent("env", name, "recreated sealed runtime before start: "+reason)
 			fmt.Fprintf(a.stdout, "Recreated sealed runtime: %s\n", reason)
 			fmt.Fprintf(a.stdout, "Started: %s\n", name)
+			fmt.Fprintf(a.stdout, "SSH:     ssh %s\n", name)
 			return nil
 		}
 		if err := dockerRun("start", ref.NetName); err != nil {
@@ -1239,8 +1354,12 @@ func (a app) startEnv(args []string, st *envdState) error {
 		}
 	}
 	touchEnvUsed(st, name, time.Now().UTC())
+	if err := ensureEnvSSHConfig(name, currentEnvdExecutable()); err != nil {
+		return err
+	}
 	st.addEvent("env", name, "started")
 	fmt.Fprintf(a.stdout, "Started: %s\n", name)
+	fmt.Fprintf(a.stdout, "SSH:     ssh %s\n", name)
 	return nil
 }
 
@@ -1572,7 +1691,11 @@ func createSidecar(id, netName string) error {
 }
 
 func (a app) createDevContainer(userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image string) error {
-	argsRun, err := devContainerRunArgs(userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image)
+	authKey, err := ensureEnvdSSHKey()
+	if err != nil {
+		return err
+	}
+	argsRun, err := devContainerRunArgs(userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image, authKey.PublicKey)
 	if err != nil {
 		return err
 	}
@@ -1621,7 +1744,7 @@ func (a app) ensureProjectDocker(ref envRef) error {
 	return waitForProjectDocker(ref.ProjectDockerName, 60*time.Second)
 }
 
-func devContainerRunArgs(userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image string) ([]string, error) {
+func devContainerRunArgs(userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image, authorizedKey string) ([]string, error) {
 	repoMount := "/home/" + userName + "/repo"
 	if !validStorageMode(storageMode) {
 		return nil, fmt.Errorf("invalid storage mode %q", storageMode)
@@ -1651,6 +1774,9 @@ func devContainerRunArgs(userName, id, devName, netName, storageMode, homeSource
 		"-e", "REPO_DIR="+repoMount,
 		"-e", "ENVD_ENV_ID="+id,
 	)
+	if strings.TrimSpace(authorizedKey) != "" {
+		argsRun = append(argsRun, "-e", "ENVD_AUTHORIZED_KEY="+authorizedKey)
+	}
 	if projectDockerEnabled(networkMode) {
 		argsRun = append(argsRun,
 			"-e", "DOCKER_HOST=tcp://127.0.0.1:2375",
@@ -1772,6 +1898,7 @@ func (a app) lockEnvdWithStopper(args []string, st *envdState, stop workloadStop
 	}
 	st.addEvent("lock", "", fmt.Sprintf("completed: stopped %d workloads; failed %d", stopped, failed))
 	_ = clearCachedMasterPassword()
+	_ = hideEnvSSHConfig()
 	fmt.Fprintf(a.stdout, "Locked: stopped %d envd-managed workloads\n", stopped)
 	if failed > 0 {
 		fmt.Fprintf(a.stdout, "Failed: %d workloads need manual inspection\n", failed)
@@ -1779,6 +1906,10 @@ func (a app) lockEnvdWithStopper(args []string, st *envdState, stop workloadStop
 	}
 	fmt.Fprintln(a.stdout, "Storage: plain env storage remains plain; protected storage is closed when configured")
 	return nil
+}
+
+func hideEnvSSHConfig() error {
+	return syncEnvSSHConfigNames(nil, currentEnvdExecutable())
 }
 
 func stopEnvWorkload(ref envRef) error {
@@ -2362,17 +2493,28 @@ func (a app) runShell(args []string) error {
 	var dockerArgs []string
 	if err := a.withState(func(st *envdState) error {
 		if len(args) > 0 {
-			touchEnvUsed(st, args[0], time.Now().UTC())
-			if rec, ok := st.Environments[args[0]]; ok && projectDockerEnabled(rec.Network) {
-				ref, err := resolveEnvRef(st, args[0])
-				if err != nil {
+			name := args[0]
+			ref, err := resolveEnvRef(st, name)
+			if err != nil {
+				return err
+			}
+			rec, ok := st.Environments[name]
+			if !ok {
+				return fmt.Errorf("unknown environment %q", name)
+			}
+			if envNeedsStart(ref, rec.Network) {
+				if err := a.startEnv([]string{name}, st); err != nil {
 					return err
 				}
-				if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[2]); err != nil {
-					return err
-				}
-				if err := a.ensureProjectDocker(ref); err != nil {
-					return err
+			} else {
+				touchEnvUsed(st, name, time.Now().UTC())
+				if projectDockerEnabled(rec.Network) {
+					if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[2]); err != nil {
+						return err
+					}
+					if err := a.ensureProjectDocker(ref); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -2387,6 +2529,19 @@ func (a app) runShell(args []string) error {
 	cmd.Stdout = a.stdout
 	cmd.Stderr = a.stderr
 	return cmd.Run()
+}
+
+func envNeedsStart(ref envRef, networkMode string) bool {
+	if dockerContainerStatus(ref.DevName) != "running" {
+		return true
+	}
+	if networkMode == "sealed" && dockerContainerStatus(ref.NetName) != "running" {
+		return true
+	}
+	if projectDockerEnabled(networkMode) && dockerContainerStatus(ref.ProjectDockerName) != "running" {
+		return true
+	}
+	return false
 }
 
 func prepareShellDockerArgs(args []string, st *envdState) ([]string, error) {
@@ -2479,76 +2634,258 @@ func prepareSSHProxyDockerArgs(args []string, st *envdState) ([]string, error) {
 	}, nil
 }
 
-type codeOptions struct {
-	EnvName string
-	Print   bool
-	Launch  bool
+func syncEnvSSHConfig(st *envdState) error {
+	st.ensureDefaults()
+	names := make([]string, 0, len(st.Environments))
+	for name := range st.Environments {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return syncEnvSSHConfigNames(names, currentEnvdExecutable())
 }
 
-func (a app) runCode(args []string, st *envdState) error {
-	opts, err := parseCodeOptions(args)
+func syncEnvSSHConfigNames(names []string, envdPath string) error {
+	sshDir, mainConfig, envdConfig, knownHosts, keyPath, _, err := sshConfigPaths()
 	if err != nil {
 		return err
 	}
-	if _, err := prepareSSHProxyDockerArgs([]string{opts.EnvName}, st); err != nil {
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
 		return err
 	}
-	touchEnvUsed(st, opts.EnvName, time.Now().UTC())
-	target := codeSSHTarget(opts.EnvName)
-	cfg := codeSSHConfig(opts.EnvName, currentEnvdExecutable())
-	st.addEvent("code", opts.EnvName, "prepared VS Code Remote SSH target via envd ssh-proxy")
-	if opts.Print || !opts.Launch {
-		fmt.Fprint(a.stdout, cfg)
-		fmt.Fprintf(a.stdout, "\nVS Code target: %s\n", target)
-		fmt.Fprintf(a.stdout, "Launch: code --remote ssh-remote+%s /repo\n", target)
+	if _, err := ensureEnvdSSHKey(); err != nil {
+		return err
 	}
-	if opts.Launch {
-		cmd := exec.Command("code", "--remote", "ssh-remote+"+target, "/repo")
-		cmd.Stdout = a.stdout
-		cmd.Stderr = a.stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to launch VS Code with code; use envd code %s --print and add the SSH config manually: %w", opts.EnvName, err)
+	if err := ensureSSHInclude(mainConfig, envdConfig); err != nil {
+		return err
+	}
+	blocks := make(map[string]string, len(names))
+	for _, name := range names {
+		if err := validateEnvName(name); err != nil {
+			return err
+		}
+		blocks[name] = envdSSHHostBlock(name, envdPath, knownHosts, keyPath)
+	}
+	return rewriteManagedSSHBlocks(envdConfig, blocks)
+}
+
+type envdSSHKey struct {
+	PrivateKey string
+	PublicKey  string
+}
+
+func ensureEnvSSHConfig(envName, envdPath string) error {
+	if err := validateEnvName(envName); err != nil {
+		return err
+	}
+	sshDir, mainConfig, envdConfig, knownHosts, keyPath, _, err := sshConfigPaths()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		return err
+	}
+	if _, err := ensureEnvdSSHKey(); err != nil {
+		return err
+	}
+	if err := ensureSSHInclude(mainConfig, envdConfig); err != nil {
+		return err
+	}
+	block := envdSSHHostBlock(envName, envdPath, knownHosts, keyPath)
+	return upsertManagedSSHBlock(envdConfig, envName, block)
+}
+
+func ensureEnvdSSHKey() (envdSSHKey, error) {
+	sshDir, _, _, _, keyPath, pubPath, err := sshConfigPaths()
+	if err != nil {
+		return envdSSHKey{}, err
+	}
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		return envdSSHKey{}, err
+	}
+	if !fileExists(keyPath) || !fileExists(pubPath) {
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return envdSSHKey{}, err
+		}
+		block, err := ssh.MarshalPrivateKey(priv, "envd")
+		if err != nil {
+			return envdSSHKey{}, err
+		}
+		privatePEM := pem.EncodeToMemory(block)
+		if err := os.WriteFile(keyPath, privatePEM, 0o600); err != nil {
+			return envdSSHKey{}, err
+		}
+		sshPub, err := ssh.NewPublicKey(pub)
+		if err != nil {
+			return envdSSHKey{}, err
+		}
+		if err := os.WriteFile(pubPath, ssh.MarshalAuthorizedKey(sshPub), 0o644); err != nil {
+			return envdSSHKey{}, err
 		}
 	}
-	return nil
+	pubRaw, err := os.ReadFile(pubPath)
+	if err != nil {
+		return envdSSHKey{}, err
+	}
+	return envdSSHKey{PrivateKey: keyPath, PublicKey: strings.TrimSpace(string(pubRaw))}, nil
 }
 
-func parseCodeOptions(args []string) (codeOptions, error) {
-	if len(args) == 0 {
-		return codeOptions{}, fmt.Errorf("usage: envd code ENV [--print|--launch]")
+func sshConfigPaths() (sshDir, mainConfig, envdConfig, knownHosts, keyPath, pubPath string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", "", "", "", "", err
 	}
-	opts := codeOptions{EnvName: args[0], Print: true}
-	if err := validateEnvName(opts.EnvName); err != nil {
-		return codeOptions{}, err
+	sshDir = filepath.Join(home, ".ssh")
+	keyPath = filepath.Join(sshDir, "envd_ed25519")
+	return sshDir, filepath.Join(sshDir, "config"), filepath.Join(sshDir, "envd_config"), filepath.Join(sshDir, "envd_known_hosts"), keyPath, keyPath + ".pub", nil
+}
+
+func ensureSSHInclude(mainConfig, envdConfig string) error {
+	includeLine := "Include " + envdConfig
+	raw, err := os.ReadFile(mainConfig)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
-	for _, arg := range args[1:] {
-		switch arg {
-		case "--print":
-			opts.Print = true
-		case "--launch":
-			opts.Launch = true
-			opts.Print = false
-		default:
-			return codeOptions{}, fmt.Errorf("unknown code option %q", arg)
+	content := pruneLegacyInlineEnvdSSHBlocks(string(raw))
+	if !strings.Contains(content, includeLine) {
+		content = strings.TrimRight(content, "\n")
+		if content == "" {
+			content = includeLine + "\n"
+		} else {
+			content = includeLine + "\n" + content + "\n"
 		}
 	}
-	return opts, nil
+	return os.WriteFile(mainConfig, []byte(content), 0o600)
 }
 
-func codeSSHTarget(envName string) string {
-	return "envd-" + envName
+func pruneLegacyInlineEnvdSSHBlocks(content string) string {
+	lines := strings.Split(content, "\n")
+	var kept []string
+	for i := 0; i < len(lines); {
+		if !isSSHHostLine(lines[i]) {
+			kept = append(kept, lines[i])
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(lines) && !isSSHHostLine(lines[j]) {
+			j++
+		}
+		block := strings.Join(lines[i:j], "\n")
+		if isLegacyInlineEnvdSSHBlock(block) {
+			for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
+				kept = kept[:len(kept)-1]
+			}
+			i = j
+			continue
+		}
+		kept = append(kept, lines[i:j]...)
+		i = j
+	}
+	return strings.TrimRight(strings.Join(kept, "\n"), "\n") + "\n"
 }
 
-func codeSSHConfig(envName, envdPath string) string {
-	target := codeSSHTarget(envName)
-	return fmt.Sprintf(`Host %s
+func isSSHHostLine(line string) bool {
+	fields := strings.Fields(line)
+	return len(fields) > 0 && strings.EqualFold(fields[0], "Host")
+}
+
+func isLegacyInlineEnvdSSHBlock(block string) bool {
+	return strings.Contains(block, "UserKnownHostsFile") &&
+		strings.Contains(block, "known_hosts_envd") &&
+		strings.Contains(block, "HostName 127.0.0.1")
+}
+
+func envdSSHHostBlock(envName, envdPath, knownHosts, keyPath string) string {
+	return fmt.Sprintf(`# envd managed: %s
+Host %s
   HostName envd
   User dev
   Port 22
   ProxyCommand %s ssh-proxy %s
+  IdentityFile %s
+  IdentitiesOnly yes
+  HostKeyAlias envd-%s
   StrictHostKeyChecking accept-new
-  UserKnownHostsFile ~/.ssh/envd_known_hosts
-`, target, shellWords(envdPath), shellWords(envName))
+  UserKnownHostsFile %s
+# envd managed end: %s
+`, envName, envName, shellWords(envdPath), shellWords(envName), shellWords(keyPath), envName, shellWords(knownHosts), envName)
+}
+
+func upsertManagedSSHBlock(path, envName, block string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	start := "# envd managed: " + envName
+	end := "# envd managed end: " + envName
+	content := string(raw)
+	startIdx := strings.Index(content, start)
+	if startIdx >= 0 {
+		endIdx := strings.Index(content[startIdx:], end)
+		if endIdx >= 0 {
+			endIdx = startIdx + endIdx + len(end)
+			for endIdx < len(content) && (content[endIdx] == '\n' || content[endIdx] == '\r') {
+				endIdx++
+			}
+			content = content[:startIdx] + block + content[endIdx:]
+			return os.WriteFile(path, []byte(content), 0o600)
+		}
+	}
+	content = strings.TrimRight(content, "\n")
+	if content != "" {
+		content += "\n\n"
+	}
+	content += block
+	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+func rewriteManagedSSHBlocks(path string, blocks map[string]string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	content := pruneAllManagedSSHBlocks(string(raw))
+	names := make([]string, 0, len(blocks))
+	for name := range blocks {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	content = strings.TrimRight(content, "\n")
+	for _, name := range names {
+		if content != "" {
+			content += "\n\n"
+		}
+		content += strings.TrimRight(blocks[name], "\n") + "\n"
+	}
+	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+func pruneAllManagedSSHBlocks(content string) string {
+	const marker = "# envd managed: "
+	for {
+		startIdx := strings.Index(content, marker)
+		if startIdx < 0 {
+			break
+		}
+		lineEnd := strings.IndexByte(content[startIdx:], '\n')
+		if lineEnd < 0 {
+			content = strings.TrimRight(content[:startIdx], "\n")
+			break
+		}
+		name := strings.TrimSpace(content[startIdx+len(marker) : startIdx+lineEnd])
+		end := "# envd managed end: " + name
+		endIdx := strings.Index(content[startIdx:], end)
+		if endIdx < 0 {
+			break
+		}
+		endIdx = startIdx + endIdx + len(end)
+		for endIdx < len(content) && (content[endIdx] == '\n' || content[endIdx] == '\r') {
+			endIdx++
+		}
+		content = content[:startIdx] + content[endIdx:]
+	}
+	return strings.TrimRight(content, "\n")
 }
 
 func currentEnvdExecutable() string {

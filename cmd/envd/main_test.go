@@ -92,6 +92,63 @@ func TestInitCreatesEncryptedState(t *testing.T) {
 	}
 }
 
+func TestUnlockValidatesExistingState(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("ENVD_STATE_DIR", stateDir)
+	t.Setenv("ENVD_MASTER_PASSWORD", "test-password")
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+
+	if err := a.run([]string{"init"}); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	out.Reset()
+	if err := a.run([]string{"unlock"}); err != nil {
+		t.Fatalf("unlock failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Unlocked: access restored") {
+		t.Fatalf("unlock output = %q", out.String())
+	}
+}
+
+func TestEnvCanBeExposedAfterUnlockSkipsDeadPlainState(t *testing.T) {
+	rec := envRecord{ID: "abc123", Storage: "plain", Network: "sealed"}
+	ref := envRef{
+		DevName:           devContainerName(rec.ID),
+		NetName:           netContainerName(rec.ID),
+		ProjectDockerName: projectDockerContainerName(rec.ID),
+	}
+	if envCanBeExposedAfterUnlock(ref, rec) {
+		t.Fatalf("dead plain state should not become visible after unlock")
+	}
+	rec.Storage = "protected"
+	if !envCanBeExposedAfterUnlock(ref, rec) {
+		t.Fatalf("protected state should be restorable after unlock")
+	}
+}
+
+func TestWrongMasterPasswordIsFriendly(t *testing.T) {
+	stateDir := t.TempDir()
+	store := stateStore{dir: stateDir, path: filepath.Join(stateDir, "state.enc")}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.save(initialEnvdState(time.Now().UTC()), []byte("right-password")); err != nil {
+		t.Fatalf("save state failed: %v", err)
+	}
+
+	_, err := store.loadOrCreate([]byte("wrong-password"))
+	if err == nil {
+		t.Fatalf("wrong password should fail")
+	}
+	if !strings.Contains(err.Error(), "wrong master password") {
+		t.Fatalf("expected friendly error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "cipher:") || strings.Contains(err.Error(), "message authentication failed") {
+		t.Fatalf("raw crypto error leaked: %v", err)
+	}
+}
+
 func TestPasswordChangeReencryptsExistingState(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("ENVD_STATE_DIR", stateDir)
@@ -893,7 +950,7 @@ func TestProfileDockerfile(t *testing.T) {
 }
 
 func TestDevContainerArgsBlockHostDockerAndHostAccessByDefault(t *testing.T) {
-	args, err := devContainerRunArgs("dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "plain", "envd-abc123-home", "envd-abc123-repo", "sealed", devImage)
+	args, err := devContainerRunArgs("dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "plain", "envd-abc123-home", "envd-abc123-repo", "sealed", devImage, "ssh-ed25519 AAAATEST envd")
 	if err != nil {
 		t.Fatalf("devContainerRunArgs failed: %v", err)
 	}
@@ -918,12 +975,13 @@ func TestDevContainerArgsBlockHostDockerAndHostAccessByDefault(t *testing.T) {
 		"-e DOCKER_HOST=tcp://127.0.0.1:2375",
 		"-e COMPOSE_PROJECT_NAME=envd_abc123",
 		"-e ENVD_ENV_ID=abc123",
+		"-e ENVD_AUTHORIZED_KEY=ssh-ed25519 AAAATEST envd",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("dev container args missing %q: %q", want, got)
 		}
 	}
-	args, err = devContainerRunArgs("dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "plain", "envd-abc123-home", "envd-abc123-repo", "direct", devImage)
+	args, err = devContainerRunArgs("dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "plain", "envd-abc123-home", "envd-abc123-repo", "direct", devImage, "")
 	if err != nil {
 		t.Fatalf("direct devContainerRunArgs failed: %v", err)
 	}
@@ -978,6 +1036,24 @@ func TestSidecarHealthcheckUsesResolvedGatewayIP(t *testing.T) {
 	}
 	if strings.Contains(got, `"${XRAY_HOST:-xray}" "${XRAY_PORT:-2088}"`) {
 		t.Fatalf("sidecar healthcheck resolves Docker DNS after resolv.conf is sealed")
+	}
+}
+
+func TestSSHDevEntrypointInstallsEnvdAuthorizedKey(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "internal", "assets", "containers", "sshdev", "entrypoint.sh"))
+	if err != nil {
+		t.Fatalf("read sshdev entrypoint: %v", err)
+	}
+	got := string(raw)
+	for _, want := range []string{
+		`ENVD_AUTHORIZED_KEY="${ENVD_AUTHORIZED_KEY:-}"`,
+		`AUTHORIZED_KEYS="${SSH_DIR}/authorized_keys"`,
+		`grep -qxF "$ENVD_AUTHORIZED_KEY" "$AUTHORIZED_KEYS"`,
+		`chmod 600 "$AUTHORIZED_KEYS"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sshdev entrypoint missing %q", want)
+		}
 	}
 }
 
@@ -1042,7 +1118,7 @@ func TestParseRunArgsProfile(t *testing.T) {
 }
 
 func TestDevContainerArgsProtectedStorageUsesEnvdVolumes(t *testing.T) {
-	args, err := devContainerRunArgs("dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "protected", "envd-abc123-home", "envd-abc123-repo", "offline", devImage)
+	args, err := devContainerRunArgs("dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "protected", "envd-abc123-home", "envd-abc123-repo", "offline", devImage, "")
 	if err != nil {
 		t.Fatalf("protected devContainerRunArgs failed: %v", err)
 	}
@@ -1190,6 +1266,8 @@ func TestLegacyEnvironmentRecordStaysPlainStorage(t *testing.T) {
 }
 
 func TestLockStopsAllRecordedWorkloads(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	socket := filepath.Join(t.TempDir(), "unlock.sock")
 	t.Setenv("ENVD_UNLOCK_SOCKET", socket)
 	done := make(chan error, 1)
@@ -1228,6 +1306,14 @@ func TestLockStopsAllRecordedWorkloads(t *testing.T) {
 	}
 	if got, ok := cachedMasterPassword(); ok {
 		t.Fatalf("lock should clear cached password, got %q", string(got))
+	}
+	envdConfig := filepath.Join(home, ".ssh", "envd_config")
+	raw, err := os.ReadFile(envdConfig)
+	if err != nil {
+		t.Fatalf("read hidden envd ssh config: %v", err)
+	}
+	if strings.Contains(string(raw), "Host books") || strings.Contains(string(raw), "Host apps") {
+		t.Fatalf("lock should hide envd SSH hosts:\n%s", raw)
 	}
 	select {
 	case err := <-done:
@@ -2039,26 +2125,154 @@ func TestRunGatewayInstallApplyRollsBackEnvdOwnedConfigOnVerifyFailure(t *testin
 	}
 }
 
-func TestCodeOptionsAndSSHConfig(t *testing.T) {
-	opts, err := parseCodeOptions([]string{"books", "--launch"})
+func TestEnsureEnvSSHConfigWritesStandardSSHHost(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := ensureEnvSSHConfig("books", "/tmp/envd tool/envd"); err != nil {
+		t.Fatalf("ensure SSH config failed: %v", err)
+	}
+	mainRaw, err := os.ReadFile(filepath.Join(home, ".ssh", "config"))
 	if err != nil {
-		t.Fatalf("parse code options failed: %v", err)
+		t.Fatalf("read main ssh config: %v", err)
 	}
-	if opts.EnvName != "books" || !opts.Launch || opts.Print {
-		t.Fatalf("unexpected code options: %+v", opts)
+	if !strings.Contains(string(mainRaw), "Include "+filepath.Join(home, ".ssh", "envd_config")) {
+		t.Fatalf("main ssh config missing envd include:\n%s", mainRaw)
 	}
-	if _, err := parseCodeOptions([]string{"books", "--bad"}); err == nil {
-		t.Fatal("accepted unknown code option")
+	envdRaw, err := os.ReadFile(filepath.Join(home, ".ssh", "envd_config"))
+	if err != nil {
+		t.Fatalf("read envd ssh config: %v", err)
 	}
-	cfg := codeSSHConfig("books", "/tmp/envd tool/envd")
+	got := string(envdRaw)
 	for _, want := range []string{
-		"Host envd-books",
-		"User dev",
+		"# envd managed: books",
+		"Host books",
 		"ProxyCommand '/tmp/envd tool/envd' ssh-proxy books",
-		"UserKnownHostsFile ~/.ssh/envd_known_hosts",
+		"IdentityFile " + shellWords(filepath.Join(home, ".ssh", "envd_ed25519")),
+		"IdentitiesOnly yes",
+		"HostKeyAlias envd-books",
+		"StrictHostKeyChecking accept-new",
+		"UserKnownHostsFile " + shellWords(filepath.Join(home, ".ssh", "envd_known_hosts")),
 	} {
-		if !strings.Contains(cfg, want) {
-			t.Fatalf("ssh config missing %q:\n%s", want, cfg)
+		if !strings.Contains(got, want) {
+			t.Fatalf("envd ssh config missing %q:\n%s", want, got)
+		}
+	}
+	if err := ensureEnvSSHConfig("books", "/opt/envd"); err != nil {
+		t.Fatalf("second ensure SSH config failed: %v", err)
+	}
+	updatedRaw, err := os.ReadFile(filepath.Join(home, ".ssh", "envd_config"))
+	if err != nil {
+		t.Fatalf("read updated envd ssh config: %v", err)
+	}
+	if strings.Count(string(updatedRaw), "# envd managed: books") != 1 {
+		t.Fatalf("envd ssh config duplicated managed block:\n%s", updatedRaw)
+	}
+	if !strings.Contains(string(updatedRaw), "ProxyCommand /opt/envd ssh-proxy books") {
+		t.Fatalf("envd ssh config did not update block:\n%s", updatedRaw)
+	}
+	if !fileExists(filepath.Join(home, ".ssh", "envd_ed25519")) || !fileExists(filepath.Join(home, ".ssh", "envd_ed25519.pub")) {
+		t.Fatalf("envd SSH keypair was not generated")
+	}
+}
+
+func TestSyncEnvSSHConfigPrunesStaleManagedHosts(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	envdConfig := filepath.Join(sshDir, "envd_config")
+	old := `Host personal
+  HostName example.com
+
+# envd managed: old
+Host old
+  HostName envd
+# envd managed end: old
+
+# envd managed: books
+Host books
+  HostName stale
+# envd managed end: books
+`
+	if err := os.WriteFile(envdConfig, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := syncEnvSSHConfigNames([]string{"books"}, "/opt/envd"); err != nil {
+		t.Fatalf("sync SSH config failed: %v", err)
+	}
+	raw, err := os.ReadFile(envdConfig)
+	if err != nil {
+		t.Fatalf("read envd config: %v", err)
+	}
+	got := string(raw)
+	if strings.Contains(got, "envd-old") || strings.Contains(got, "# envd managed: old") {
+		t.Fatalf("stale envd SSH block was not pruned:\n%s", got)
+	}
+	if !strings.Contains(got, "Host personal") {
+		t.Fatalf("user SSH block was not preserved:\n%s", got)
+	}
+	if strings.Count(got, "# envd managed: books") != 1 {
+		t.Fatalf("books block missing or duplicated:\n%s", got)
+	}
+	if !strings.Contains(got, "ProxyCommand /opt/envd ssh-proxy books") {
+		t.Fatalf("books block was not refreshed:\n%s", got)
+	}
+}
+
+func TestEnsureSSHIncludePrunesLegacyInlineEnvdHosts(t *testing.T) {
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mainConfig := filepath.Join(sshDir, "config")
+	envdConfig := filepath.Join(sshDir, "envd_config")
+	raw := `Include /Users/c/.colima/ssh_config
+
+Host github.com
+  HostName github.com
+  User git
+
+Host books
+  HostName 127.0.0.1
+  Port 2230
+  User books
+  IdentityFile /Users/c/.ssh/id_ed25519
+  IdentitiesOnly yes
+  ForwardAgent yes
+  UserKnownHostsFile /Users/c/.ssh/known_hosts_envd
+  StrictHostKeyChecking accept-new
+
+Host local-db
+  HostName 127.0.0.1
+  Port 2222
+  User me
+`
+	if err := os.WriteFile(mainConfig, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSSHInclude(mainConfig, envdConfig); err != nil {
+		t.Fatalf("ensure include failed: %v", err)
+	}
+	updated, err := os.ReadFile(mainConfig)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	got := string(updated)
+	if strings.Contains(got, "Host books") || strings.Contains(got, "known_hosts_envd") {
+		t.Fatalf("legacy envd host was not removed:\n%s", got)
+	}
+	for _, want := range []string{
+		"Include " + envdConfig,
+		"Include /Users/c/.colima/ssh_config",
+		"Host github.com",
+		"Host local-db",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("config missing preserved entry %q:\n%s", want, got)
 		}
 	}
 }

@@ -44,6 +44,8 @@ only where implemented and release-gated.
       encrypted state.
 - [x] Cache interactive unlock in memory for a short TTL.
 - [x] Clear cached unlock on `envd lock`.
+- [x] `envd unlock` restores restorable workloads and republishes envd SSH
+      targets after lock.
 - [x] Store human env names, gateway hosts, project paths, and event history only
       in encrypted state.
 - [x] Store only minimal public host metadata outside encrypted state.
@@ -271,13 +273,13 @@ only where implemented and release-gated.
 - [x] Implement `envd lock`.
 - [x] Terminate envd-owned shell/SSH/editor sessions on lock.
 - [x] Stop envd-managed workloads on lock.
+- [x] Hide envd-managed SSH targets on lock.
 - [x] Close protected storage on lock when the environment uses protected storage.
 - [x] Add lock/session release gate tests.
 - [x] Implement automatic encrypted recovery points.
 - [x] Implement automatic recovery-point pruning.
 - [x] Ensure `envd rm <env>` removes env-owned storage and recovery points after
       confirmation.
-- [x] Implement `envd code <env>`.
 - [x] Implement envd-controlled SSH proxy access.
 
 ## Post-v1 Identity

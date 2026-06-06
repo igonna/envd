@@ -379,6 +379,40 @@ func (s stateStore) changePassword(stderr io.Writer) error {
 	return nil
 }
 
+func (s stateStore) unlock(stderr io.Writer) (envdState, time.Duration, bool, error) {
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return envdState{}, 0, false, err
+	}
+	if !fileExists(s.path) {
+		return envdState{}, 0, false, fmt.Errorf("envd is not initialized; run `envd init` first")
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return envdState{}, 0, false, err
+	}
+	defer unlock()
+
+	password, err := readMasterPasswordUncached(stderr)
+	if err != nil {
+		return envdState{}, 0, false, err
+	}
+	defer zeroBytes(password)
+
+	st, err := s.loadOrCreate(password)
+	if err != nil {
+		_ = clearCachedMasterPassword()
+		return envdState{}, 0, false, err
+	}
+	ttl := unlockTTL()
+	cached := ttl > 0 && os.Getenv("ENVD_DISABLE_UNLOCK_CACHE") != "1" && os.Getenv("ENVD_MASTER_PASSWORD") == ""
+	if cached {
+		if err := cacheMasterPassword(password, ttl); err != nil {
+			return envdState{}, 0, false, err
+		}
+	}
+	return st, ttl, cached, nil
+}
+
 func (s stateStore) reset(now time.Time) (result, path string, err error) {
 	if _, err := os.Stat(s.dir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -434,6 +468,9 @@ func (s stateStore) loadOrCreate(password []byte) (envdState, error) {
 	}
 	plain, err := decryptEnvelope(env, password)
 	if err != nil {
+		if isStateAuthError(err) {
+			return envdState{}, errors.New("wrong master password")
+		}
 		return envdState{}, fmt.Errorf("cannot unlock encrypted state: %w", err)
 	}
 	var st envdState
@@ -445,6 +482,10 @@ func (s stateStore) loadOrCreate(password []byte) (envdState, error) {
 	}
 	st.ensureDefaults()
 	return st, nil
+}
+
+func isStateAuthError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "message authentication failed")
 }
 
 func initialEnvdState(now time.Time) envdState {

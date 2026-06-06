@@ -7,6 +7,7 @@ SSH_DIR="${HOME_DIR}/.ssh"
 REPO_DIR="${REPO_DIR:-${HOME_DIR}/repo}"
 GIT_USER_NAME="${GIT_USER_NAME:-}"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-}"
+ENVD_AUTHORIZED_KEY="${ENVD_AUTHORIZED_KEY:-}"
 
 if [ "${ENVD_SEALED_DNS:-}" = "1" ]; then
   cat > /etc/resolv.conf <<'EOF'
@@ -120,6 +121,16 @@ chmod 755 "$HOME_DIR"
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 chown -R "${DEV_USER}:${DEV_USER}" "$SSH_DIR"
+
+if [ -n "$ENVD_AUTHORIZED_KEY" ]; then
+  AUTHORIZED_KEYS="${SSH_DIR}/authorized_keys"
+  touch "$AUTHORIZED_KEYS"
+  if ! grep -qxF "$ENVD_AUTHORIZED_KEY" "$AUTHORIZED_KEYS" 2>/dev/null; then
+    printf '%s\n' "$ENVD_AUTHORIZED_KEY" >> "$AUTHORIZED_KEYS"
+  fi
+  chmod 600 "$AUTHORIZED_KEYS"
+  chown "${DEV_USER}:${DEV_USER}" "$AUTHORIZED_KEYS"
+fi
 
 # If Docker socket is mounted, grant DEV_USER access via matching group GID.
 if [ -S /var/run/docker.sock ]; then

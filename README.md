@@ -87,8 +87,9 @@ envd gateway rollback              # return to previous verified gateway
 envd user uri ams1                 # print app import URI
 envd pkg add web apt:ffmpeg        # add package intent to a profile
 envd run app --profile web         # lazily build/use that profile
-envd code books --print            # print VS Code Remote SSH config
-envd lock                          # stop workloads and clear cached unlock
+ssh books                          # connect through envd-managed SSH
+envd lock                          # stop workloads and hide envd SSH targets
+envd unlock                        # restore workloads/SSH targets after lock
 envd rm books --yes                # remove an environment and envd-owned volumes
 envd password change               # change master password without deleting state
 envd reset-state --delete --i-understand-this-deletes-envd-state --yes
@@ -124,6 +125,10 @@ immediately with:
 ```bash
 envd lock
 ```
+
+`envd lock` stops envd-managed workloads and removes envd SSH targets from the
+host SSH config so editors stop showing them. `envd unlock` validates the master
+password, restores restorable workloads, and publishes SSH targets again.
 
 To change the master password while keeping existing envd state:
 

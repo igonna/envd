@@ -41,8 +41,9 @@ Core user promises:
 - `envd init` is the explicit one-time step that creates encrypted state and the
   master password.
 - The master password can be changed without deleting encrypted state.
-- Interactive unlock may be cached only in memory for a short TTL; `envd lock`
-  clears it immediately.
+- `envd lock` stops envd-owned work, hides envd SSH targets, and clears the
+  short-lived unlock cache. `envd unlock` restores access after explicit master
+  password entry.
 - Sealed networking is the default and fails closed.
 - The active gateway and remote server are inspectable and switchable.
 - Remote server setup is reconciled, not installed blindly.
@@ -765,8 +766,9 @@ envd gateway use <name>
 envd run <name>
   Create a dev environment. Uses sealed networking by default.
 
-envd code <name>
-  Open the environment in VS Code through an envd-controlled local SSH proxy.
+ssh <name>
+  Open the environment through envd-managed SSH config and envd's local SSH
+  proxy.
 
 envd lock
   Stop envd-owned work, revoke identities/secrets, close protected storage when
@@ -825,7 +827,6 @@ envd gateway use <name>
 envd run <env>
 envd ps
 envd shell <env>
-envd code <env>
 envd stop <env>
 envd start <env>
 envd rm <env>
@@ -1311,8 +1312,8 @@ Rules:
   cleanup on explicit `envd lock`.
 - `envd start <env>` should restore the environment from its declared storage
   mode.
-- `envd code <env>` or `envd shell <env>` should start a stopped environment
-  lazily when safe.
+- `ssh <env>` or `envd shell <env>` should start a stopped environment lazily
+  when safe if envd can do it without corrupting the SSH stream.
 - Users should not need to keep a terminal open just to prevent stop; declared
   services or `--keep-running` are the explicit keep-alive mechanism.
 
@@ -1377,7 +1378,7 @@ Useful commands:
 ```bash
 envd run books .
 envd inspect books
-envd code books
+ssh books
 ```
 
 `envd inspect books` should show:
@@ -1832,7 +1833,7 @@ Commands:
 
 ```bash
 envd lock
-envd status
+envd unlock
 ```
 
 Rules:
@@ -1851,6 +1852,8 @@ Rules:
 - Lock terminates envd-managed shell, SSH, and one-shot command sessions.
 - Lock prevents new envd-managed shell, one-shot command, SSH, identity, secret,
   and gateway management operations until unlock.
+- Lock removes envd-managed SSH targets from host SSH config so editors stop
+  advertising connectable envd environments while locked.
 - Lock does not create new decrypted mounts.
 - Lock does not expose envd secrets, identity material, or decrypted storage
   through new access paths.
@@ -1858,8 +1861,9 @@ Rules:
 - `envd lock` stops envd-managed environments and service/app runtimes, then
   closes protected storage where present.
 - If an operation cannot be made safe while locked, it must fail closed.
-- There is no required `unlock` command in normal use. The next stateful command
-  prompts for the master password and reopens only the state it needs.
+- `envd unlock` is the explicit restore step after `envd lock`: it validates the
+  master password, restores restorable envd workloads, and republishes envd SSH
+  targets.
 
 SSH/access behavior:
 
@@ -1880,7 +1884,7 @@ Expected commands:
 
 ```bash
 envd run books
-envd code books
+ssh books
 ```
 
 Access model:
@@ -1893,21 +1897,22 @@ The preferred VS Code integration is an SSH `ProxyCommand`, not a durable SSH
 server exposed on the network:
 
 ```sshconfig
-Host envd-books
+Host books
   HostName envd
   User dev
   Port 22
   ProxyCommand envd ssh-proxy books
+  HostKeyAlias envd-books
   StrictHostKeyChecking accept-new
   UserKnownHostsFile ~/.ssh/envd_known_hosts
 ```
 
 Rules:
 
-- `envd code <env>` prints or launches a VS Code Remote SSH target that uses
-  `envd ssh-proxy <env>`.
-- Generated SSH targets should use envd-owned aliases and never expose a durable
-  host SSH listener.
+- `envd run <env>`, `envd start <env>`, and `envd unlock` install/update normal
+  OpenSSH config for `ssh <env>`.
+- Generated SSH config should expose exactly one human target per environment,
+  for example `Host books`, and never expose a durable host SSH listener.
 - The proxy must require envd to be unlocked.
 - The proxy must verify the target environment is running, required storage
   policy is satisfied, network policy is valid, and the caller is local.
@@ -1917,8 +1922,9 @@ Rules:
   rest, and scoped to envd access.
 - Short-lived SSH certificates are preferred over long-lived static keys where
   practical.
-- `envd lock` must terminate active editor/SSH sessions and make the proxy
-  refuse reconnects until unlock.
+- `envd lock` must terminate active editor/SSH sessions and remove visible envd
+  SSH targets. `envd unlock` must restore restorable workloads and publish the
+  targets again.
 
 If a TCP SSH listener is required for tool compatibility:
 
@@ -1952,10 +1958,11 @@ Lock ordering:
 3. Broadcast lock to envd-owned terminal sessions.
 4. Stop envd-managed environments, service/app runtimes, and sealed project
    Docker engines.
-5. Close protected storage for stopped environments.
-6. Mark core sealing complete.
-7. Queue registered host Docker cleanup asynchronously.
-8. Record cleanup progress, completion, or failure in events/status.
+5. Hide envd-managed SSH targets from host SSH config.
+6. Close protected storage for stopped environments.
+7. Mark core sealing complete.
+8. Queue registered host Docker cleanup asynchronously.
+9. Record cleanup progress, completion, or failure in events/status.
 
 Core sealing must not wait on registered host Docker cleanup. If asynchronous
 cleanup is slow, blocked, or fails, envd remains locked and protected storage
@@ -2744,8 +2751,9 @@ success, and continue.
 Rules:
 
 - Secrets should be scoped by purpose, for example `remote/ams1/password`.
-- Vault availability follows envd's explicit lock state and implicit unlock on
-  the next stateful command.
+- Vault availability follows envd's explicit lock state. Single-shot stateful
+  commands may prompt for the master password for their own operation, but
+  restoring visible environment access after lock is `envd unlock`.
 - `envd lock` must close the vault, revoke decrypted secret access, and terminate
   any envd-managed process or agent that holds decrypted secret material.
 - Single-shot commands may prompt for the master password, decrypt what is
@@ -3446,7 +3454,7 @@ Identity gate:
 
 Editor/SSH access gate:
 
-- `envd code <env>` and VS Code Remote SSH must connect through envd-controlled
+- `ssh <env>` and VS Code Remote SSH must connect through envd-controlled
   proxy/auth, not a durable exposed container SSH server.
 - Generated SSH config must use `ProxyCommand envd ssh-proxy ...` or an
   equivalent envd-controlled local endpoint.
@@ -3454,11 +3462,11 @@ Editor/SSH access gate:
   interfaces.
 - Localhost or socket endpoints must still require envd-managed authentication
   and unlocked state.
-- Generated SSH aliases should be opaque by default; human env-name mappings
-  must stay in encrypted state unless the user explicitly opts into visible
-  aliases.
-- Lock must terminate active editor/SSH sessions and make reconnect fail until
-  unlock.
+- Generated SSH config should expose one visible human env name only. Host-key
+  isolation should use `HostKeyAlias envd-<env>` so editors do not show a
+  duplicate target.
+- Lock must terminate active editor/SSH sessions, hide envd SSH targets, and
+  make reconnect fail until `envd unlock` restores access.
 - Tests must prove another machine on the LAN cannot connect to envd editor/SSH
   access by default.
 - Tests must prove stale keys/certificates cannot reconnect after lock.
@@ -3620,7 +3628,7 @@ Post-v1 security/storage milestone:
 - Optional legacy Docker volume import into protected storage.
 - `envd lock` deterministic shutdown behavior.
 - Automatic encrypted recovery points and lifecycle pruning.
-- `envd code <env>` and envd-controlled SSH proxy access.
+- envd-controlled SSH proxy access through normal `ssh <env>`.
 
 Post-v1 identity milestone:
 
