@@ -325,6 +325,11 @@ func (a app) run(args []string) error {
 		return a.runShell(args[1:])
 	case "ssh-proxy":
 		return a.runSSHProxy(args[1:])
+	case "vscode-extensions":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"vscode-extensions"})
+		}
+		return a.runVSCodeExtensions(args[1:])
 	case "network":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"network"})
@@ -664,6 +669,7 @@ Environment:
   inspect              show environment details
   stop                 stop an environment
   rm                   remove an environment
+  vscode-extensions    lock/unlock remote VS Code extensions
 
 Gateway:
   gateway              install/use/list gateways
@@ -743,6 +749,8 @@ Next command: envd init
 		fmt.Fprint(a.stdout, "Usage: envd stop ENV\n")
 	case "rm":
 		fmt.Fprint(a.stdout, "Usage: envd rm ENV --yes\n")
+	case "vscode-extensions":
+		a.printVSCodeExtensionsHelp()
 	case "lock":
 		fmt.Fprint(a.stdout, "Usage: envd lock\n\nStops envd-managed workloads, hides envd SSH targets, and clears cached unlock.\n")
 	case "doctor":
@@ -1046,6 +1054,17 @@ Deep:
 `)
 }
 
+func (a app) printVSCodeExtensionsHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd vscode-extensions lock ENV
+  envd vscode-extensions unlock ENV
+
+Default:
+  extension storage is locked whenever envd creates or starts an env
+
+`)
+}
+
 func (a app) printInternetHelp() {
 	fmt.Fprint(a.stdout, `Usage:
   envd internet COMMAND
@@ -1273,6 +1292,37 @@ func (a app) runInspect(args []string, st *envdState) error {
 	return nil
 }
 
+func (a app) runVSCodeExtensions(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: envd vscode-extensions lock|unlock ENV")
+	}
+	action, name := args[0], args[1]
+	route, err := runtimeRoute(name)
+	if err != nil {
+		return err
+	}
+	ref := envRef{Name: route.Name, ID: route.ID, UserName: route.UserName, DevName: route.DevName, Network: route.Network}
+	if dockerContainerStatus(ref.DevName) != "running" {
+		return fmt.Errorf("environment %q is not running; start it first with: envd start %s", name, name)
+	}
+	switch action {
+	case "lock":
+		if err := setVSCodeExtensionsLocked(ref, true); err != nil {
+			return err
+		}
+		fmt.Fprintf(a.stdout, "VS Code extensions: locked for %s\n", name)
+		return nil
+	case "unlock":
+		if err := setVSCodeExtensionsLocked(ref, false); err != nil {
+			return err
+		}
+		fmt.Fprintf(a.stdout, "VS Code extensions: unlocked for %s\n", name)
+		return nil
+	default:
+		return fmt.Errorf("usage: envd vscode-extensions lock|unlock ENV")
+	}
+}
+
 func (a app) runEnv(args []string, st *envdState) error {
 	opts, err := parseRunArgs(args)
 	if err != nil {
@@ -1434,6 +1484,9 @@ func (a app) runEnv(args []string, st *envdState) error {
 	if err := repairEnvSSHAccessForRef(ref); err != nil {
 		return err
 	}
+	if err := setVSCodeExtensionsLocked(ref, true); err != nil {
+		return err
+	}
 
 	ok = true
 	fmt.Fprintf(a.stdout, "Created: %s\n", name)
@@ -1552,6 +1605,9 @@ func (a app) startEnv(args []string, st *envdState) error {
 			if err := repairEnvSSHAccessForRef(ref); err != nil {
 				return err
 			}
+			if err := setVSCodeExtensionsLocked(ref, true); err != nil {
+				return err
+			}
 			st.addEvent("env", name, "started from protected storage")
 			fmt.Fprintf(a.stdout, "Started: %s\n", name)
 			fmt.Fprintf(a.stdout, "SSH:     ssh %s\n", name)
@@ -1590,6 +1646,9 @@ func (a app) startEnv(args []string, st *envdState) error {
 			if err := repairEnvSSHAccessForRef(ref); err != nil {
 				return err
 			}
+			if err := setVSCodeExtensionsLocked(ref, true); err != nil {
+				return err
+			}
 			st.addEvent("env", name, "recreated sealed runtime before start: "+reason)
 			fmt.Fprintf(a.stdout, "Recreated sealed runtime: %s\n", reason)
 			fmt.Fprintf(a.stdout, "Started: %s\n", name)
@@ -1624,6 +1683,9 @@ func (a app) startEnv(args []string, st *envdState) error {
 	}
 	touchEnvUsed(st, name, time.Now().UTC())
 	if err := repairEnvSSHAccessForRef(ref); err != nil {
+		return err
+	}
+	if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 		return err
 	}
 	st.addEvent("env", name, "started")
@@ -1807,6 +1869,9 @@ func (a app) networkEnv(args []string, st *envdState, password []byte) error {
 	}
 	ref.Network = mode
 	if err := repairEnvSSHAccessForRef(ref); err != nil {
+		return err
+	}
+	if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 		return err
 	}
 	st.addEvent("env", name, "network changed "+current+" -> "+mode)
@@ -3578,6 +3643,9 @@ func (a app) runMigrateEnvProfile(args []string, st *envdState, password []byte)
 	st.Environments[name] = rec
 	ref.Network = mode
 	if err := repairEnvSSHAccessForRef(ref); err != nil {
+		return err
+	}
+	if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 		return err
 	}
 	st.addEvent("env", name, fmt.Sprintf("migrated to profile %s generation %d", profileName, generation))
@@ -6954,6 +7022,32 @@ chmod 700 "${ssh_dir}"
 chmod 600 "${authorized_keys}"
 `
 	return dockerRun("exec", "-e", "DEV_USER="+userName, "-e", "ENVD_AUTHORIZED_KEY="+authKey.PublicKey, ref.DevName, "sh", "-lc", script)
+}
+
+func setVSCodeExtensionsLocked(ref envRef, locked bool) error {
+	userName := ref.UserName
+	if userName == "" {
+		userName = "dev"
+	}
+	mode := "lock"
+	if !locked {
+		mode = "unlock"
+	}
+	script := `
+set -eu
+home_dir="/home/${DEV_USER}"
+for base in ".vscode-server" ".vscode-server-insiders"; do
+  dir="${home_dir}/${base}/extensions"
+  mkdir -p "${dir}"
+  chown -R "${DEV_USER}:${DEV_USER}" "${home_dir}/${base}"
+  if [ "${ENVD_VSCODE_EXTENSIONS_MODE}" = "lock" ]; then
+    chmod -R a-w "${dir}"
+  else
+    chmod -R u+w "${dir}"
+  fi
+done
+`
+	return dockerRun("exec", "-e", "DEV_USER="+userName, "-e", "ENVD_VSCODE_EXTENSIONS_MODE="+mode, ref.DevName, "sh", "-lc", script)
 }
 
 func (a app) probeGatewayPorts(cfg gatewayConfig) probeResult {
