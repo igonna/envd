@@ -59,7 +59,7 @@ assert_encrypted_image() {
 
 trap cleanup EXIT INT TERM
 
-envd run "$env_name" --network offline --storage protected >/tmp/envd-protected-run.out
+envd start "$env_name" --network offline --storage protected >/tmp/envd-protected-run.out
 grep -q "Storage: protected" /tmp/envd-protected-run.out
 grep -q "Storage backend: apfs-sparseimage" /tmp/envd-protected-run.out
 echo "OK: protected env created"

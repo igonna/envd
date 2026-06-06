@@ -48,6 +48,26 @@ func TestHelpDoesNotNeedState(t *testing.T) {
 	}
 }
 
+func TestHelpUsesStartAndListCommands(t *testing.T) {
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+
+	if err := a.run([]string{"help"}); err != nil {
+		t.Fatalf("help failed: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{"start                create or start an environment", "list                 list environments"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("help missing %q:\n%s", want, got)
+		}
+	}
+	for _, old := range []string{"run                  create", "ps                   list"} {
+		if strings.Contains(got, old) {
+			t.Fatalf("help still contains old command %q:\n%s", old, got)
+		}
+	}
+}
+
 func TestStatefulCommandRequiresInit(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("ENVD_STATE_DIR", stateDir)
@@ -438,38 +458,6 @@ func TestEncryptedStateDoesNotLeakSensitiveValues(t *testing.T) {
 	}
 }
 
-func TestLoadGatewayConfig(t *testing.T) {
-	root := t.TempDir()
-	gwDir := filepath.Join(root, "deploy", "gateway")
-	if err := os.MkdirAll(gwDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	env := strings.Join([]string{
-		"XRAY_BIND_IP=0.0.0.0",
-		"XRAY_SOCKS_PORT=11080",
-		"XRAY_INBOUND_PORT=2088",
-		"XRAY_HTTP_PROXY_PORT=2089",
-		"XRAY_HTTP_PROXY_HOST_PORT=11081",
-		"XRAY_SERVER_IP=1.2.3.4",
-		"XRAY_SERVER_PORT=443",
-		"",
-	}, "\n")
-	if err := os.WriteFile(filepath.Join(gwDir, ".env"), []byte(env), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := (app{root: root}).loadGatewayConfig()
-	if err != nil {
-		t.Fatalf("loadGatewayConfig failed: %v", err)
-	}
-	if cfg.BindIP != "0.0.0.0" || cfg.SOCKSPort != 11080 || cfg.HTTPHostPort != 11081 {
-		t.Fatalf("unexpected config: %+v", cfg)
-	}
-	if host := hostForClient(cfg.BindIP); host != "127.0.0.1" {
-		t.Fatalf("hostForClient = %q", host)
-	}
-}
-
 func validTestGatewayConfig(serverIP string) gatewayConfig {
 	return gatewayConfig{
 		BindIP:       "127.0.0.1",
@@ -548,7 +536,7 @@ func TestXrayProviderRender(t *testing.T) {
 	if strings.Contains(string(rendered), "${") {
 		t.Fatalf("render left unresolved template variable: %s", rendered)
 	}
-	if !strings.Contains(string(rendered), `"fingerprint":"firefox"`) {
+	if !strings.Contains(string(rendered), `"fingerprint": "firefox"`) {
 		t.Fatalf("render did not apply fingerprint default: %s", rendered)
 	}
 }
@@ -2839,22 +2827,6 @@ func TestHostingShortlistRanking(t *testing.T) {
 	sortHostingProviders(providers, checks)
 	if providers[0].ID != "ok" {
 		t.Fatalf("reachable provider was not ranked first: %+v", providers)
-	}
-}
-
-func TestParseGatewayImportArgs(t *testing.T) {
-	name, yes, err := parseGatewayImportArgs([]string{"ams1", "--yes"})
-	if err != nil || name != "ams1" || !yes {
-		t.Fatalf("parseGatewayImportArgs = %q %v %v", name, yes, err)
-	}
-	if _, _, err := parseGatewayImportArgs([]string{"ams1"}); err != nil {
-		t.Fatalf("missing --yes is allowed by parser and enforced by command, got %v", err)
-	}
-	if err := validateGatewayName("ams1"); err != nil {
-		t.Fatalf("valid gateway name rejected: %v", err)
-	}
-	if err := validateGatewayName("Ams1"); err == nil {
-		t.Fatal("invalid gateway name accepted")
 	}
 }
 

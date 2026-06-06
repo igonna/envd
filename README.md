@@ -57,9 +57,9 @@ envd gateway use ams1
 Run a sealed environment:
 
 ```bash
-envd run books
+envd start books
 envd shell books
-envd ps
+envd list
 ```
 
 Check what is broken when networking fails:
@@ -73,8 +73,8 @@ envd gateway egress
 Use explicit non-sealed modes only when you mean it:
 
 ```bash
-envd run scratch --network direct
-envd run offline --network offline
+envd start scratch --network direct
+envd start offline --network offline
 ```
 
 ## Common Commands
@@ -86,7 +86,7 @@ envd gateway status                # show active gateway
 envd gateway rollback              # return to previous verified gateway
 envd user uri ams1                 # print app import URI
 envd pkg add web apt:ffmpeg        # add package intent to a profile
-envd run app --profile web         # lazily build/use that profile
+envd start app --profile web         # lazily build/use that profile
 ssh books                          # connect through envd-managed SSH
 envd lock                          # stop workloads and hide envd SSH targets
 envd unlock                        # restore workloads/SSH targets after lock
@@ -96,8 +96,8 @@ envd reset-state --delete --i-understand-this-deletes-envd-state --yes
                                    # move unreadable envd state to a backup
 ```
 
-`envd gateway import-local <name> --yes` exists only for migrating old manual
-local gateway `.env` setups into encrypted state.
+Gateway setup is managed by `envd gateway install` and encrypted envd state. A
+normal envd checkout does not contain or need gateway `.env` files.
 
 ## State And Runtime Files
 

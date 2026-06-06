@@ -639,20 +639,20 @@ If Xray is unavailable, outbound traffic fails closed.
 Sealed is default:
 
 ```bash
-envd run dev1
-envd run dev1 --network sealed
+envd start dev1
+envd start dev1 --network sealed
 ```
 
 Direct is explicit and has normal Docker networking:
 
 ```bash
-envd run dev1 --network direct
+envd start dev1 --network direct
 ```
 
 Offline is explicit and has no external internet:
 
 ```bash
-envd run dev1 --network offline
+envd start dev1 --network offline
 ```
 
 The CLI must show the chosen mode after creation. It should never silently choose
@@ -693,7 +693,7 @@ Every command should perform safe startup:
 6. Continue the original command after unlock.
 
 The user should not accidentally create a forgotten master password from an
-ordinary command like `envd ps`.
+ordinary command like `envd list`.
 
 ### Lazy Reconciliation UX
 
@@ -716,7 +716,7 @@ Principles:
 Examples:
 
 ```bash
-envd run books
+envd start books
 ```
 
 May lazily create runtime directories, fetch runtime assets, build the selected
@@ -763,7 +763,7 @@ envd gateway use <name>
   Switch the active gateway. Verifies the new route, syncs sealed environments,
   and rolls back if validation fails.
 
-envd run <name>
+envd start <name>
   Create a dev environment. Uses sealed networking by default.
 
 ssh <name>
@@ -805,8 +805,8 @@ gateways, environments, identities, recovery points, or event history.
 envd init
 envd gateway install ams1 --host 1.2.3.4 --user root --password
 envd gateway use ams1
-envd run books
-envd ps
+envd start books
+envd list
 ```
 
 The normal user should not need separate `inspect`, `plan`, and `apply`
@@ -824,8 +824,8 @@ Normal commands:
 envd init
 envd gateway install <name> --host <ip> --user root --password
 envd gateway use <name>
-envd run <env>
-envd ps
+envd start <env>
+envd list
 envd shell <env>
 envd stop <env>
 envd start <env>
@@ -994,7 +994,7 @@ environments:
 
 During propagation, sealed environments must remain fail-closed. If the active
 gateway changed but a sidecar cannot be updated, the sidecar should keep default
-drop policy and `envd ps` should show the issue:
+drop policy and `envd list` should show the issue:
 
 ```text
 NAME   STATE    NET     VPN      PROFILE  ISSUE
@@ -1136,9 +1136,8 @@ next command that needs those images should repair automatically.
 
 Installed `envd` binaries must be self-contained for envd-owned runtime assets.
 The binary embeds the default dev container, sidecar, project-Docker build
-contexts, and gateway render templates. A repo checkout may be used during local
-development, but installed commands must not require `dev-containers/`,
-`deploy/gateway/`, copied compose files, or an `example.env`.
+contexts, and gateway render templates. Installed commands must not require
+repo-local Docker contexts, copied compose files, or gateway `.env` files.
 
 Normal gateway operation is state-driven:
 
@@ -1146,11 +1145,10 @@ Normal gateway operation is state-driven:
 encrypted gateway record -> embedded gateway template -> envd data/runtime dir
 ```
 
-`envd gateway install` and `envd gateway use` are the normal path. `gateway use`
-materializes `config.json` and the local gateway compose file under the envd
-data directory from encrypted state. `gateway import-local` exists only to
-migrate old manual `.env` setups into encrypted state; it is not the normal UX
-and should not be required after installation.
+`envd gateway install` and `envd gateway use` are the only normal gateway path.
+`gateway use` materializes `config.json` and the local gateway compose file
+under the envd data directory from encrypted state. Repo-local gateway `.env`
+files are not part of the product model.
 
 The asset cache should include:
 
@@ -1177,21 +1175,21 @@ Action: envd doctor --deep
 ### Environments
 
 ```bash
-envd run dev1
-envd run dev1 --network sealed
-envd run dev1 --network direct
-envd run dev1 --network offline
+envd start dev1
+envd start dev1 --network sealed
+envd start dev1 --network direct
+envd start dev1 --network offline
 envd shell dev1
 envd stop dev1
 envd start dev1
 envd restart dev1
 envd rm dev1
-envd ps
+envd list
 envd inspect dev1
 envd network set dev1 sealed
 ```
 
-`envd ps` should expose operational state, not just container names:
+`envd list` should expose operational state, not just container names:
 
 ```text
 NAME      STATE    NET      VPN     STORAGE    EGRESS     IDENTITY  PROFILE  ISSUE
@@ -1207,7 +1205,7 @@ last verified gateway egress identity when available. The `STORAGE` column is
 also required so plain storage is never confused with encrypted protected
 storage.
 
-`envd ps` must not show anonymous image IDs as the primary identity. If Docker
+`envd list` must not show anonymous image IDs as the primary identity. If Docker
 only has an image ID, that is a recovery signal, not a normal state. The source
 of truth should be the envd environment spec:
 
@@ -1235,7 +1233,7 @@ envd doctor --deep explains if automatic repair cannot finish.
 
 ### Idle Supervisor And Auto-Stop
 
-Many environments will be created with `envd run` and then forgotten. envd should
+Many environments will be created with `envd start` and then forgotten. envd should
 clean these up automatically without making the user micromanage containers.
 
 This is resource management, not a security primitive. `envd lock` remains the
@@ -1275,7 +1273,7 @@ When auto-stop happens:
 - Close protected storage if the environment uses it.
 - Keep envd state, recovery points, and profile images intact.
 - Record the reason in events.
-- Show the stop reason in `envd ps` and `envd why <env>`.
+- Show the stop reason in `envd list` and `envd why <env>`.
 
 Expected status:
 
@@ -1289,8 +1287,8 @@ safe   stopped  idle 3h    protected  protected storage closed
 Configuration should stay simple:
 
 ```bash
-envd run books --idle-stop 3h
-envd run db --keep-running
+envd start books --idle-stop 3h
+envd start db --keep-running
 envd inspect books
 ```
 
@@ -1362,7 +1360,7 @@ Default behavior:
 
 ```bash
 cd ~/repo/books
-envd run books
+envd start books
 ```
 
 If the command is run inside a Git repo or normal project directory, envd should
@@ -1376,7 +1374,7 @@ that `envd lock` can hide files already present on the host filesystem.
 Useful commands:
 
 ```bash
-envd run books .
+envd start books .
 envd inspect books
 ssh books
 ```
@@ -1398,7 +1396,7 @@ Workspace sync rules:
 - Git remotes and identity operations go through envd-managed policy.
 - `envd inspect` shows the remembered host source path, mount path, and storage
   mode.
-- Protected storage is explicit, for example `envd run books --storage protected`.
+- Protected storage is explicit, for example `envd start books --storage protected`.
 - envd must never label a raw host workspace or normal Docker volume as protected
   storage.
 
@@ -1428,8 +1426,8 @@ Manifest rules:
 - Secrets must live in the encrypted envd store, not the repo.
 - The manifest may declare required secret names, but not secret values.
 - Local user overrides should live outside the repo.
-- `envd run` should read the manifest automatically if present.
-- If required secrets are missing, `envd run` should ask once, save them
+- `envd start` should read the manifest automatically if present.
+- If required secrets are missing, `envd start` should ask once, save them
   encrypted, and continue.
 - If the manifest would change an existing environment, envd should show a
   concise plan and ask before migration.
@@ -1454,7 +1452,7 @@ Rules:
 - `envd rm <env>` is the explicit removal action. After confirmation, it should
   remove the environment, envd-managed storage, env-owned recovery points, and
   env state together.
-- `envd ps`, `envd inspect`, and `envd why` may mention that an automatic
+- `envd list`, `envd inspect`, and `envd why` may mention that an automatic
   recovery point exists when it is relevant, but users should not manage recovery
   points during normal use.
 
@@ -1619,12 +1617,12 @@ fail-closed.
 Raw Docker opt-in:
 
 ```bash
-envd run dev1 --docker raw
+envd start dev1 --docker raw
 ```
 
 Rules:
 
-- Raw host Docker access must be shown in `envd ps` as a risk.
+- Raw host Docker access must be shown in `envd list` as a risk.
 - Raw host Docker containers are not considered sealed.
 - Protected identities are denied while raw host Docker is attached unless a
   separate explicit identity policy allows it.
@@ -1817,7 +1815,7 @@ Docker network name      envd-n-4b109bd0
 Docker volume/mount id   envd-s-91b2d7aa
 ```
 
-`envd ps` maps opaque IDs back to human names only after encrypted state is
+`envd list` maps opaque IDs back to human names only after encrypted state is
 available. When locked, envd may show a minimal locked status, but it should not
 print encrypted names or paths without unlock.
 
@@ -1883,7 +1881,7 @@ should not require hunting for server passwords or repeatedly copying keys.
 Expected commands:
 
 ```bash
-envd run books
+envd start books
 ssh books
 ```
 
@@ -1909,7 +1907,7 @@ Host books
 
 Rules:
 
-- `envd run <env>`, `envd start <env>`, and `envd unlock` install/update normal
+- `envd start <env>`, `envd start <env>`, and `envd unlock` install/update normal
   OpenSSH config for `ssh <env>`.
 - Generated SSH config should expose exactly one human target per environment,
   for example `Host books`, and never expose a durable host SSH listener.
@@ -2035,8 +2033,8 @@ optionally combined with something the user has.
 User-facing contract:
 
 ```text
-envd run <env>                     -> creates normal plain workspace storage
-envd run <env> --storage protected -> creates encrypted protected storage
+envd start <env>                     -> creates normal plain workspace storage
+envd start <env> --storage protected -> creates encrypted protected storage
 envd lock                          -> stops envd workloads and revokes access
 envd stop <env>                    -> stops one environment
 ```
@@ -2057,7 +2055,7 @@ What the user can trust:
 - When an environment is running, tools see a normal filesystem.
 - `envd lock` stops envd-managed environments, revokes secrets/identity grants,
   and closes protected storage when present.
-- `envd ps` and `envd inspect` show storage state plainly.
+- `envd list` and `envd inspect` show storage state plainly.
 
 Visible storage states:
 
@@ -2192,7 +2190,7 @@ Rules:
 
 - Do not pretend normal Docker volumes are encrypted.
 - Persistent unencrypted environment storage is the default normal mode.
-- `envd ps` and `envd inspect` must show storage mode.
+- `envd list` and `envd inspect` must show storage mode.
 - Protected storage is explicit.
 - Identity policies may require protected storage.
 - If protected storage is requested and cannot be mounted safely, environment
@@ -2264,7 +2262,7 @@ Rules:
 - A chain must never silently degrade to only the entry hop.
 - A chain must never silently bypass the chain and use direct networking.
 - Chain egress policy is evaluated at the final exit, not at the entry hop.
-- `envd ps` must show when a chain is active.
+- `envd list` must show when a chain is active.
 - Identity policy should bind to final egress policy and chain health.
 - Chain topology is local envd state and should not be exposed to dev
   containers.
@@ -2784,7 +2782,7 @@ Behavior:
 
 - `.envd.yaml` may declare required secret names.
 - Secret values are never stored in the repo.
-- On `envd run`, if required secrets are missing, envd asks for them, stores
+- On `envd start`, if required secrets are missing, envd asks for them, stores
   them encrypted, and continues.
 - Secrets are injected only into the environment that requested them.
 - Secret names can appear in `envd inspect`; values must never appear in normal
@@ -2851,7 +2849,7 @@ Expected first experience:
 ```bash
 ./install.sh
 envd gateway install ams1 --host 1.2.3.4 --user root --password
-envd run books
+envd start books
 ```
 
 ## Self Management
@@ -2984,7 +2982,7 @@ time:
 envd pkg add web tool:node-lts
 envd pkg add web npm:pnpm
 envd pkg add go tool:go-stable
-envd run app1 --profile web
+envd start app1 --profile web
 ```
 
 Referencing a new profile name creates that profile lazily from the default
@@ -3024,7 +3022,7 @@ Desired workflow:
 envd pkg add default apt:ffmpeg
 envd pkg add web npm:pnpm
 envd pkg add python pip:poetry
-envd run app1 --profile web
+envd start app1 --profile web
 ```
 
 `pkg add` updates the profile manifest and marks the profile as dirty. The next
@@ -3058,7 +3056,7 @@ Rules:
 - Profiles should store package intent, not only a generated Dockerfile.
 - Generated Dockerfiles are build artifacts.
 - Package changes create profile generations.
-- Dirty profiles are built lazily by `envd run`, `envd migrate`, and commands
+- Dirty profiles are built lazily by `envd start`, `envd migrate`, and commands
   that need the profile.
 - Existing environments are not mutated until the user runs a controlled
   migration.
@@ -3106,14 +3104,14 @@ The safe default is sealed:
 
 ```bash
 envd pkg add web apt:ffmpeg
-envd run app1 --profile web
+envd start app1 --profile web
 ```
 
 Explicit direct build/download mode can be attached to the command that triggers
 the build:
 
 ```bash
-envd run app1 --profile web --build-network direct
+envd start app1 --profile web --build-network direct
 envd migrate books --profile web --build-network direct
 ```
 
@@ -3161,7 +3159,7 @@ copied credential files do.
 
 ```bash
 envd identity add work
-envd run dev1 --identity work
+envd start dev1 --identity work
 ```
 
 `identity add` should run an interactive import flow for Git identity, SSH keys,
@@ -3308,7 +3306,7 @@ Required checks:
 - Broker denies access when sealed route is unhealthy.
 - Broker denies access when egress policy fails.
 - Broker grants are revoked after gateway switch until revalidation succeeds.
-- `envd ps` shows identity status.
+- `envd list` shows identity status.
 - `envd doctor --identity` runs negative tests to confirm unsafe access is
   blocked.
 
@@ -3592,7 +3590,7 @@ v1 baseline:
 1. Create source-built `install.sh` bootstrap.
 2. Create Go CLI skeleton.
 3. Implement encrypted config/state model and explicit `envd init`.
-4. Implement environment specs and `envd ps` from envd state plus Docker state.
+4. Implement environment specs and `envd list` from envd state plus Docker state.
 5. Implement image identity, profile tags, drift detection, and automatic image
    deletion recovery.
 6. Implement runtime asset manager with pinned assets and automatic restore.
@@ -3615,7 +3613,7 @@ v1 success criteria:
 
 - A user can install envd from source with `./install.sh`.
 - A user can create one sealed environment and see exact network/storage/image
-  state in `envd ps`.
+  state in `envd list`.
 - A broken gateway, broken DNS, broken sidecar, missing image, or wrong proxy port
   is diagnosed by layer without manual curl/ping debugging.
 - Docker image deletion is repaired for envd-owned images.

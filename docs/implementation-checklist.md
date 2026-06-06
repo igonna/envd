@@ -62,7 +62,7 @@ only where implemented and release-gated.
 - [x] Keep an envd-owned asset cache separate from project data.
 - [x] Restore missing envd-owned images automatically when a command needs them.
 - [x] Detect Docker image drift from anonymous image IDs.
-- [x] Show image identity in `envd ps` and `envd inspect`.
+- [x] Show image identity in `envd list` and `envd inspect`.
 - [x] Fail with a layer-specific diagnostic if asset restore cannot complete.
 
 ### Local Gateway And Proxy
@@ -90,8 +90,7 @@ only where implemented and release-gated.
       needed.
 - [x] Render local gateway config from encrypted gateway state, not manual
       `.env`, for normal operation.
-- [x] Keep `gateway import-local` only as legacy migration from old manual
-      `.env` setups.
+- [x] Remove legacy gateway `.env` import path from the product surface.
 - [x] Update help/docs so `gateway install/use` is the normal path and manual
       `.env` is not normal UX.
 - [x] Add tests proving assets/templates work without a repo checkout.
@@ -133,15 +132,14 @@ only where implemented and release-gated.
 ### Sealed Environment Creation
 
 - [x] Define environment spec format.
-- [x] Implement `envd run <env>`.
-- [x] Implement `envd ps`.
+- [x] Implement `envd start <env>`.
+- [x] Implement `envd list`.
 - [x] Implement `envd inspect <env>`.
 - [x] Implement `envd shell <env>`.
 - [x] Implement `envd stop <env>`.
-- [x] Implement `envd start <env>`.
 - [x] Implement `envd rm <env>`.
 - [x] Use plain storage by default.
-- [x] Show plain storage clearly in `envd ps` and `envd inspect`.
+- [x] Show plain storage clearly in `envd list` and `envd inspect`.
 - [x] Never describe plain storage as encrypted or protected.
 - [x] Generate sidecar container and dev container pair.
 - [x] Share dev container network namespace with sidecar.
@@ -151,7 +149,7 @@ only where implemented and release-gated.
 - [x] Ensure no proxy env vars are required inside sealed dev containers.
 - [x] Verify DNS, TCP, TLS, Docker Hub, and egress IP from inside the sealed env.
 - [x] Mark env healthy only after sealed probes pass.
-- [x] Show network, gateway generation, egress, and issue in `envd ps`.
+- [x] Show network, gateway generation, egress, and issue in `envd list`.
 
 ### Network Modes
 
@@ -198,8 +196,8 @@ only where implemented and release-gated.
 ### v1 Migration From Current System
 
 - [x] Discover old envd containers and sidecars.
-- [x] Discover old gateway `.env` and rendered config where safe.
-- [x] Import existing gateway credentials only after user confirmation.
+- [x] Do not support legacy gateway `.env` migration; configure gateways through
+      `envd gateway install`.
 - [x] Preserve environment names where feasible.
 - [x] Detect existing Docker volumes as plain storage.
 - [x] Do not claim legacy Docker volumes are protected or encrypted.

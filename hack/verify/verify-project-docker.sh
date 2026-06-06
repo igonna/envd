@@ -11,30 +11,22 @@ if [ ! -x "$envd_bin" ]; then
   exit 1
 fi
 
-state_dir=$(mktemp -d "$repo_dir/envd-project-docker-state.XXXXXX")
 env_name="projectdocker"
-password="test-password"
 port="18080"
 
 cleanup() {
-  ENVD_STATE_DIR="$state_dir" ENVD_MASTER_PASSWORD="$password" "$envd_bin" rm "$env_name" --yes >/dev/null 2>&1 || true
-  rm -rf "$state_dir"
+  "$envd_bin" rm "$env_name" --yes >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
 envd() {
-  ENVD_STATE_DIR="$state_dir" ENVD_MASTER_PASSWORD="$password" "$envd_bin" "$@"
+  "$envd_bin" "$@"
 }
 
-if [ -f "$repo_dir/deploy/gateway/.env" ]; then
-  (cd "$repo_dir" && envd gateway import-local verify --yes >/dev/null)
-else
-  echo "verify-project-docker requires deploy/gateway/.env or a prepared gateway import path" >&2
-  exit 1
-fi
+envd gateway status >/dev/null
 
 echo "==> create sealed env with managed project Docker"
-envd run "$env_name" >/dev/null
+envd start "$env_name" >/dev/null
 
 env_id=$(envd shell "$env_name" printenv ENVD_ENV_ID | tr -d '\r\n')
 sidecar="envd-${env_id}-net"

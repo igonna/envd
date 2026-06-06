@@ -58,7 +58,7 @@ envd() {
 
 trap cleanup EXIT INT TERM
 
-envd run "$env_name" --network offline --storage protected >/tmp/envd-linux-luks-run.out
+envd start "$env_name" --network offline --storage protected >/tmp/envd-linux-luks-run.out
 grep -q "Storage: protected" /tmp/envd-linux-luks-run.out
 grep -q "Storage backend: luks2-dmcrypt" /tmp/envd-linux-luks-run.out
 echo "OK: Linux LUKS protected env created"

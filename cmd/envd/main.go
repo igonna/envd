@@ -65,7 +65,6 @@ const (
 	projectDockerImage = "envd-project-docker:27-rootless"
 	gatewayNet         = "vpn-gateway_inside"
 	remoteXrayVersion  = "26.2.6"
-	gatewayDeployDir   = "deploy/gateway"
 	containerAssetsDir = "internal/assets/containers"
 )
 
@@ -296,23 +295,18 @@ func (a app) run(args []string) error {
 			return a.printCommandHelp([]string{"identity"})
 		}
 		return a.withState(func(st *envdState) error { return a.runIdentity(args[1:], st) })
-	case "ps":
-		return a.withState(func(st *envdState) error { return a.runPS(args[1:], st) })
+	case "list":
+		return a.withState(func(st *envdState) error { return a.listEnvs(args[1:], st) })
 	case "inspect":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"inspect"})
 		}
 		return a.withState(func(st *envdState) error { return a.runInspect(args[1:], st) })
-	case "run":
-		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
-			return a.printCommandHelp([]string{"run"})
-		}
-		return a.withState(func(st *envdState) error { return a.runEnv(args[1:], st) })
 	case "start":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"start"})
 		}
-		return a.withState(func(st *envdState) error { return a.startEnv(args[1:], st) })
+		return a.withState(func(st *envdState) error { return a.startOrCreateEnv(args[1:], st) })
 	case "stop":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"stop"})
@@ -615,24 +609,23 @@ Start:
   envd init
   envd gateway install ams1 --host 1.2.3.4 --user root --password --yes
   envd gateway use ams1
-  envd run books
+  envd start books
   envd shell books
 
 Setup:
   init                 create encrypted state
+  lock                 stop envd-managed workloads
   unlock               restore access after lock
   password             change master password
   reset-state          reset forgotten-password state
 
 Environment:
-  run                  create or start an environment
+  start                create or start an environment
   shell                open a shell or run a command
-  ps                   list environments
+  list                 list environments
   inspect              show environment details
-  start                start an environment
   stop                 stop an environment
   rm                   remove an environment
-  lock                 stop envd-managed workloads
 
 Gateway:
   gateway              install/use/list gateways
@@ -709,16 +702,14 @@ Next command: envd init
 `)
 	case "proxy":
 		fmt.Fprint(a.stdout, "Usage:\n  envd proxy\n  envd proxy test\n")
-	case "run":
-		fmt.Fprint(a.stdout, "Usage: envd run ENV [--network sealed|direct|offline] [--profile PROFILE]\n")
+	case "start":
+		fmt.Fprint(a.stdout, "Usage: envd start ENV [--network sealed|direct|offline] [--storage plain|protected] [--profile PROFILE]\n")
 	case "shell":
 		fmt.Fprint(a.stdout, "Usage:\n  envd shell ENV\n  envd shell ENV COMMAND [args]\n")
-	case "ps":
-		fmt.Fprint(a.stdout, "Usage: envd ps\n")
+	case "list":
+		fmt.Fprint(a.stdout, "Usage: envd list\n")
 	case "inspect":
 		fmt.Fprint(a.stdout, "Usage: envd inspect ENV\n")
-	case "start":
-		fmt.Fprint(a.stdout, "Usage: envd start ENV\n")
 	case "stop":
 		fmt.Fprint(a.stdout, "Usage: envd stop ENV\n")
 	case "rm":
@@ -744,7 +735,7 @@ Next command: envd init
 	case "identity":
 		fmt.Fprint(a.stdout, "Usage:\n  envd identity add NAME --ssh-key PATH\n  envd identity list\n  envd identity broker check ENV IDENTITY --class ssh\n")
 	case "migrate":
-		fmt.Fprint(a.stdout, "Usage:\n  envd migrate inspect\n  envd migrate adopt --yes\n  envd migrate protected ENV --yes\n  envd migrate gateway inspect\n")
+		fmt.Fprint(a.stdout, "Usage:\n  envd migrate inspect\n  envd migrate adopt --yes\n  envd migrate protected ENV --yes\n")
 	case "supervisor":
 		fmt.Fprint(a.stdout, "Usage:\n  envd supervisor run [--idle 3h]\n  envd supervisor tick [--idle 3h]\n")
 	case "user":
@@ -907,7 +898,7 @@ func recordDoctorEvents(st *envdState, currentFailures map[string]string) {
 
 func (a app) runGateway(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd gateway <install|use|list|status|inspect|render|egress|rollback|risk|chain|import-local>\n")
+		fmt.Fprint(a.stdout, "Usage: envd gateway <install|use|list|status|inspect|render|egress|rollback|risk|chain>\n")
 		return nil
 	}
 	switch args[0] {
@@ -923,8 +914,6 @@ func (a app) runGateway(args []string, st *envdState) error {
 		return a.runGatewayEgress(st)
 	case "risk":
 		return a.runGatewayRisk(args[1:], st)
-	case "import-local":
-		return a.runGatewayImportLocal(args[1:], st)
 	case "install":
 		return a.runGatewayInstall(args[1:], st)
 	case "use":
@@ -992,9 +981,9 @@ func (a app) runGatewayList(args []string, st *envdState) error {
 	return nil
 }
 
-func (a app) runPS(args []string, st *envdState) error {
+func (a app) listEnvs(args []string, st *envdState) error {
 	if len(args) > 0 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
-		fmt.Fprint(a.stdout, "Usage: envd ps\n")
+		fmt.Fprint(a.stdout, "Usage: envd list\n")
 		return nil
 	}
 	envs, err := listEnvContainers(st)
@@ -1058,7 +1047,7 @@ func (a app) runEnv(args []string, st *envdState) error {
 	}
 	name, network, storage, profile := opts.Name, opts.Network, opts.Storage, opts.Profile
 	if name == "" {
-		return fmt.Errorf("usage: envd run ENV")
+		return fmt.Errorf("usage: envd start ENV")
 	}
 	if err := validateEnvName(name); err != nil {
 		return err
@@ -1221,6 +1210,20 @@ func (a app) runEnv(args []string, st *envdState) error {
 		fmt.Fprintf(a.stdout, "Sidecar: %s\n", netName)
 	}
 	return nil
+}
+
+func (a app) startOrCreateEnv(args []string, st *envdState) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: envd start ENV [--network sealed|direct|offline] [--storage plain|protected] [--profile PROFILE]")
+	}
+	name := args[0]
+	if _, ok := st.Environments[name]; ok {
+		if len(args) != 1 {
+			return fmt.Errorf("environment %q already exists; usage: envd start %s", name, name)
+		}
+		return a.startEnv(args, st)
+	}
+	return a.runEnv(args, st)
 }
 
 func (a app) startEnv(args []string, st *envdState) error {
@@ -2905,14 +2908,12 @@ func shellWords(value string) string {
 
 func (a app) runMigrate(args []string, st *envdState, password []byte) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd migrate inspect|adopt --yes|protected ENV --yes|gateway inspect|ENV --profile PROFILE\n")
+		fmt.Fprint(a.stdout, "Usage: envd migrate inspect|adopt --yes|protected ENV --yes|ENV --profile PROFILE\n")
 		return nil
 	}
 	switch args[0] {
 	case "inspect":
 		return a.runMigrateInspect(st)
-	case "gateway":
-		return a.runMigrateGateway(args[1:], st)
 	case "protected":
 		return a.runMigrateProtected(args[1:], st)
 	case "adopt":
@@ -3125,20 +3126,6 @@ func (a app) runMigrateProtected(args []string, st *envdState) error {
 	return nil
 }
 
-func (a app) runMigrateGateway(args []string, st *envdState) error {
-	if len(args) != 1 || args[0] != "inspect" {
-		return fmt.Errorf("usage: envd migrate gateway inspect")
-	}
-	cfg, err := a.loadGatewayConfigFromFile()
-	if err != nil {
-		return err
-	}
-	st.addEvent("migration", "gateway", "inspected local gateway config; credentials not imported")
-	fmt.Fprintf(a.stdout, "Gateway: local Xray config discovered for %s:%s\n", cfg.ServerIP, cfg.ServerPort)
-	fmt.Fprintln(a.stdout, "Import:  skipped; gateway credentials are not imported without an explicit import implementation")
-	return nil
-}
-
 func (a app) runMigrateInspect(st *envdState) error {
 	envs, err := discoverLegacyEnvs(st)
 	if err != nil {
@@ -3153,12 +3140,6 @@ func (a app) runMigrateInspect(st *envdState) error {
 		}
 		fmt.Fprintf(a.stdout, "%-18s %-10s %-8s %-8s %-12s %-12s %s\n",
 			env.Name, env.Dev.State.Status, env.networkMode(), "plain", volumeStatus(ref.HomeVol), volumeStatus(ref.RepoVol), note)
-	}
-	cfg, err := a.loadGatewayConfigFromFile()
-	if err != nil {
-		fmt.Fprintf(a.stdout, "Gateway: not discovered (%s)\n", redactSensitive(err.Error()))
-	} else {
-		fmt.Fprintf(a.stdout, "Gateway: discovered local Xray config for %s:%s; credentials not imported by inspect\n", cfg.ServerIP, cfg.ServerPort)
 	}
 	return nil
 }
@@ -3190,9 +3171,6 @@ func (a app) runMigrateAdopt(st *envdState) error {
 		adopted++
 	}
 	fmt.Fprintf(a.stdout, "Adopted: %d legacy plain environments\n", adopted)
-	if _, err := a.loadGatewayConfigFromFile(); err == nil {
-		st.addEvent("migration", "gateway", "discovered local gateway config; credentials not imported")
-	}
 	return nil
 }
 
@@ -4133,7 +4111,7 @@ func gatewayRiskReport(name string, rec gatewayRecord, st *envdState) gatewayRis
 	diversity := gatewayDiversity(st)
 	if diversity < 2 {
 		reasons = append(reasons, "only one gateway is configured")
-		actions = append(actions, "install or import a second gateway on a different provider/ASN")
+		actions = append(actions, "install a second gateway on a different provider/ASN")
 		score += 2
 	}
 	if cfg.ServerIP == "" {
@@ -4198,35 +4176,6 @@ func uniqueStrings(values []string) []string {
 		out = append(out, v)
 	}
 	return out
-}
-
-func (a app) runGatewayImportLocal(args []string, st *envdState) error {
-	name, yes, err := parseGatewayImportArgs(args)
-	if err != nil {
-		return err
-	}
-	if !yes {
-		return fmt.Errorf("usage: envd gateway import-local NAME --yes")
-	}
-	if err := validateGatewayName(name); err != nil {
-		return err
-	}
-	cfg, err := a.loadGatewayConfigFromFile()
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	rec := gatewayRecordFromConfig(name, cfg, now)
-	st.Gateways[name] = rec
-	if st.ActiveGateway == "" {
-		st.ActiveGateway = name
-	}
-	st.addEvent("gateway", name, "imported local gateway config into encrypted state")
-	fmt.Fprintf(a.stdout, "Imported: %s\n", name)
-	if st.ActiveGateway == name {
-		fmt.Fprintf(a.stdout, "Active:   %s\n", name)
-	}
-	return nil
 }
 
 func (a app) runGatewayChain(args []string, st *envdState) error {
@@ -5895,10 +5844,6 @@ func sortedGatewayProfileNames(st *envdState) []string {
 	}
 	sort.Strings(names)
 	return names
-}
-
-func (a app) loadGatewayConfigFromFile() (gatewayConfig, error) {
-	return a.loadGatewayConfig()
 }
 
 func gatewayRecordFromConfig(name string, cfg gatewayConfig, now time.Time) gatewayRecord {
@@ -7775,7 +7720,7 @@ func parseRunArgs(args []string) (runOptions, error) {
 			return runOptions{}, fmt.Errorf("unknown option %s", arg)
 		default:
 			if opts.Name != "" {
-				return runOptions{}, fmt.Errorf("usage: envd run ENV")
+				return runOptions{}, fmt.Errorf("usage: envd start ENV")
 			}
 			opts.Name = arg
 		}
@@ -7862,27 +7807,6 @@ func parseProjectManifest(raw []byte) (projectManifest, error) {
 	return manifest, nil
 }
 
-func parseGatewayImportArgs(args []string) (name string, yes bool, err error) {
-	for _, arg := range args {
-		switch arg {
-		case "--yes", "-y":
-			yes = true
-		default:
-			if strings.HasPrefix(arg, "-") {
-				return "", false, fmt.Errorf("unknown option %s", arg)
-			}
-			if name != "" {
-				return "", false, fmt.Errorf("usage: envd gateway import-local NAME --yes")
-			}
-			name = arg
-		}
-	}
-	if name == "" {
-		return "", false, fmt.Errorf("usage: envd gateway import-local NAME --yes")
-	}
-	return name, yes, nil
-}
-
 func parseMigrateProfileArgs(args []string) (name, profile string, err error) {
 	if len(args) != 3 || args[1] != "--profile" {
 		return "", "", fmt.Errorf("usage: envd migrate ENV --profile PROFILE")
@@ -7914,32 +7838,6 @@ func validateGatewayName(name string) error {
 		}
 	}
 	return nil
-}
-
-func (a app) loadGatewayConfig() (gatewayConfig, error) {
-	cfg := gatewayConfig{
-		BindIP:       "127.0.0.1",
-		SOCKSPort:    11080,
-		HTTPHostPort: 11081,
-		SOCKSInner:   2088,
-		HTTPInner:    2089,
-		Raw:          map[string]string{},
-	}
-	envPath := filepath.Join(a.root, gatewayDeployDir, ".env")
-	vals, err := readDotEnv(envPath)
-	if err != nil {
-		return cfg, fmt.Errorf("gateway config missing at %s: %w", envPath, err)
-	}
-	cfg.Raw = vals
-
-	cfg.BindIP = stringVal(vals, "XRAY_BIND_IP", cfg.BindIP)
-	cfg.SOCKSPort = intVal(vals, "XRAY_SOCKS_PORT", cfg.SOCKSPort)
-	cfg.SOCKSInner = intVal(vals, "XRAY_INBOUND_PORT", cfg.SOCKSInner)
-	cfg.HTTPInner = intVal(vals, "XRAY_HTTP_PROXY_PORT", intVal(vals, "XRAY_HTTP_RPOXY_PORT", cfg.HTTPInner))
-	cfg.HTTPHostPort = intVal(vals, "XRAY_HTTP_PROXY_HOST_PORT", intVal(vals, "XRAY_HTTP_PROXY_PORT", intVal(vals, "XRAY_HTTP_RPOXY_PORT", cfg.HTTPHostPort)))
-	cfg.ServerIP = stringVal(vals, "XRAY_SERVER_IP", "")
-	cfg.ServerPort = stringVal(vals, "XRAY_SERVER_PORT", "")
-	return cfg, nil
 }
 
 func (xrayProvider) Name() string {
@@ -7991,12 +7889,6 @@ func (xrayProvider) Render(a app, cfg gatewayConfig) ([]byte, error) {
 }
 
 func loadGatewayTemplate(root string) ([]byte, error) {
-	if root != "" {
-		templatePath := filepath.Join(root, gatewayDeployDir, "config.template.json")
-		if raw, err := os.ReadFile(templatePath); err == nil {
-			return raw, nil
-		}
-	}
 	return envdassets.FS.ReadFile("gateway/config.template.json")
 }
 
@@ -8273,7 +8165,7 @@ func nextActionForError(err error) string {
 	case "remote gateway":
 		return "Run envd gateway egress; if it fails, the remote gateway path is down."
 	case "sealed sidecar":
-		return "Run envd ps and recreate or restart the affected sealed environment."
+		return "Run envd list and recreate or restart the affected sealed environment."
 	case "project Docker":
 		return "Run envd stop ENV then envd start ENV; the managed project Docker endpoint failed."
 	case "DNS":
@@ -8285,53 +8177,6 @@ func nextActionForError(err error) string {
 	default:
 		return ""
 	}
-}
-
-func readDotEnv(path string) (map[string]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	vals := make(map[string]string)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, val, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		val = strings.Trim(strings.TrimSpace(val), `"'`)
-		vals[key] = val
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return vals, nil
-}
-
-func stringVal(vals map[string]string, key, fallback string) string {
-	if v, ok := vals[key]; ok && v != "" {
-		return v
-	}
-	return fallback
-}
-
-func intVal(vals map[string]string, key string, fallback int) int {
-	v, ok := vals[key]
-	if !ok || v == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return fallback
-	}
-	return n
 }
 
 func publishedPortMatches(output string, want int) bool {
@@ -8393,7 +8238,6 @@ func isRepoRoot(dir string) bool {
 	markers := []string{
 		"go.mod",
 		filepath.Join("internal", "assets", "assets.go"),
-		filepath.Join(gatewayDeployDir, ".env"),
 	}
 	for _, marker := range markers {
 		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
