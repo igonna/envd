@@ -591,6 +591,21 @@ func TestActiveGatewayConfigRequiresEncryptedState(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "no active gateway") {
 		t.Fatalf("expected active gateway error, got %v", err)
 	}
+	if strings.ContainsAny(err.Error(), "`<>") {
+		t.Fatalf("active gateway error is not paste-safe: %q", err.Error())
+	}
+}
+
+func TestActiveGatewayConfigSuggestsReadyGateway(t *testing.T) {
+	st := envdState{
+		Gateways: map[string]gatewayRecord{
+			"frankfurt2": {Name: "frankfurt2", ServerIP: "150.241.79.37", ServerPort: "443"},
+		},
+	}
+	_, _, err := (app{root: t.TempDir()}).activeGatewayConfig(&st)
+	if err == nil || !strings.Contains(err.Error(), "envd gateway use frankfurt2") {
+		t.Fatalf("expected active gateway suggestion, got %v", err)
+	}
 }
 
 func TestActiveGatewayConfigUsesEncryptedStateWithoutRepo(t *testing.T) {
@@ -1536,15 +1551,25 @@ func TestGatewayInstallPlanParsingAndOutput(t *testing.T) {
 	printGatewayInstallPlan(&out, plan)
 	got := out.String()
 	for _, want := range []string{
-		"Gateway:  ams1",
+		"Name:     ams1",
 		"Remote:   root@1.2.3.4",
-		"detect OS, architecture, memory, disk, init system, and firewall",
-		"store remote password encrypted only after successful verification",
-		"Apply:    skipped unless --yes is provided",
+		"Gateway:  xray (censorship-resistant)",
+		"Action:   adopt",
+		"Password: requested",
+		"Apply:    no",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("install plan output missing %q:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "Step 01") {
+		t.Fatalf("default install plan should be compact:\n%s", got)
+	}
+	plan.Verbose = true
+	out.Reset()
+	printGatewayInstallPlan(&out, plan)
+	if !strings.Contains(out.String(), "Step 01") {
+		t.Fatalf("verbose install plan missing detailed steps:\n%s", out.String())
 	}
 	if _, err := parseGatewayInstallPlan([]string{"ams1", "--user", "root"}); err == nil {
 		t.Fatal("accepted install plan without host")
@@ -1567,8 +1592,75 @@ func TestRunGatewayInstallDryRunRecordsPlanOnly(t *testing.T) {
 	if len(st.Events) != 1 || !strings.Contains(st.Events[0].Message, "planned remote install") {
 		t.Fatalf("dry-run did not record plan event: %+v", st.Events)
 	}
-	if !strings.Contains(out.String(), "skipped unless --yes is provided") {
+	if !strings.Contains(out.String(), "Apply:    no") {
 		t.Fatalf("dry-run output missing non-apply note: %q", out.String())
+	}
+}
+
+func TestRunGatewayInstallPreviewWithoutYesSucceeds(t *testing.T) {
+	server := startTestSSHServer(t, "root", "secret")
+	t.Setenv("ENVD_GATEWAY_PASSWORD", "secret")
+	st := envdState{}
+	var out bytes.Buffer
+	err := (app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}).runGatewayInstall([]string{
+		"ams1",
+		"--host", server.addr,
+		"--user", "root",
+		"--password",
+	}, &st)
+	if err != nil {
+		t.Fatalf("gateway install preview should not fail: %v\n%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{"Probe:    ok", "Ready:    verified; no remote changes applied", "Next:     envd gateway install ams1 --host " + server.addr + " --user root --yes"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("preview output missing %q:\n%s", want, got)
+		}
+	}
+	if _, ok := st.Gateways["ams1"]; ok {
+		t.Fatalf("preview created usable gateway profile before apply: %+v", st.Gateways["ams1"])
+	}
+	if st.RemoteGateways["ams1"].Password != "secret" {
+		t.Fatalf("preview did not keep verified remote credentials for apply: %+v", st.RemoteGateways["ams1"])
+	}
+}
+
+func TestRunGatewayInstallExistingEnvdConfigRequiresReplace(t *testing.T) {
+	server := startTestSSHServer(t, "root", "secret")
+	server.setHandler(func(command string) (string, uint32) {
+		if strings.Contains(command, "envd_owned_service") {
+			return "envd_owned_service=true\nenvd_owned_config=true\nxray_binary=/usr/local/bin/xray\nxray_version=Xray 26.2.6\n", 0
+		}
+		return defaultTestSSHResponse(command)
+	})
+	t.Setenv("ENVD_GATEWAY_PASSWORD", "secret")
+	st := envdState{}
+	var out bytes.Buffer
+	err := (app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}).runGatewayInstall([]string{
+		"frankfurt2",
+		"--host", server.addr,
+		"--user", "root",
+		"--password",
+	}, &st)
+	if err != nil {
+		t.Fatalf("existing envd-owned preview should not fail: %v\n%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{"existing envd-owned gateway config found", "--replace --yes"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("existing envd preview output missing %q:\n%s", want, got)
+		}
+	}
+	out.Reset()
+	err = (app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}).runGatewayInstall([]string{
+		"frankfurt2",
+		"--host", server.addr,
+		"--user", "root",
+		"--password",
+		"--yes",
+	}, &st)
+	if err == nil || !strings.Contains(err.Error(), "rerun with --replace") {
+		t.Fatalf("apply over existing envd config without replace should fail, got %v\n%s", err, out.String())
 	}
 }
 
@@ -1609,7 +1701,7 @@ func TestRunGatewayInstallProbeStoresEncryptedRemoteInspection(t *testing.T) {
 		t.Fatalf("gateway install probe failed: %v", err)
 	}
 	got := out.String()
-	for _, want := range []string{"Probe:    ok", "ubuntu 24.04 aarch64", "existing non-envd Xray config found", "Material: generated envd-owned Xray Reality config"} {
+	for _, want := range []string{"Probe:    ok", "ubuntu 24.04 aarch64", "existing non-envd Xray config found", "Config:   generated"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("probe output missing %q:\n%s", want, got)
 		}
@@ -1684,6 +1776,48 @@ func TestGenerateRemoteGatewayMaterial(t *testing.T) {
 			t.Fatalf("material missing %q:\nconfig=%s\nunit=%s", want, material.ConfigJSON, material.ServiceUnit)
 		}
 	}
+	if strings.Contains(material.ConfigJSON, `"encryption"`) {
+		t.Fatalf("server inbound config must not contain VLESS client encryption:\n%s", material.ConfigJSON)
+	}
+	if !strings.Contains(material.ConfigJSON, `"decryption": "none"`) {
+		t.Fatalf("server inbound config missing VLESS decryption setting:\n%s", material.ConfigJSON)
+	}
+}
+
+func TestRemoteInstallXrayScriptBootstrapsRequiredTools(t *testing.T) {
+	material := remoteGatewayMaterial{
+		XrayVersion: remoteXrayVersion,
+		ConfigJSON:  "{}",
+	}
+	script := remoteInstallXrayScript(material)
+	for _, want := range []string{
+		"command -v unzip",
+		"apt-get install -y --no-install-recommends $need_pkgs",
+		"dnf install -y $need_pkgs",
+		"yum install -y $need_pkgs",
+		"apk add --no-cache $need_pkgs",
+		"missing required install tools",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("remote install script missing %q:\n%s", want, script)
+		}
+	}
+}
+
+func TestExtractLastIPLineIgnoresDockerPullNoise(t *testing.T) {
+	raw := strings.Join([]string{
+		"Unable to find image 'alpine:3.21' locally",
+		"3.21: Pulling from library/alpine",
+		"Status: Downloaded newer image for alpine:3.21",
+		"150.241.79.37",
+		"",
+	}, "\n")
+	if got := extractLastIPLine(raw); got != "150.241.79.37" {
+		t.Fatalf("extractLastIPLine = %q", got)
+	}
+	if got := extractLastIPLine("no ip here"); got != "" {
+		t.Fatalf("unexpected IP from noisy output: %q", got)
+	}
 }
 
 func TestRunGatewayInstallApplyInstallsVerifiesAndStoresProfile(t *testing.T) {
@@ -1741,7 +1875,7 @@ func TestRunGatewayInstallApplyInstallsVerifiesAndStoresProfile(t *testing.T) {
 		t.Fatalf("gateway install apply failed: %v\n%s", err, out.String())
 	}
 	got := out.String()
-	for _, want := range []string{"Apply:    ok", "Verify:   remote process ok", "Profile:  stored"} {
+	for _, want := range []string{"Apply:    ok", "Verify:   remote process ok", "Stored:   gateway profile", "Next:     envd gateway use ams1"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("apply output missing %q:\n%s", want, got)
 		}
@@ -1764,6 +1898,51 @@ func TestRunGatewayInstallApplyInstallsVerifiesAndStoresProfile(t *testing.T) {
 	}
 	if !st.RemoteGateways["ams1"].ProviderState.EnvdOwnedConfig {
 		t.Fatalf("remote provider state not marked envd-owned after apply: %+v", st.RemoteGateways["ams1"].ProviderState)
+	}
+}
+
+func TestRunGatewayInstallReplaceRegeneratesMaterial(t *testing.T) {
+	server := startTestSSHServer(t, "root", "secret")
+	t.Setenv("ENVD_GATEWAY_PASSWORD", "secret")
+	oldMaterial := remoteGatewayMaterial{
+		XrayVersion:       remoteXrayVersion,
+		Port:              443,
+		UUID:              "old-uuid",
+		RealityPrivateKey: "old-private",
+		RealityPublicKey:  "old-public",
+		ShortID:           "old-short",
+		SNI:               "old.example",
+		ConfigJSON:        `{"old":true}`,
+		ServiceUnit:       remoteXrayServiceUnit(),
+	}
+	st := envdState{RemoteGateways: map[string]remoteGatewayRecord{
+		"ams1": {
+			Name:     "ams1",
+			Host:     server.addr,
+			User:     "root",
+			Password: "secret",
+			Material: oldMaterial,
+		},
+	}}
+	var out bytes.Buffer
+	err := (app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}).runGatewayInstall([]string{
+		"ams1",
+		"--host", server.addr,
+		"--user", "root",
+		"--password",
+		"--replace",
+		"--probe",
+		"--dry-run",
+	}, &st)
+	if err != nil {
+		t.Fatalf("replace probe failed: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "Config:   regenerated") {
+		t.Fatalf("replace output did not report regenerated material:\n%s", out.String())
+	}
+	got := st.RemoteGateways["ams1"].Material
+	if got.UUID == oldMaterial.UUID || got.ConfigJSON == oldMaterial.ConfigJSON || got.RealityPrivateKey == oldMaterial.RealityPrivateKey {
+		t.Fatalf("replace reused old material: %+v", got)
 	}
 }
 
@@ -1804,6 +1983,7 @@ func TestRunGatewayInstallApplyRollsBackEnvdOwnedConfigOnVerifyFailure(t *testin
 		"--host", server.addr,
 		"--user", "root",
 		"--password",
+		"--replace",
 		"--yes",
 	}, &st)
 	if err == nil || !strings.Contains(err.Error(), "remote provider process verification failed") {
@@ -2553,6 +2733,49 @@ func TestGatewayActivationTracksPreviousAndRollbackEvents(t *testing.T) {
 	}
 	if len(st.Events) == 0 || !strings.Contains(st.Events[len(st.Events)-1].Message, "rollback activated generation 4") {
 		t.Fatalf("rollback event missing: %+v", st.Events)
+	}
+}
+
+func TestGatewayListShowsRemoteLocalAndChains(t *testing.T) {
+	now := time.Now().UTC()
+	st := envdState{
+		ActiveGateway:   "ams1",
+		PreviousGateway: "local1",
+		Gateways: map[string]gatewayRecord{
+			"ams1":   gatewayRecordFromConfig("ams1", gatewayConfig{ServerIP: "150.241.79.37", ServerPort: "443", Raw: map[string]string{}}, now),
+			"local1": {Name: "local1", ServerIP: "203.0.113.10", ServerPort: "443", ImportedFromLocal: true},
+		},
+		RemoteGateways: map[string]remoteGatewayRecord{
+			"ams1":  {Name: "ams1", Host: "150.241.79.37", Provider: "xray", Strategy: "censorship-resistant", Mode: "replace"},
+			"draft": {Name: "draft", Host: "198.51.100.20", Provider: "xray", Strategy: "fast", Mode: "install"},
+		},
+		GatewayChains: map[string]gatewayChainRecord{
+			"chain1": {Name: "chain1", Entry: "ams1", Exit: "local1"},
+		},
+	}
+	var out bytes.Buffer
+	if err := (app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}).runGatewayList(nil, &st); err != nil {
+		t.Fatalf("gateway list failed: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"NAME",
+		"ams1",
+		"active",
+		"remote",
+		"150.241.79.37",
+		"censorship-resistant",
+		"draft",
+		"fast",
+		"chain1",
+		"ams1->local1",
+		"local1",
+		"previous",
+		"imported",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("gateway list missing %q:\n%s", want, got)
+		}
 	}
 }
 

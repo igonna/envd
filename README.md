@@ -81,6 +81,7 @@ envd run offline --network offline
 
 ```bash
 envd proxy                         # show host SOCKS/HTTP proxy endpoints
+envd gateway list                  # list configured gateways
 envd gateway status                # show active gateway
 envd gateway rollback              # return to previous verified gateway
 envd user uri ams1                 # print app import URI

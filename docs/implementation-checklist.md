@@ -117,6 +117,7 @@ only where implemented and release-gated.
 
 - [x] Implement `envd gateway install <name>`.
 - [x] Implement `envd gateway use <name>`.
+- [x] Implement `envd gateway list`.
 - [x] Implement `envd gateway status`.
 - [x] Implement `envd gateway inspect`.
 - [x] Implement `envd gateway egress`.

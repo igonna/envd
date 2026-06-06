@@ -74,8 +74,11 @@ else
   exit 1
 fi
 
-cp "$out" "$install_dir/envd"
-chmod 755 "$install_dir/envd"
+tmp_install="$install_dir/envd.tmp.$$"
+cp "$out" "$tmp_install"
+xattr -c "$tmp_install" 2>/dev/null || true
+chmod 755 "$tmp_install"
+mv "$tmp_install" "$install_dir/envd"
 
 duplicates=""
 for candidate in $(find_envd_on_path); do

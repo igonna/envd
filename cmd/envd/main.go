@@ -268,10 +268,19 @@ func (a app) run(args []string) error {
 		}
 		return a.withState(func(st *envdState) error { return a.runGateway(args[1:], st) })
 	case "user":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"user"})
+		}
 		return a.withState(func(st *envdState) error { return a.runUser(args[1:], st) })
 	case "internet":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"internet"})
+		}
 		return a.withState(func(st *envdState) error { return a.runInternet(args[1:], st) })
 	case "hosting":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"hosting"})
+		}
 		return a.withState(func(st *envdState) error { return a.runHosting(args[1:], st) })
 	case "identity":
 		if len(args) > 1 && args[1] == "broker" {
@@ -280,18 +289,36 @@ func (a app) run(args []string) error {
 		if len(args) > 1 && args[1] == "ssh-agent" {
 			return a.runIdentitySSHAgent(args[2:])
 		}
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"identity"})
+		}
 		return a.withState(func(st *envdState) error { return a.runIdentity(args[1:], st) })
 	case "ps":
 		return a.withState(func(st *envdState) error { return a.runPS(args[1:], st) })
 	case "inspect":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"inspect"})
+		}
 		return a.withState(func(st *envdState) error { return a.runInspect(args[1:], st) })
 	case "run":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"run"})
+		}
 		return a.withState(func(st *envdState) error { return a.runEnv(args[1:], st) })
 	case "start":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"start"})
+		}
 		return a.withState(func(st *envdState) error { return a.startEnv(args[1:], st) })
 	case "stop":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"stop"})
+		}
 		return a.withState(func(st *envdState) error { return a.stopEnv(args[1:], st) })
 	case "rm":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"rm"})
+		}
 		return a.withState(func(st *envdState) error { return a.rmEnv(args[1:], st) })
 	case "lock":
 		return a.withState(func(st *envdState) error { return a.lockEnvd(args[1:], st) })
@@ -300,21 +327,36 @@ func (a app) run(args []string) error {
 	case "ssh-proxy":
 		return a.runSSHProxy(args[1:])
 	case "code":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"code"})
+		}
 		return a.withState(func(st *envdState) error { return a.runCode(args[1:], st) })
 	case "network":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"network"})
+		}
 		return a.withStatePasswordSaveOnError(func(st *envdState, password []byte) error { return a.networkEnv(args[1:], st, password) })
 	case "pkg":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"pkg"})
+		}
 		return a.withState(func(st *envdState) error { return a.runPkg(args[1:], st) })
 	case "supervisor":
 		return a.runSupervisor(args[1:])
 	case "migrate":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"migrate"})
+		}
 		return a.withStatePasswordSaveOnError(func(st *envdState, password []byte) error { return a.runMigrate(args[1:], st, password) })
 	case "events":
 		return a.withState(func(st *envdState) error { return a.runEvents(args[1:], st) })
 	case "why":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"why"})
+		}
 		return a.withState(func(st *envdState) error { return a.runWhy(args[1:], st) })
 	default:
-		return fmt.Errorf("unknown command %q\n\nRun `envd help` for available commands.", args[0])
+		return fmt.Errorf("unknown command %q\n\nRun envd help for available commands.", args[0])
 	}
 }
 
@@ -487,79 +529,30 @@ func (a app) printHelp() {
 	fmt.Fprint(a.stdout, `envd - sealed development environments with a managed gateway
 
 Usage:
-  envd <command> [args]
-  envd help <command>
+  envd COMMAND [args]
+  envd help COMMAND
 
-Quick Start:
+Start:
   envd init
-  envd gateway install ams1 --host 1.2.3.4 --user root --password --probe --dry-run
   envd gateway install ams1 --host 1.2.3.4 --user root --password --yes
   envd gateway use ams1
   envd run books
   envd shell books
-  envd doctor --deep
 
 Commands:
-  init
-        Create encrypted state and master password
+  init                 create encrypted state
+  gateway              install/use/list gateways
+  run                  create or start an environment
+  shell                open a shell or run a command
+  ps                   list environments
+  doctor               diagnose what is broken
+  lock                 stop envd-managed workloads
+  proxy                show/test local proxy ports
 
-  password change
-        Change master password without deleting encrypted state
+More:
+  code, pkg, network, identity, internet, hosting, migrate, events, why
 
-  reset-state --delete --i-understand-this-deletes-envd-state --yes
-        Move encrypted state to backup after typed confirmation
-
-  gateway install <name> --host <ip> --user <user> --password [--probe] [--dry-run|--yes]
-        Inspect, plan, and install/adopt a remote gateway
-  gateway use <name>
-        Verify and activate a gateway
-  gateway status|inspect|render|egress|rollback
-        Manage and inspect the active gateway
-
-  proxy
-        Show host SOCKS/HTTP proxy endpoints
-  proxy test
-        Test SOCKS and HTTP CONNECT through the host proxy
-
-  run <env> [--network sealed|direct|offline] [--profile <profile>]
-        Create/start an environment
-  shell <env> [command...]
-        Open a shell or run a command inside an environment
-  ps
-        List environments
-  inspect <env>
-        Show environment details
-  start <env>
-        Start an environment
-  stop <env>
-        Stop an environment
-  rm <env> --yes
-        Remove an environment and envd-owned volumes
-  lock
-        Stop envd-managed workloads and clear cached unlock
-
-  doctor [--deep]
-        Diagnose Docker, gateway, proxy, and sealed networking
-  why <env>
-        Explain an environment state
-  events
-        Show encrypted event log
-
-  network set <env> <sealed|direct|offline>
-        Change network mode
-  pkg add <profile> <apt|npm|tool>:<package>
-        Add package intent to a profile
-  code <env> [--print|--launch]
-        Print or launch VS Code Remote SSH config
-
-Other Commands:
-  user, internet, hosting, identity, migrate, supervisor, ssh-proxy, version, help
-
-Options:
-  -h, --help
-        Show help for a command
-
-Run envd help <command> for full command-specific usage.
+Run envd help COMMAND for usage.
 
 `)
 }
@@ -598,9 +591,10 @@ Next command: envd init
 `)
 	case "gateway":
 		fmt.Fprint(a.stdout, `Usage:
-  envd gateway install <name> --host <ip> --user <user> --password --probe --dry-run
-  envd gateway install <name> --host <ip> --user <user> --password --yes
-  envd gateway use <name>
+  envd gateway install NAME --host HOST --user USER --password [--yes] [--replace] [--verbose]
+  envd gateway install NAME --host HOST --user USER --password --probe --dry-run
+  envd gateway list
+  envd gateway use NAME
   envd gateway status
   envd gateway inspect
   envd gateway render
@@ -611,51 +605,51 @@ Next command: envd init
 	case "proxy":
 		fmt.Fprint(a.stdout, "Usage:\n  envd proxy\n  envd proxy test\n")
 	case "run":
-		fmt.Fprint(a.stdout, "Usage: envd run <env> [--network sealed|direct|offline] [--profile <profile>]\n")
+		fmt.Fprint(a.stdout, "Usage: envd run ENV [--network sealed|direct|offline] [--profile PROFILE]\n")
 	case "shell":
-		fmt.Fprint(a.stdout, "Usage:\n  envd shell <env>\n  envd shell <env> <command> [args]\n")
+		fmt.Fprint(a.stdout, "Usage:\n  envd shell ENV\n  envd shell ENV COMMAND [args]\n")
 	case "ps":
 		fmt.Fprint(a.stdout, "Usage: envd ps\n")
 	case "inspect":
-		fmt.Fprint(a.stdout, "Usage: envd inspect <env>\n")
+		fmt.Fprint(a.stdout, "Usage: envd inspect ENV\n")
 	case "start":
-		fmt.Fprint(a.stdout, "Usage: envd start <env>\n")
+		fmt.Fprint(a.stdout, "Usage: envd start ENV\n")
 	case "stop":
-		fmt.Fprint(a.stdout, "Usage: envd stop <env>\n")
+		fmt.Fprint(a.stdout, "Usage: envd stop ENV\n")
 	case "rm":
-		fmt.Fprint(a.stdout, "Usage: envd rm <env> --yes\n")
+		fmt.Fprint(a.stdout, "Usage: envd rm ENV --yes\n")
 	case "lock":
 		fmt.Fprint(a.stdout, "Usage: envd lock\n\nStops envd-managed workloads, active envd shells, and clears cached unlock.\n")
 	case "doctor":
 		fmt.Fprint(a.stdout, "Usage:\n  envd doctor\n  envd doctor --deep\n")
 	case "why":
-		fmt.Fprint(a.stdout, "Usage: envd why <env>\n")
+		fmt.Fprint(a.stdout, "Usage: envd why ENV\n")
 	case "events":
 		fmt.Fprint(a.stdout, "Usage: envd events\n")
 	case "internet":
 		fmt.Fprint(a.stdout, "Usage:\n  envd internet status\n  envd internet report\n")
 	case "hosting":
-		fmt.Fprint(a.stdout, "Usage:\n  envd hosting check\n  envd hosting shortlist\n  envd hosting update --url <providers.json> --sig <sig> --key <pubkey>\n")
+		fmt.Fprint(a.stdout, "Usage:\n  envd hosting check\n  envd hosting shortlist\n  envd hosting update --url PROVIDERS_JSON --sig SIG --key PUBKEY\n")
 	case "network":
-		fmt.Fprint(a.stdout, "Usage: envd network set <env> <sealed|direct|offline>\n")
+		fmt.Fprint(a.stdout, "Usage: envd network set ENV sealed|direct|offline\n")
 	case "pkg":
-		fmt.Fprint(a.stdout, "Usage:\n  envd pkg add <profile> <apt|npm|tool>:<package>\n  envd pkg suggest <env>\n  envd pkg promote <env> --to <profile>\n")
+		fmt.Fprint(a.stdout, "Usage:\n  envd pkg add PROFILE apt:PACKAGE\n  envd pkg add PROFILE npm:PACKAGE\n  envd pkg add PROFILE tool:NAME\n  envd pkg suggest ENV\n  envd pkg promote ENV --to PROFILE\n")
 	case "code":
-		fmt.Fprint(a.stdout, "Usage:\n  envd code <env> --print\n  envd code <env> --launch\n")
+		fmt.Fprint(a.stdout, "Usage:\n  envd code ENV --print\n  envd code ENV --launch\n")
 	case "ssh-proxy":
-		fmt.Fprint(a.stdout, "Usage: envd ssh-proxy <env>\n")
+		fmt.Fprint(a.stdout, "Usage: envd ssh-proxy ENV\n")
 	case "identity":
-		fmt.Fprint(a.stdout, "Usage:\n  envd identity add <name> --ssh-key <path>\n  envd identity list\n  envd identity broker check <env> <identity> --class ssh\n")
+		fmt.Fprint(a.stdout, "Usage:\n  envd identity add NAME --ssh-key PATH\n  envd identity list\n  envd identity broker check ENV IDENTITY --class ssh\n")
 	case "migrate":
-		fmt.Fprint(a.stdout, "Usage:\n  envd migrate inspect\n  envd migrate adopt --yes\n  envd migrate protected <env> --yes\n  envd migrate gateway inspect\n")
+		fmt.Fprint(a.stdout, "Usage:\n  envd migrate inspect\n  envd migrate adopt --yes\n  envd migrate protected ENV --yes\n  envd migrate gateway inspect\n")
 	case "supervisor":
 		fmt.Fprint(a.stdout, "Usage:\n  envd supervisor run [--idle 3h]\n  envd supervisor tick [--idle 3h]\n")
 	case "user":
-		fmt.Fprint(a.stdout, "Usage: envd user uri <gateway>\n")
+		fmt.Fprint(a.stdout, "Usage: envd user uri GATEWAY\n")
 	case "version":
 		fmt.Fprint(a.stdout, "Usage: envd version\n")
 	case "help":
-		fmt.Fprint(a.stdout, "Usage:\n  envd help\n  envd help <command>\n")
+		fmt.Fprint(a.stdout, "Usage:\n  envd help\n  envd help COMMAND\n")
 	default:
 		return fmt.Errorf("unknown help topic %q", args[0])
 	}
@@ -810,10 +804,12 @@ func recordDoctorEvents(st *envdState, currentFailures map[string]string) {
 
 func (a app) runGateway(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd gateway <install|use|status|inspect|render|egress|rollback|risk|chain|import-local>\n")
+		fmt.Fprint(a.stdout, "Usage: envd gateway <install|use|list|status|inspect|render|egress|rollback|risk|chain|import-local>\n")
 		return nil
 	}
 	switch args[0] {
+	case "list", "ls":
+		return a.runGatewayList(args[1:], st)
 	case "status":
 		return a.runGatewayStatus(st)
 	case "inspect":
@@ -839,6 +835,60 @@ func (a app) runGateway(args []string, st *envdState) error {
 	}
 }
 
+func (a app) runGatewayList(args []string, st *envdState) error {
+	if len(args) > 0 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
+		fmt.Fprint(a.stdout, "Usage: envd gateway list\n")
+		return nil
+	}
+	if len(args) != 0 {
+		return fmt.Errorf("usage: envd gateway list")
+	}
+	names := sortedGatewayNames(st)
+	if len(names) == 0 {
+		fmt.Fprintln(a.stdout, "No gateways. Add one with: envd gateway install NAME --host HOST --user root --password")
+		return nil
+	}
+	fmt.Fprintf(a.stdout, "%-18s %-8s %-8s %-22s %-10s %-22s %s\n", "NAME", "ACTIVE", "TYPE", "REMOTE", "PROVIDER", "STRATEGY", "READY")
+	for _, name := range names {
+		active := ""
+		switch name {
+		case st.ActiveGateway:
+			active = "active"
+		case st.PreviousGateway:
+			active = "previous"
+		}
+		typ := "local"
+		remote := "-"
+		provider := "xray"
+		strategy := "-"
+		ready := "yes"
+		if chain, ok := st.GatewayChains[name]; ok {
+			typ = "chain"
+			remote = chain.Entry + "->" + chain.Exit
+			provider = "chain"
+			strategy = "fail-closed"
+			ready = "no"
+		} else if rec, ok := st.RemoteGateways[name]; ok {
+			typ = "remote"
+			remote = rec.Host
+			provider = defaultString(rec.Provider, "xray")
+			strategy = defaultString(rec.Strategy, "-")
+			if _, ok := st.Gateways[name]; ok {
+				ready = "yes"
+			} else {
+				ready = "no"
+			}
+		} else if rec, ok := st.Gateways[name]; ok {
+			remote = rec.ServerIP + ":" + rec.ServerPort
+			if rec.ImportedFromLocal {
+				typ = "imported"
+			}
+		}
+		fmt.Fprintf(a.stdout, "%-18s %-8s %-8s %-22s %-10s %-22s %s\n", name, active, typ, remote, provider, strategy, ready)
+	}
+	return nil
+}
+
 func (a app) runPS(args []string, st *envdState) error {
 	if len(args) > 0 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
 		fmt.Fprint(a.stdout, "Usage: envd ps\n")
@@ -861,7 +911,7 @@ func (a app) runPS(args []string, st *envdState) error {
 
 func (a app) runInspect(args []string, st *envdState) error {
 	if len(args) != 1 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd inspect <env>\n")
+		fmt.Fprint(a.stdout, "Usage: envd inspect ENV\n")
 		return nil
 	}
 	env, err := inspectEnv(st, args[0])
@@ -905,7 +955,7 @@ func (a app) runEnv(args []string, st *envdState) error {
 	}
 	name, network, storage, profile := opts.Name, opts.Network, opts.Storage, opts.Profile
 	if name == "" {
-		return fmt.Errorf("usage: envd run <env>")
+		return fmt.Errorf("usage: envd run ENV")
 	}
 	if err := validateEnvName(name); err != nil {
 		return err
@@ -1068,7 +1118,7 @@ func (a app) runEnv(args []string, st *envdState) error {
 
 func (a app) startEnv(args []string, st *envdState) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: envd start <env>")
+		return fmt.Errorf("usage: envd start ENV")
 	}
 	name := args[0]
 	ref, err := resolveEnvRef(st, name)
@@ -1238,7 +1288,7 @@ func devStartCommandsForMode(networkMode, devName string) [][]string {
 
 func (a app) networkEnv(args []string, st *envdState, password []byte) error {
 	if len(args) != 3 || args[0] != "set" {
-		return fmt.Errorf("usage: envd network set <env> <sealed|direct|offline>")
+		return fmt.Errorf("usage: envd network set ENV sealed|direct|offline")
 	}
 	name := args[1]
 	mode := args[2]
@@ -1316,7 +1366,7 @@ func (a app) networkEnv(args []string, st *envdState, password []byte) error {
 
 func (a app) runPkg(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd pkg <add <profile> <apt|npm|tool>:<package>|suggest <env>|promote <env> --to <profile>>\n")
+		fmt.Fprint(a.stdout, "Usage:\n  envd pkg add PROFILE apt:PACKAGE\n  envd pkg add PROFILE npm:PACKAGE\n  envd pkg add PROFILE tool:NAME\n  envd pkg suggest ENV\n  envd pkg promote ENV --to PROFILE\n")
 		return nil
 	}
 	switch args[0] {
@@ -1333,7 +1383,7 @@ func (a app) runPkg(args []string, st *envdState) error {
 
 func (a app) runPkgAdd(args []string, st *envdState) error {
 	if len(args) != 2 {
-		return fmt.Errorf("usage: envd pkg add <profile> <apt|npm|tool>:<package>")
+		return fmt.Errorf("usage: envd pkg add PROFILE apt:PACKAGE")
 	}
 	profileName := args[0]
 	if err := validateProfileName(profileName); err != nil {
@@ -1361,7 +1411,7 @@ func (a app) runPkgAdd(args []string, st *envdState) error {
 
 func (a app) runPkgSuggest(args []string, st *envdState) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: envd pkg suggest <env>")
+		return fmt.Errorf("usage: envd pkg suggest ENV")
 	}
 	pkgs, err := a.suggestEnvPackages(st, args[0])
 	if err != nil {
@@ -1450,7 +1500,7 @@ func (a app) ensureProfileImage(st *envdState, profileName string) (string, int,
 	}
 	profile, ok := st.Profiles[profileName]
 	if !ok {
-		return "", 0, fmt.Errorf("profile %q not found; run `envd pkg add %s apt:<package>` first", profileName, profileName)
+		return "", 0, fmt.Errorf("profile %q not found; add packages first with: envd pkg add %s apt:PACKAGE", profileName, profileName)
 	}
 	if profile.ID == "" {
 		id, err := newProfileID(st)
@@ -1626,7 +1676,7 @@ func projectDockerEnabled(networkMode string) bool {
 
 func (a app) stopEnv(args []string, st *envdState) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: envd stop <env>")
+		return fmt.Errorf("usage: envd stop ENV")
 	}
 	name := args[0]
 	ref, err := resolveEnvRef(st, name)
@@ -1650,13 +1700,13 @@ func (a app) rmEnv(args []string, st *envdState) error {
 			yes = true
 		default:
 			if name != "" {
-				return fmt.Errorf("usage: envd rm <env> --yes")
+				return fmt.Errorf("usage: envd rm ENV --yes")
 			}
 			name = arg
 		}
 	}
 	if name == "" || !yes {
-		return fmt.Errorf("usage: envd rm <env> --yes")
+		return fmt.Errorf("usage: envd rm ENV --yes")
 	}
 	ref, err := resolveEnvRef(st, name)
 	if err != nil {
@@ -2065,7 +2115,7 @@ func (a app) runSupervisor(args []string) error {
 		return err
 	}
 	if !fileExists(store.path) {
-		return fmt.Errorf("envd is not initialized; run `envd init` first")
+		return fmt.Errorf("envd is not initialized; run envd init first")
 	}
 	password, err := readMasterPassword(a.stderr)
 	if err != nil {
@@ -2341,7 +2391,7 @@ func (a app) runShell(args []string) error {
 
 func prepareShellDockerArgs(args []string, st *envdState) ([]string, error) {
 	if len(args) < 1 {
-		return nil, fmt.Errorf("usage: envd shell <env> [command...]")
+		return nil, fmt.Errorf("usage: envd shell ENV [COMMAND...]")
 	}
 	name := args[0]
 	ref, err := resolveEnvRef(st, name)
@@ -2401,7 +2451,7 @@ func (a app) runSSHProxy(args []string) error {
 
 func prepareSSHProxyDockerArgs(args []string, st *envdState) ([]string, error) {
 	if len(args) != 1 {
-		return nil, fmt.Errorf("usage: envd ssh-proxy <env>")
+		return nil, fmt.Errorf("usage: envd ssh-proxy ENV")
 	}
 	name := args[0]
 	ref, err := resolveEnvRef(st, name)
@@ -2421,7 +2471,7 @@ func prepareSSHProxyDockerArgs(args []string, st *envdState) ([]string, error) {
 		return nil, err
 	}
 	if env.Dev.State.Status != "running" {
-		return nil, fmt.Errorf("environment %q is not running; run `envd start %s` first", name, name)
+		return nil, fmt.Errorf("environment %q is not running; start it first with: envd start %s", name, name)
 	}
 	return []string{
 		"exec", "-i", ref.DevName,
@@ -2457,7 +2507,7 @@ func (a app) runCode(args []string, st *envdState) error {
 		cmd.Stdout = a.stdout
 		cmd.Stderr = a.stderr
 		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to launch VS Code with `code`; use `envd code %s --print` and add the SSH config manually: %w", opts.EnvName, err)
+			return fmt.Errorf("failed to launch VS Code with code; use envd code %s --print and add the SSH config manually: %w", opts.EnvName, err)
 		}
 	}
 	return nil
@@ -2465,7 +2515,7 @@ func (a app) runCode(args []string, st *envdState) error {
 
 func parseCodeOptions(args []string) (codeOptions, error) {
 	if len(args) == 0 {
-		return codeOptions{}, fmt.Errorf("usage: envd code <env> [--print|--launch]")
+		return codeOptions{}, fmt.Errorf("usage: envd code ENV [--print|--launch]")
 	}
 	opts := codeOptions{EnvName: args[0], Print: true}
 	if err := validateEnvName(opts.EnvName); err != nil {
@@ -2518,7 +2568,7 @@ func shellWords(value string) string {
 
 func (a app) runMigrate(args []string, st *envdState, password []byte) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd migrate <inspect|adopt --yes|protected <env> --yes|gateway inspect|<env> --profile <profile>>\n")
+		fmt.Fprint(a.stdout, "Usage: envd migrate inspect|adopt --yes|protected ENV --yes|gateway inspect|ENV --profile PROFILE\n")
 		return nil
 	}
 	switch args[0] {
@@ -2612,12 +2662,12 @@ func (a app) runMigrateEnvProfile(args []string, st *envdState, password []byte)
 
 func (a app) runMigrateProtected(args []string, st *envdState) error {
 	if len(args) != 2 || (args[1] != "--yes" && args[1] != "-y") {
-		return fmt.Errorf("usage: envd migrate protected <env> --yes")
+		return fmt.Errorf("usage: envd migrate protected ENV --yes")
 	}
 	name := args[0]
 	rec, ok := st.Environments[name]
 	if !ok {
-		return fmt.Errorf("environment %q is not adopted; run `envd migrate adopt --yes` first", name)
+		return fmt.Errorf("environment %q is not adopted; run envd migrate adopt --yes first", name)
 	}
 	if !rec.Legacy {
 		return fmt.Errorf("environment %q is already envd-owned; protected import is for adopted legacy envs only", name)
@@ -2880,7 +2930,7 @@ func (a app) runGatewayEgress(st *envdState) error {
 
 func (a app) runGatewayRisk(args []string, st *envdState) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: envd gateway risk <name>")
+		return fmt.Errorf("usage: envd gateway risk NAME")
 	}
 	name := args[0]
 	rec, ok := st.Gateways[name]
@@ -2914,6 +2964,7 @@ type gatewayInstallPlan struct {
 	DryRun   bool
 	Yes      bool
 	Probe    bool
+	Verbose  bool
 	Steps    []string
 }
 
@@ -2943,16 +2994,32 @@ func (a app) runGatewayInstall(args []string, st *envdState) error {
 			st.addEvent("gateway", plan.Name, "remote install probe failed: "+redactSensitive(err.Error()))
 			return layerErr("remote gateway", err)
 		}
-		printRemoteGatewayProbe(a.stdout, result)
+		printRemoteGatewayProbe(a.stdout, result, plan.Verbose)
 		material := existing.Material
-		if !result.ProviderState.EnvdOwnedConfig && material.ConfigJSON == "" {
+		_, hasLocalProfile := st.Gateways[plan.Name]
+		if plan.Mode == "install" && result.ProviderState.EnvdOwnedConfig && !hasLocalProfile {
+			fmt.Fprintln(a.stdout, "Remote:   existing envd-owned gateway config found")
+			replacePlan := plan
+			replacePlan.Mode = "replace"
+			if !plan.Yes {
+				fmt.Fprintln(a.stdout, "Ready:    verified; no remote changes applied")
+				fmt.Fprintln(a.stdout, "Next:     "+gatewayInstallApplyCommand(replacePlan))
+				return nil
+			}
+			return fmt.Errorf("remote already has envd-owned gateway config; rerun with --replace if you want to replace it")
+		}
+		if plan.Mode == "replace" || material.ConfigJSON == "" {
 			material, err = generateRemoteGatewayMaterial(plan)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(a.stdout, "Material: generated envd-owned Xray Reality config in encrypted state")
+			if plan.Mode == "replace" {
+				fmt.Fprintln(a.stdout, "Config:   regenerated")
+			} else {
+				fmt.Fprintln(a.stdout, "Config:   generated")
+			}
 		} else if material.ConfigJSON != "" {
-			fmt.Fprintln(a.stdout, "Material: reused existing envd-owned Xray Reality config from encrypted state")
+			fmt.Fprintln(a.stdout, "Config:   reused")
 		}
 		now := time.Now().UTC()
 		rec = remoteGatewayRecord{
@@ -2985,7 +3052,9 @@ func (a app) runGatewayInstall(args []string, st *envdState) error {
 		return nil
 	}
 	if !plan.Yes {
-		return fmt.Errorf("remote gateway install requires --yes to apply remote changes")
+		fmt.Fprintln(a.stdout, "Ready:    verified; no remote changes applied")
+		fmt.Fprintln(a.stdout, "Next:     "+gatewayInstallApplyCommand(plan))
+		return nil
 	}
 	if rec.Name == "" {
 		return fmt.Errorf("remote gateway install requires a successful probe before apply")
@@ -3004,13 +3073,26 @@ func (a app) runGatewayInstall(args []string, st *envdState) error {
 	st.addEvent("gateway", plan.Name, "remote install applied and verified; local gateway profile stored")
 	fmt.Fprintln(a.stdout, "Apply:    ok")
 	fmt.Fprintln(a.stdout, "Verify:   remote process ok; local TCP reachability ok")
-	fmt.Fprintln(a.stdout, "Profile:  stored; run `envd gateway use "+plan.Name+"` to activate")
+	fmt.Fprintln(a.stdout, "Stored:   gateway profile")
+	fmt.Fprintln(a.stdout, "Next:     envd gateway use "+plan.Name)
 	return nil
+}
+
+func gatewayInstallApplyCommand(plan gatewayInstallPlan) string {
+	parts := []string{"envd", "gateway", "install", plan.Name, "--host", plan.Host, "--user", plan.User}
+	if plan.Mode == "adopt" {
+		parts = append(parts, "--adopt")
+	}
+	if plan.Mode == "replace" {
+		parts = append(parts, "--replace")
+	}
+	parts = append(parts, "--yes")
+	return strings.Join(parts, " ")
 }
 
 func parseGatewayInstallPlan(args []string) (gatewayInstallPlan, error) {
 	if len(args) == 0 {
-		return gatewayInstallPlan{}, fmt.Errorf("usage: envd gateway install <name> --host <ip> --user <user> [--password] [--probe] [--dry-run|--yes] [--adopt|--replace]")
+		return gatewayInstallPlan{}, fmt.Errorf("usage: envd gateway install NAME --host HOST --user USER [--password] [--probe] [--dry-run|--yes] [--adopt|--replace] [--verbose]")
 	}
 	plan := gatewayInstallPlan{
 		Name:     args[0],
@@ -3054,6 +3136,8 @@ func parseGatewayInstallPlan(args []string) (gatewayInstallPlan, error) {
 			plan.DryRun = true
 		case "--probe":
 			plan.Probe = true
+		case "--verbose", "-v":
+			plan.Verbose = true
 		case "--yes", "-y":
 			plan.Yes = true
 		case "--adopt":
@@ -3114,24 +3198,25 @@ func gatewayInstallPlanSteps(plan gatewayInstallPlan) []string {
 }
 
 func printGatewayInstallPlan(w io.Writer, plan gatewayInstallPlan) {
-	fmt.Fprintf(w, "Gateway:  %s\n", plan.Name)
+	fmt.Fprintf(w, "Name:     %s\n", plan.Name)
 	fmt.Fprintf(w, "Remote:   %s@%s\n", plan.User, plan.Host)
-	fmt.Fprintf(w, "Provider: %s\n", plan.Provider)
-	fmt.Fprintf(w, "Strategy: %s\n", plan.Strategy)
-	fmt.Fprintf(w, "Mode:     %s\n", plan.Mode)
+	fmt.Fprintf(w, "Gateway:  %s (%s)\n", plan.Provider, plan.Strategy)
+	fmt.Fprintf(w, "Action:   %s\n", plan.Mode)
 	if plan.Password {
-		fmt.Fprintln(w, "Password: requested; store only after successful verification")
+		fmt.Fprintln(w, "Password: requested")
 	}
 	if plan.Probe {
-		fmt.Fprintln(w, "Probe:    enabled; SSH inspection only, no remote mutation")
-	}
-	for i, step := range plan.Steps {
-		fmt.Fprintf(w, "Step %02d:  %s\n", i+1, step)
+		fmt.Fprintln(w, "Probe:    enabled")
 	}
 	if plan.DryRun || !plan.Yes {
-		fmt.Fprintln(w, "Apply:    skipped unless --yes is provided")
+		fmt.Fprintln(w, "Apply:    no")
 	} else {
-		fmt.Fprintln(w, "Apply:    enabled after successful probe")
+		fmt.Fprintln(w, "Apply:    yes")
+	}
+	if plan.Verbose {
+		for i, step := range plan.Steps {
+			fmt.Fprintf(w, "Step %02d:  %s\n", i+1, step)
+		}
 	}
 }
 
@@ -3161,6 +3246,7 @@ func readGatewayPassword(stderr io.Writer) (string, error) {
 	if _, err := fmt.Fscan(os.Stdin, &pw); err != nil {
 		return "", err
 	}
+	fmt.Fprintln(stderr)
 	pw = strings.TrimSpace(pw)
 	if pw == "" {
 		return "", errors.New("empty remote SSH password is not allowed")
@@ -3274,6 +3360,25 @@ ENVD_XRAY_CONFIG
 install -m 600 /usr/local/etc/envd/xray/config.json.tmp /usr/local/etc/envd/xray/config.json
 rm -f /usr/local/etc/envd/xray/config.json.tmp
 if ! /usr/local/bin/xray version 2>/dev/null | head -n1 | grep -F %s >/dev/null 2>&1; then
+  need_pkgs=""
+  command -v unzip >/dev/null 2>&1 || need_pkgs="$need_pkgs unzip"
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || need_pkgs="$need_pkgs curl"
+  [ -e /etc/ssl/certs/ca-certificates.crt ] || need_pkgs="$need_pkgs ca-certificates"
+  if [ -n "$need_pkgs" ]; then
+    if command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends $need_pkgs
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y $need_pkgs
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y $need_pkgs
+    elif command -v apk >/dev/null 2>&1; then
+      apk add --no-cache $need_pkgs
+    else
+      echo "missing required install tools:$need_pkgs and no supported package manager found" >&2; exit 1
+    fi
+  fi
   arch="$(uname -m)"
   case "$arch" in
     x86_64|amd64) xray_arch=64 ;;
@@ -3533,19 +3638,20 @@ func atoiDefault(value string, fallback int) int {
 	return n
 }
 
-func printRemoteGatewayProbe(w io.Writer, result remoteGatewayProbeResult) {
+func printRemoteGatewayProbe(w io.Writer, result remoteGatewayProbeResult, verbose bool) {
 	info := result.Inspection
 	provider := result.ProviderState
 	fmt.Fprintln(w, "Probe:    ok")
-	fmt.Fprintf(w, "HostKey:  %s\n", result.HostKeySHA256)
-	fmt.Fprintf(w, "Remote:   %s %s %s, memory=%dMB disk=%dMB init=%s firewall=%s\n",
-		info.OS, info.Version, info.Arch, info.MemoryMB, info.DiskMB, info.InitSystem, info.Firewall)
-	fmt.Fprintf(w, "Provider: envd_service=%t envd_config=%t xray=%s\n",
-		provider.EnvdOwnedService, provider.EnvdOwnedConfig, defaultString(provider.XrayVersion, "not detected"))
+	fmt.Fprintf(w, "Remote:   %s %s %s\n", info.OS, info.Version, info.Arch)
+	if verbose {
+		fmt.Fprintf(w, "HostKey:  %s\n", result.HostKeySHA256)
+		fmt.Fprintf(w, "System:   memory=%dMB disk=%dMB init=%s firewall=%s\n", info.MemoryMB, info.DiskMB, info.InitSystem, info.Firewall)
+		fmt.Fprintf(w, "Provider: envd_service=%t envd_config=%t xray=%s\n",
+			provider.EnvdOwnedService, provider.EnvdOwnedConfig, defaultString(provider.XrayVersion, "not detected"))
+	}
 	if len(provider.UnknownConfigs) > 0 {
 		fmt.Fprintf(w, "Warning:  existing non-envd Xray config found: %s\n", strings.Join(provider.UnknownConfigs, ", "))
 	}
-	fmt.Fprintln(w, "Apply:    skipped; probe did not change remote server")
 }
 
 func generateRemoteGatewayMaterial(plan gatewayInstallPlan) (remoteGatewayMaterial, error) {
@@ -3613,9 +3719,8 @@ func remoteXrayServerConfig(uuid, privateKey, shortID, sni string, port int) (st
 			"protocol": "vless",
 			"settings": map[string]any{
 				"clients": []any{map[string]any{
-					"id":         uuid,
-					"flow":       "xtls-rprx-vision",
-					"encryption": "none",
+					"id":   uuid,
+					"flow": "xtls-rprx-vision",
 				}},
 				"decryption": "none",
 			},
@@ -3680,12 +3785,12 @@ func gatewayRiskReport(name string, rec gatewayRecord, st *envdState) gatewayRis
 		} else {
 			providerReach = "fail"
 			reasons = append(reasons, "hosting provider failed latest reachability check")
-			actions = append(actions, "run `envd hosting shortlist` and prepare a replacement provider")
+			actions = append(actions, "run envd hosting shortlist and prepare a replacement provider")
 			score += 3
 		}
 	} else {
 		reasons = append(reasons, "no hosting reachability history for provider "+provider)
-		actions = append(actions, "run `envd hosting check`")
+		actions = append(actions, "run envd hosting check")
 		score++
 	}
 	diversity := gatewayDiversity(st)
@@ -3764,7 +3869,7 @@ func (a app) runGatewayImportLocal(args []string, st *envdState) error {
 		return err
 	}
 	if !yes {
-		return fmt.Errorf("usage: envd gateway import-local <name> --yes")
+		return fmt.Errorf("usage: envd gateway import-local NAME --yes")
 	}
 	if err := validateGatewayName(name); err != nil {
 		return err
@@ -3829,7 +3934,7 @@ func (a app) runGatewayChainCreate(args []string, st *envdState) error {
 
 func (a app) runGatewayChainStatus(args []string, st *envdState) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: envd gateway chain status <name>")
+		return fmt.Errorf("usage: envd gateway chain status NAME")
 	}
 	name := args[0]
 	rec, ok := st.GatewayChains[name]
@@ -3854,7 +3959,7 @@ func (a app) runGatewayChainStatus(args []string, st *envdState) error {
 
 func parseGatewayChainCreateArgs(args []string) (name, entry, exit string, err error) {
 	if len(args) != 5 {
-		return "", "", "", fmt.Errorf("usage: envd gateway chain create <name> --entry <gateway> --exit <gateway>")
+		return "", "", "", fmt.Errorf("usage: envd gateway chain create NAME --entry ENTRY_GATEWAY --exit EXIT_GATEWAY")
 	}
 	name = args[0]
 	if err := validateGatewayName(name); err != nil {
@@ -3867,11 +3972,11 @@ func parseGatewayChainCreateArgs(args []string) (name, entry, exit string, err e
 		case "--exit":
 			exit = args[i+1]
 		default:
-			return "", "", "", fmt.Errorf("usage: envd gateway chain create <name> --entry <gateway> --exit <gateway>")
+			return "", "", "", fmt.Errorf("usage: envd gateway chain create NAME --entry ENTRY_GATEWAY --exit EXIT_GATEWAY")
 		}
 	}
 	if entry == "" || exit == "" {
-		return "", "", "", fmt.Errorf("usage: envd gateway chain create <name> --entry <gateway> --exit <gateway>")
+		return "", "", "", fmt.Errorf("usage: envd gateway chain create NAME --entry ENTRY_GATEWAY --exit EXIT_GATEWAY")
 	}
 	if entry == exit {
 		return "", "", "", fmt.Errorf("gateway chain requires different entry and exit gateways")
@@ -3887,7 +3992,7 @@ func parseGatewayChainCreateArgs(args []string) (name, entry, exit string, err e
 
 func (a app) runGatewayUse(args []string, st *envdState) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: envd gateway use <name>")
+		return fmt.Errorf("usage: envd gateway use NAME")
 	}
 	name := args[0]
 	return a.activateGateway(name, st, "use", a.verifyGatewayActivation, stopEnvWorkload)
@@ -3912,6 +4017,13 @@ func (a app) verifyGatewayActivation(cfg gatewayConfig) (string, error) {
 	if _, err := (xrayProvider{}).Render(a, cfg); err != nil {
 		return "", layerErr("local gateway", err)
 	}
+	runtimeDir, err := a.materializeGatewayRuntime(cfg)
+	if err != nil {
+		return "", layerErr("local gateway", err)
+	}
+	if err := startGatewayRuntime(runtimeDir); err != nil {
+		return "", layerErr("local gateway", err)
+	}
 	gatewayEgress, err := a.gatewayEgressIP(cfg)
 	if err != nil {
 		return "", layerErr("remote gateway", err)
@@ -3926,7 +4038,7 @@ func (a app) activateGateway(name string, st *envdState, reason string, verify g
 			st.addEvent("gateway", name, "chain activation refused fail-closed; chain backend unavailable")
 			return fmt.Errorf("gateway chain %q (%s -> %s) cannot be activated yet; refusing to degrade to direct or single-hop", name, chain.Entry, chain.Exit)
 		}
-		return fmt.Errorf("gateway %q not found; run `envd gateway install %s --host <ip> --user root --password` first", name, name)
+		return fmt.Errorf("gateway %q not found; install it first with: envd gateway install %s --host HOST --user root --password", name, name)
 	}
 	cfg := rec.toConfig()
 	gatewayEgress, err := verify(cfg)
@@ -3968,7 +4080,7 @@ func (a app) activateGateway(name string, st *envdState, reason string, verify g
 
 func (a app) runUser(args []string, st *envdState) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd user uri <gateway>\n")
+		fmt.Fprint(a.stdout, "Usage: envd user uri GATEWAY\n")
 		return nil
 	}
 	switch args[0] {
@@ -3981,12 +4093,12 @@ func (a app) runUser(args []string, st *envdState) error {
 
 func (a app) runUserURI(args []string, st *envdState) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: envd user uri <gateway>")
+		return fmt.Errorf("usage: envd user uri GATEWAY")
 	}
 	name := args[0]
 	rec, ok := st.Gateways[name]
 	if !ok {
-		return fmt.Errorf("gateway %q not found; run `envd gateway install %s --host <ip> --user root --password` first", name, name)
+		return fmt.Errorf("gateway %q not found; install it first with: envd gateway install %s --host HOST --user root --password", name, name)
 	}
 	uri, err := gatewayUserURI(name, rec.toConfig())
 	if err != nil {
@@ -4062,7 +4174,7 @@ func (a app) runInternetReport(args []string, st *envdState) error {
 		return fmt.Errorf("usage: envd internet report")
 	}
 	if len(st.InternetChecks) == 0 {
-		fmt.Fprintln(a.stdout, "No internet checks recorded yet. Run `envd internet status`.")
+		fmt.Fprintln(a.stdout, "No internet checks recorded yet. Run envd internet status.")
 		return nil
 	}
 	for _, check := range st.InternetChecks {
@@ -4282,7 +4394,7 @@ func (a app) runIdentityWrappers(args []string, st *envdState) error {
 
 func parseIdentityWrapperOptions(args []string) (identityWrapperOptions, error) {
 	if len(args) < 2 {
-		return identityWrapperOptions{}, fmt.Errorf("usage: envd identity wrappers <env> <identity> [--dir <path>]")
+		return identityWrapperOptions{}, fmt.Errorf("usage: envd identity wrappers ENV IDENTITY [--dir PATH]")
 	}
 	opts := identityWrapperOptions{EnvName: args[0], IdentityName: args[1]}
 	if err := validateEnvName(opts.EnvName); err != nil {
@@ -4350,7 +4462,7 @@ func (a app) stdin() io.Reader {
 
 func parseIdentityCredentialHelperArgs(args []string) (envName, identityName, op string, err error) {
 	if len(args) < 2 || len(args) > 3 {
-		return "", "", "", fmt.Errorf("usage: envd identity credential-helper <env> <identity> [get|store|erase]")
+		return "", "", "", fmt.Errorf("usage: envd identity credential-helper ENV IDENTITY [get|store|erase]")
 	}
 	envName, identityName = args[0], args[1]
 	if len(args) == 3 {
@@ -4444,7 +4556,7 @@ func (a app) runIdentitySSHAgent(args []string) error {
 
 func parseIdentitySSHAgentArgs(args []string) (identitySSHAgentOptions, error) {
 	if len(args) != 4 || args[2] != "--socket" {
-		return identitySSHAgentOptions{}, fmt.Errorf("usage: envd identity ssh-agent <env> <identity> --socket <path>")
+		return identitySSHAgentOptions{}, fmt.Errorf("usage: envd identity ssh-agent ENV IDENTITY --socket PATH")
 	}
 	opts := identitySSHAgentOptions{EnvName: args[0], IdentityName: args[1], SocketPath: args[3]}
 	if err := validateEnvName(opts.EnvName); err != nil {
@@ -4602,7 +4714,7 @@ func (a app) runIdentityBroker(args []string) error {
 
 func parseIdentityBrokerTargetArgs(args []string) (envName, identityName, class string, err error) {
 	if len(args) != 4 || args[2] != "--class" {
-		return "", "", "", fmt.Errorf("usage: envd identity broker check <env> <identity> --class <ssh|git-https>")
+		return "", "", "", fmt.Errorf("usage: envd identity broker check ENV IDENTITY --class ssh|git-https")
 	}
 	envName, identityName, class = args[0], args[1], args[3]
 	if err := validateEnvName(envName); err != nil {
@@ -4619,7 +4731,7 @@ func parseIdentityBrokerTargetArgs(args []string) (envName, identityName, class 
 
 func parseIdentityBrokerServeArgs(args []string) (envName, identityName, class, socketPath string, err error) {
 	if len(args) != 6 || args[2] != "--class" || args[4] != "--socket" {
-		return "", "", "", "", fmt.Errorf("usage: envd identity broker serve <env> <identity> --class <ssh|git-https> --socket <path>")
+		return "", "", "", "", fmt.Errorf("usage: envd identity broker serve ENV IDENTITY --class ssh|git-https --socket PATH")
 	}
 	envName, identityName, class, socketPath = args[0], args[1], args[3], args[5]
 	if err := validateEnvName(envName); err != nil {
@@ -4866,7 +4978,7 @@ func (a app) runIdentityList(args []string, st *envdState) error {
 
 func parseIdentityAddArgs(args []string) (identityAddOptions, error) {
 	if len(args) < 3 {
-		return identityAddOptions{}, fmt.Errorf("usage: envd identity add <name> (--ssh-key <path>|--git-https --username <user> --token-file <path>)")
+		return identityAddOptions{}, fmt.Errorf("usage: envd identity add NAME (--ssh-key PATH|--git-https --username USER --token-file PATH)")
 	}
 	opts := identityAddOptions{Name: args[0]}
 	if err := validateIdentityName(opts.Name); err != nil {
@@ -4912,7 +5024,7 @@ func parseIdentityAddArgs(args []string) (identityAddOptions, error) {
 			return identityAddOptions{}, fmt.Errorf("git HTTPS identity requires --username and --token-file")
 		}
 	default:
-		return identityAddOptions{}, fmt.Errorf("usage: envd identity add <name> (--ssh-key <path>|--git-https --username <user> --token-file <path>)")
+		return identityAddOptions{}, fmt.Errorf("usage: envd identity add NAME (--ssh-key PATH|--git-https --username USER --token-file PATH)")
 	}
 	return opts, nil
 }
@@ -5430,7 +5542,22 @@ func (a app) activeGatewayConfig(st *envdState) (gatewayConfig, string, error) {
 		}
 		return rec.toConfig(), "encrypted state", nil
 	}
-	return gatewayConfig{}, "", fmt.Errorf("no active gateway; run `envd gateway install <name> --host <ip> --user root --password`, then `envd gateway use <name>`")
+	if names := sortedGatewayProfileNames(st); len(names) > 0 {
+		return gatewayConfig{}, "", fmt.Errorf("no active gateway configured; activate one with: envd gateway use %s", names[0])
+	}
+	if names := sortedGatewayNames(st); len(names) > 0 {
+		return gatewayConfig{}, "", fmt.Errorf("no active gateway configured; gateway %s exists but is not ready; rerun gateway install or check with: envd gateway list", names[0])
+	}
+	return gatewayConfig{}, "", fmt.Errorf("no active gateway configured; install one with: envd gateway install NAME --host HOST --user root --password; then activate it with: envd gateway use NAME")
+}
+
+func sortedGatewayProfileNames(st *envdState) []string {
+	names := make([]string, 0, len(st.Gateways))
+	for name := range st.Gateways {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (a app) loadGatewayConfigFromFile() (gatewayConfig, error) {
@@ -5568,7 +5695,7 @@ func (a app) runEvents(args []string, st *envdState) error {
 
 func (a app) runWhy(args []string, st *envdState) error {
 	if len(args) != 1 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd why <env>\n")
+		fmt.Fprint(a.stdout, "Usage: envd why ENV\n")
 		return nil
 	}
 	name := args[0]
@@ -5736,7 +5863,25 @@ func projectDockerEgress(devName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(out), nil
+	ip := extractLastIPLine(out)
+	if ip == "" {
+		return "", fmt.Errorf("project Docker egress response did not contain an IP: %s", strings.TrimSpace(out))
+	}
+	return ip, nil
+}
+
+func extractLastIPLine(raw string) string {
+	lines := strings.Split(raw, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if net.ParseIP(line) != nil {
+			return line
+		}
+	}
+	return ""
 }
 
 func dockerContainerStatus(name string) string {
@@ -6651,6 +6796,25 @@ func sortedEnvNames(st *envdState) []string {
 	return names
 }
 
+func sortedGatewayNames(st *envdState) []string {
+	seen := map[string]bool{}
+	for name := range st.Gateways {
+		seen[name] = true
+	}
+	for name := range st.RemoteGateways {
+		seen[name] = true
+	}
+	for name := range st.GatewayChains {
+		seen[name] = true
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sortStrings(names)
+	return names
+}
+
 func discoverLegacyEnvs(st *envdState) ([]envInspect, error) {
 	envs, err := listEnvContainers(st)
 	if err != nil {
@@ -6908,7 +7072,7 @@ func validateProfileName(name string) error {
 func parseProfilePackage(spec string) (profilePackage, error) {
 	source, name, ok := strings.Cut(spec, ":")
 	if !ok || source == "" || name == "" {
-		return profilePackage{}, fmt.Errorf("package must use apt:<package>, npm:<package>, or tool:<name>")
+		return profilePackage{}, fmt.Errorf("package must use apt:PACKAGE, npm:PACKAGE, or tool:NAME")
 	}
 	switch source {
 	case "apt", "npm", "tool":
@@ -6923,7 +7087,7 @@ func parseProfilePackage(spec string) (profilePackage, error) {
 
 func parsePkgPromoteArgs(args []string) (envName, profileName string, err error) {
 	if len(args) != 3 || args[1] != "--to" {
-		return "", "", fmt.Errorf("usage: envd pkg promote <env> --to <profile>")
+		return "", "", fmt.Errorf("usage: envd pkg promote ENV --to PROFILE")
 	}
 	if err := validateEnvName(args[0]); err != nil {
 		return "", "", err
@@ -7274,7 +7438,7 @@ func parseRunArgs(args []string) (runOptions, error) {
 			return runOptions{}, fmt.Errorf("unknown option %s", arg)
 		default:
 			if opts.Name != "" {
-				return runOptions{}, fmt.Errorf("usage: envd run <env>")
+				return runOptions{}, fmt.Errorf("usage: envd run ENV")
 			}
 			opts.Name = arg
 		}
@@ -7371,20 +7535,20 @@ func parseGatewayImportArgs(args []string) (name string, yes bool, err error) {
 				return "", false, fmt.Errorf("unknown option %s", arg)
 			}
 			if name != "" {
-				return "", false, fmt.Errorf("usage: envd gateway import-local <name> --yes")
+				return "", false, fmt.Errorf("usage: envd gateway import-local NAME --yes")
 			}
 			name = arg
 		}
 	}
 	if name == "" {
-		return "", false, fmt.Errorf("usage: envd gateway import-local <name> --yes")
+		return "", false, fmt.Errorf("usage: envd gateway import-local NAME --yes")
 	}
 	return name, yes, nil
 }
 
 func parseMigrateProfileArgs(args []string) (name, profile string, err error) {
 	if len(args) != 3 || args[1] != "--profile" {
-		return "", "", fmt.Errorf("usage: envd migrate <env> --profile <profile>")
+		return "", "", fmt.Errorf("usage: envd migrate ENV --profile PROFILE")
 	}
 	name = args[0]
 	profile = args[2]
@@ -7526,6 +7690,10 @@ func gatewayRuntimeDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dataDir, "gateway"), nil
+}
+
+func startGatewayRuntime(runtimeDir string) error {
+	return dockerRun("compose", "-f", filepath.Join(runtimeDir, "compose.yml"), "up", "-d")
 }
 
 func gatewayComposeYAML(cfg gatewayConfig) string {
@@ -7758,19 +7926,19 @@ func redactSensitive(text string) string {
 func nextActionForError(err error) string {
 	switch diagnosticLayer(err) {
 	case "host Docker":
-		return "Start Docker/Desktop and rerun `envd doctor --deep`."
+		return "Start Docker/Desktop and rerun envd doctor --deep."
 	case "asset cache":
 		return "Rerun the command from the envd repo so envd can rebuild required runtime images."
 	case "local gateway":
-		return "Run `envd gateway render`, then restart the gateway compose stack if render is OK."
+		return "Run envd gateway render, then restart the gateway compose stack if render is OK."
 	case "local proxy":
-		return "Check `envd proxy`; if ports differ from Docker mappings, restart the gateway compose stack."
+		return "Check envd proxy; if ports differ from Docker mappings, restart the gateway compose stack."
 	case "remote gateway":
-		return "Run `envd gateway egress`; if it fails, the remote gateway path is down."
+		return "Run envd gateway egress; if it fails, the remote gateway path is down."
 	case "sealed sidecar":
-		return "Run `envd ps` and recreate or restart the affected sealed environment."
+		return "Run envd ps and recreate or restart the affected sealed environment."
 	case "project Docker":
-		return "Run `envd stop <env>` then `envd start <env>`; the managed project Docker endpoint failed."
+		return "Run envd stop ENV then envd start ENV; the managed project Docker endpoint failed."
 	case "DNS":
 		return "Keep the env blocked; DNS inside the sealed route is not resolving."
 	case "egress policy":
