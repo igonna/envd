@@ -1106,13 +1106,11 @@ func (a app) printIdentityHelp() {
 
 Manage:
   envd identity add NAME --ssh-key PATH
+  envd identity add NAME --git-https --username USER --token-file PATH
   envd identity list
 
-Broker:
-  envd identity broker check ENV IDENTITY --class ssh
-
-Internal:
-  wrappers, credential-helper, ssh-agent, broker
+Rule:
+  identities are usable from sealed envs only with a healthy gateway
 
 `)
 }
@@ -3015,9 +3013,59 @@ func prepareShellDockerArgs(args []string, st *envdState) ([]string, error) {
 	if rec, ok := st.Environments[name]; ok && projectDockerEnabled(rec.Network) {
 		dockerArgs = append(dockerArgs, projectDockerExecEnvArgs(ref.ID)...)
 	}
+	identity, err := singleSSHIdentityForShell(st, name)
+	if err != nil {
+		return nil, err
+	}
+	if identity != nil {
+		dockerArgs = append(dockerArgs, "-e", "ENVD_IDENTITY_KEY_B64="+base64.StdEncoding.EncodeToString([]byte(identity.PrivateKey)))
+		command = shellCommandWithEphemeralSSHAgent(command)
+	}
 	dockerArgs = append(dockerArgs, "-u", ref.UserName, "-w", "/home/"+ref.UserName+"/repo", ref.DevName)
 	dockerArgs = append(dockerArgs, command...)
 	return dockerArgs, nil
+}
+
+func singleSSHIdentityForShell(st *envdState, envName string) (*identityRecord, error) {
+	var out *identityRecord
+	names := make([]string, 0, len(st.Identities))
+	for name := range st.Identities {
+		names = append(names, name)
+	}
+	sortStrings(names)
+	for _, identityName := range names {
+		rec := st.Identities[identityName]
+		if rec.Type != "ssh" || strings.TrimSpace(rec.PrivateKey) == "" {
+			continue
+		}
+		if out != nil {
+			return nil, nil
+		}
+		decision := evaluateIdentityBrokerGrant(st, envName, identityName, "ssh", runtimeIdentityBrokerHealth(st, envName))
+		if !decision.Allow {
+			return nil, fmt.Errorf("identity %q denied for %s: %s", identityName, envName, decision.Reason)
+		}
+		copy := rec
+		out = &copy
+	}
+	return out, nil
+}
+
+func shellCommandWithEphemeralSSHAgent(command []string) []string {
+	quoted := make([]string, 0, len(command))
+	for _, part := range command {
+		quoted = append(quoted, shellQuote(part))
+	}
+	script := `
+set -eu
+if command -v ssh-agent >/dev/null 2>&1 && command -v ssh-add >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+  eval "$(ssh-agent -s)" >/dev/null
+  trap 'ssh-agent -k >/dev/null 2>&1 || true' EXIT INT TERM
+  printf '%s' "$ENVD_IDENTITY_KEY_B64" | base64 -d | ssh-add - >/dev/null 2>&1
+  unset ENVD_IDENTITY_KEY_B64
+fi
+exec ` + strings.Join(quoted, " ")
+	return []string{"sh", "-lc", script}
 }
 
 func projectDockerExecEnvArgs(id string) []string {
@@ -3031,6 +3079,13 @@ func projectDockerExecEnvArgs(id string) []string {
 }
 
 func (a app) runSSHProxy(args []string) error {
+	if len(args) == 1 {
+		stop, err := a.startSSHProxyIdentityAgent(args[0])
+		if err != nil {
+			return err
+		}
+		defer stop()
+	}
 	dockerArgs, err := prepareSSHProxyDockerArgs(args)
 	if err != nil {
 		return err
@@ -3040,6 +3095,70 @@ func (a app) runSSHProxy(args []string) error {
 	cmd.Stdout = a.stdout
 	cmd.Stderr = a.stderr
 	return cmd.Run()
+}
+
+func (a app) startSSHProxyIdentityAgent(envName string) (func(), error) {
+	store, err := newStateStore()
+	if err != nil {
+		return func() {}, err
+	}
+	var identityName string
+	if err := store.withState(a.stderr, func(st *envdState) error {
+		st.ensureDefaults()
+		identity, err := singleSSHIdentityForShell(st, envName)
+		if err != nil {
+			return err
+		}
+		if identity == nil {
+			return nil
+		}
+		identityName = identity.Name
+		return nil
+	}); err != nil {
+		if isSSHProxyUnlockUnavailable(err) {
+			return func() {}, nil
+		}
+		return func() {}, err
+	}
+	if identityName == "" {
+		return func() {}, nil
+	}
+	socketPath, err := identityAgentSocketPath(envName)
+	if err != nil {
+		return func() {}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		return func() {}, err
+	}
+	_ = os.Remove(socketPath)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return func() {}, err
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go a.handleIdentitySSHAgentConn(conn, envName, identityName)
+		}
+	}()
+	stop := func() {
+		_ = listener.Close()
+		<-done
+		_ = os.Remove(socketPath)
+	}
+	return stop, nil
+}
+
+func isSSHProxyUnlockUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "master password is not cached and no terminal is available")
 }
 
 func prepareSSHProxyDockerArgs(args []string) ([]string, error) {
@@ -3250,6 +3369,10 @@ func isLegacyInlineEnvdSSHBlock(block string) bool {
 }
 
 func envdSSHHostBlock(envName, envdPath, knownHosts, keyPath string) string {
+	agentSocket, err := identityAgentSocketPath(envName)
+	if err != nil {
+		agentSocket = "none"
+	}
 	return fmt.Sprintf(`# envd managed: %s
 Host %s
   HostName envd
@@ -3258,11 +3381,24 @@ Host %s
   ProxyCommand %s ssh-proxy %s
   IdentityFile %s
   IdentitiesOnly yes
+  ForwardAgent yes
+  IdentityAgent %s
   HostKeyAlias envd-%s
   StrictHostKeyChecking accept-new
   UserKnownHostsFile %s
 # envd managed end: %s
-`, envName, envName, shellWords(envdPath), shellWords(envName), shellWords(keyPath), envName, shellWords(knownHosts), envName)
+`, envName, envName, shellWords(envdPath), shellWords(envName), shellWords(keyPath), shellWords(agentSocket), envName, shellWords(knownHosts), envName)
+}
+
+func identityAgentSocketPath(envName string) (string, error) {
+	if err := validateEnvName(envName); err != nil {
+		return "", err
+	}
+	dir, err := envdDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "runtime", "identity-agents", envName+".sock"), nil
 }
 
 func upsertManagedSSHBlock(path, envName, block string) error {
@@ -5916,7 +6052,7 @@ func (a app) runIdentityAdd(args []string, st *envdState) error {
 	}
 	fmt.Fprintf(a.stdout, "Type: %s\n", rec.Type)
 	fmt.Fprintf(a.stdout, "Fingerprint: %s\n", rec.Fingerprint)
-	fmt.Fprintf(a.stdout, "Policy: sealed-only, require healthy sealed route, require current gateway generation\n")
+	fmt.Fprintf(a.stdout, "Access: sealed envs only; healthy gateway required\n")
 	return nil
 }
 
@@ -5933,10 +6069,10 @@ func (a app) runIdentityList(args []string, st *envdState) error {
 		names = append(names, name)
 	}
 	sortStrings(names)
-	fmt.Fprintf(a.stdout, "%-18s %-8s %-18s %s\n", "NAME", "TYPE", "FINGERPRINT", "POLICY")
+	fmt.Fprintf(a.stdout, "%-18s %-8s %-24s %s\n", "NAME", "TYPE", "FINGERPRINT", "ACCESS")
 	for _, name := range names {
 		rec := st.Identities[name]
-		fmt.Fprintf(a.stdout, "%-18s %-8s %-18s %s\n", name, rec.Type, rec.Fingerprint, identityPolicySummary(rec.Policy))
+		fmt.Fprintf(a.stdout, "%-18s %-8s %-24s %s\n", name, rec.Type, rec.Fingerprint, identityAccessSummary(rec.Policy))
 	}
 	return nil
 }
@@ -6024,6 +6160,13 @@ func identityPolicySummary(policy identityPolicy) string {
 	return "net=" + strings.Join(policy.AllowedNetworks, ",") +
 		" healthy_sealed=" + strconv.FormatBool(policy.RequireHealthySealed) +
 		" gateway_current=" + strconv.FormatBool(policy.RequireGatewayCurrent)
+}
+
+func identityAccessSummary(policy identityPolicy) string {
+	if identityPolicyAllowsSealedOnly(policy) {
+		return "sealed envs only"
+	}
+	return "invalid"
 }
 
 func probeIdentityRecords(st *envdState) []probeResult {

@@ -1576,6 +1576,16 @@ func TestPrepareShellDockerArgs(t *testing.T) {
 	}
 }
 
+func TestShellCommandWithEphemeralSSHAgent(t *testing.T) {
+	command := shellCommandWithEphemeralSSHAgent([]string{"git", "clone", "git@github.com:owner/repo.git", "."})
+	got := strings.Join(command, " ")
+	for _, want := range []string{"sh -lc", "ssh-agent -s", "ssh-add -", "unset ENVD_IDENTITY_KEY_B64", "exec 'git' 'clone'"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("wrapped shell command missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestGatewayRecordRoundTrip(t *testing.T) {
 	cfg := gatewayConfig{
 		BindIP:       "127.0.0.1",
@@ -2308,6 +2318,8 @@ func TestEnsureEnvSSHConfigWritesStandardSSHHost(t *testing.T) {
 		"ProxyCommand '/tmp/envd tool/envd' ssh-proxy books",
 		"IdentityFile " + shellWords(filepath.Join(home, ".ssh", "envd_ed25519")),
 		"IdentitiesOnly yes",
+		"ForwardAgent yes",
+		"IdentityAgent " + shellWords(filepath.Join(home, ".local", "share", "envd", "runtime", "identity-agents", "books.sock")),
 		"HostKeyAlias envd-books",
 		"StrictHostKeyChecking accept-new",
 		"UserKnownHostsFile " + shellWords(filepath.Join(home, ".ssh", "envd_known_hosts")),
