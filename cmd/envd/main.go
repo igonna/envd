@@ -1474,6 +1474,7 @@ func (a app) runBrowserInstall(force bool) error {
 	if force {
 		_ = os.RemoveAll(inst.BrowserDir)
 	}
+	_ = os.RemoveAll(filepath.Join(inst.Root, "extensions", "vhrome-new-tab"))
 	if _, err := os.Stat(inst.Executable); errors.Is(err, os.ErrNotExist) {
 		revision, err := installChromiumSnapshot(inst)
 		if err != nil {
@@ -1693,7 +1694,7 @@ func browserLaunchFlags(profileDir, socksProxy string) []string {
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--disable-background-networking",
 		"--disable-sync",
-		"--disable-features=OptimizationHints,MediaRouter",
+		"--disable-features=OptimizationHints,MediaRouter,TabSearch,AvatarToolbarButton,ExtensionsToolbarMenu,SidePanelPinning",
 		"--use-mock-keychain",
 		"--no-first-run",
 		"--no-default-browser-check",
@@ -2036,8 +2037,166 @@ func seedBrowserProfile(profileDir string) error {
 	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
 		return err
 	}
+	if err := seedBrowserLocalState(filepath.Join(profileDir, "Local State")); err != nil {
+		return err
+	}
+	if err := seedBrowserPreferences(filepath.Join(defaultDir, "Preferences")); err != nil {
+		return err
+	}
+	if err := clearBrowserNewTabData(defaultDir); err != nil {
+		return err
+	}
+	if err := clearBrowserStartupSession(defaultDir); err != nil {
+		return err
+	}
 	_, err := seedBrowserSearchEngine(defaultDir)
 	return err
+}
+
+func seedBrowserLocalState(path string) error {
+	state := map[string]any{}
+	if raw, err := os.ReadFile(path); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		_ = json.Unmarshal(raw, &state)
+	}
+	browser, _ := state["browser"].(map[string]any)
+	if browser == nil {
+		browser = map[string]any{}
+	}
+	experiments := stringSetFromAnySlice(browser["enabled_labs_experiments"])
+	experiments["disable-top-sites"] = true
+	experiments["hide-extensions-menu"] = true
+	experiments["remove-tabsearch-button"] = true
+	experiments["show-avatar-button@3"] = true
+	experiments["extensions-toolbar-menu@2"] = true
+	browser["enabled_labs_experiments"] = sortedKeys(experiments)
+	state["browser"] = browser
+	raw, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o600)
+}
+
+func seedBrowserPreferences(path string) error {
+	prefs := map[string]any{}
+	if raw, err := os.ReadFile(path); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		_ = json.Unmarshal(raw, &prefs)
+	}
+	ntp, _ := prefs["ntp"].(map[string]any)
+	if ntp == nil {
+		ntp = map[string]any{}
+	}
+	ntp["shortcust_visible"] = false
+	ntp["use_most_visited_tiles"] = false
+	ntp["num_personal_suggestions"] = 0
+	ntp["shortcuts_auto_removal_disabled"] = true
+	prefs["ntp"] = ntp
+	customLinks, _ := prefs["custom_links"].(map[string]any)
+	if customLinks == nil {
+		customLinks = map[string]any{}
+	}
+	customLinks["initialized"] = true
+	customLinks["list"] = []any{}
+	prefs["custom_links"] = customLinks
+	raw, err := json.MarshalIndent(prefs, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o600)
+}
+
+func clearBrowserNewTabData(defaultDir string) error {
+	dbs := map[string][]string{
+		"Top Sites": {"top_sites"},
+		"Shortcuts": {"omni_box_shortcuts"},
+	}
+	for db, tables := range dbs {
+		if err := clearSQLiteTables(filepath.Join(defaultDir, db), tables); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func clearBrowserStartupSession(defaultDir string) error {
+	for _, name := range []string{"Current Session", "Current Tabs", "Last Session", "Last Tabs"} {
+		if err := os.Remove(filepath.Join(defaultDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	sessionsDir := filepath.Join(defaultDir, "Sessions")
+	entries, err := os.ReadDir(sessionsDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "Session_") || strings.HasPrefix(name, "Tabs_") {
+			if err := os.Remove(filepath.Join(sessionsDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func clearSQLiteTables(dbPath string, tables []string) error {
+	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	sqlite, err := exec.LookPath("sqlite3")
+	if err != nil {
+		sqlite = "/usr/bin/sqlite3"
+	}
+	if _, err := os.Stat(sqlite); err != nil {
+		return nil
+	}
+	for _, table := range tables {
+		out, err := exec.Command(sqlite, dbPath, "DELETE FROM "+table+";").CombinedOutput()
+		if err != nil {
+			msg := strings.ToLower(string(out) + err.Error())
+			if strings.Contains(msg, "locked") {
+				return fmt.Errorf("Vhrome profile is in use; quit Vhrome and retry")
+			}
+			if strings.Contains(msg, "no such table") {
+				continue
+			}
+			return fmt.Errorf("clear browser data failed: %w\n%s", err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+func stringSetFromAnySlice(v any) map[string]bool {
+	out := map[string]bool{}
+	items, _ := v.([]any)
+	for _, item := range items {
+		text, _ := item.(string)
+		if text != "" {
+			out[text] = true
+		}
+	}
+	return out
+}
+
+func sortedKeys(set map[string]bool) []string {
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func seedBrowserSearchEngine(defaultDir string) (string, error) {
@@ -2161,6 +2320,7 @@ fi`, logPath, shellWords(filepath.Join(appDir, "Contents", "MacOS", "Chromium")+
 		return fmt.Errorf("create Vhrome app failed: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
 	resourcesDir := filepath.Join(inst.Launcher, "Contents", "Resources")
+	_ = os.Remove(filepath.Join(resourcesDir, "Assets.car"))
 	iconPath := filepath.Join(resourcesDir, "applet.icns")
 	if err := writeVhromeICNS(iconPath); err != nil {
 		return err
@@ -2205,9 +2365,6 @@ func copyFile(src, dst string, mode fs.FileMode) error {
 }
 
 func vhromeIconPixel(x, y int) color.RGBA {
-	if !insideRoundedRect(x, y, 96, 96, 832, 832, 190) {
-		return color.RGBA{}
-	}
 	return color.RGBA{A: 255}
 }
 

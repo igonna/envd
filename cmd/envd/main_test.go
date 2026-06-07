@@ -320,14 +320,26 @@ func TestStatusReportsMissingIdentityAgent(t *testing.T) {
 }
 
 func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
-	flags := strings.Join(browserLaunchFlags("/tmp/profile", "127.0.0.1:11080"), " ")
+	profile := filepath.Join(t.TempDir(), "profile")
+	extensionDir := browserExtensionDirForProfile(profile)
+	if err := os.MkdirAll(extensionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extensionDir, "manifest.json"), []byte(`{"manifest_version":3}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	flags := strings.Join(browserLaunchFlags(profile, "127.0.0.1:11080"), " ")
 	for _, want := range []string{
-		"--user-data-dir=/tmp/profile",
+		"--user-data-dir=" + profile,
 		"--proxy-server=socks5://127.0.0.1:11080",
 		"--disable-quic",
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--disable-background-networking",
 		"--use-mock-keychain",
+		"TabSearch",
+		"AvatarToolbarButton",
+		"ExtensionsToolbarMenu",
+		"ublock-origin-lite",
 	} {
 		if !strings.Contains(flags, want) {
 			t.Fatalf("browser flags missing %q:\n%s", want, flags)
@@ -340,14 +352,89 @@ func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
 
 func TestSeedBrowserProfileDoesNotWriteProtectedSearchPrefs(t *testing.T) {
 	profile := t.TempDir()
+	defaultDir := filepath.Join(profile, "Default")
+	if err := os.MkdirAll(filepath.Join(defaultDir, "Sessions"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(defaultDir, "Current Session"),
+		filepath.Join(defaultDir, "Last Tabs"),
+		filepath.Join(defaultDir, "Sessions", "Session_1"),
+		filepath.Join(defaultDir, "Sessions", "Tabs_1"),
+		filepath.Join(defaultDir, "Sessions", "Other"),
+	} {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := seedBrowserProfile(profile); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"Preferences", "Secure Preferences"} {
-		if _, err := os.Stat(filepath.Join(profile, "Default", name)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("%s should not be created by browser seed; err=%v", name, err)
+	raw, err := os.ReadFile(filepath.Join(profile, "Local State"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var localState map[string]any
+	if err := json.Unmarshal(raw, &localState); err != nil {
+		t.Fatal(err)
+	}
+	browser := localState["browser"].(map[string]any)
+	experiments := browser["enabled_labs_experiments"].([]any)
+	if !containsAnyString(experiments, "disable-top-sites") {
+		t.Fatalf("missing top-sites flag: %+v", experiments)
+	}
+	if !containsAnyString(experiments, "hide-extensions-menu") {
+		t.Fatalf("missing extensions menu flag: %+v", experiments)
+	}
+	if !containsAnyString(experiments, "remove-tabsearch-button") {
+		t.Fatalf("missing tab search flag: %+v", experiments)
+	}
+	if !containsAnyString(experiments, "show-avatar-button@3") {
+		t.Fatalf("missing avatar flag: %+v", experiments)
+	}
+	if !containsAnyString(experiments, "extensions-toolbar-menu@2") {
+		t.Fatalf("missing extensions toolbar flag: %+v", experiments)
+	}
+	prefsRaw, err := os.ReadFile(filepath.Join(profile, "Default", "Preferences"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prefs map[string]any
+	if err := json.Unmarshal(prefsRaw, &prefs); err != nil {
+		t.Fatal(err)
+	}
+	ntp := prefs["ntp"].(map[string]any)
+	if ntp["shortcust_visible"] != false || ntp["use_most_visited_tiles"] != false || ntp["num_personal_suggestions"] != float64(0) {
+		t.Fatalf("unexpected ntp prefs: %+v", ntp)
+	}
+	if prefs["default_search_provider_data"] != nil {
+		t.Fatalf("seed should not write protected search prefs: %+v", prefs["default_search_provider_data"])
+	}
+	if _, err := os.Stat(filepath.Join(profile, "Default", "Secure Preferences")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Secure Preferences should not be created by browser seed; err=%v", err)
+	}
+	for _, path := range []string{
+		filepath.Join(defaultDir, "Current Session"),
+		filepath.Join(defaultDir, "Last Tabs"),
+		filepath.Join(defaultDir, "Sessions", "Session_1"),
+		filepath.Join(defaultDir, "Sessions", "Tabs_1"),
+	} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("startup session file should be removed: %s err=%v", path, err)
 		}
 	}
+	if _, err := os.Stat(filepath.Join(defaultDir, "Sessions", "Other")); err != nil {
+		t.Fatalf("unrelated session dir file should remain: %v", err)
+	}
+}
+
+func containsAnyString(items []any, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestInstallVhromeLinuxLauncher(t *testing.T) {
