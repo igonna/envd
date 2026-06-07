@@ -1156,7 +1156,15 @@ func (a app) printPkgHelp() {
 Add:
   envd pkg add PROFILE apt:PACKAGE
   envd pkg add PROFILE npm:PACKAGE
+  envd pkg add PROFILE pip:PACKAGE
   envd pkg add PROFILE tool:NAME
+
+Common tools:
+  tool:codex      installs Node/npm and @openai/codex
+  tool:node       installs Node/npm
+  tool:rg         installs ripgrep
+  tool:go         installs Go
+  tool:python     installs Python/pip/venv
 
 Promote:
   envd pkg suggest ENV
@@ -1930,7 +1938,7 @@ func (a app) runPkg(args []string, st *envdState) error {
 
 func (a app) runPkgAdd(args []string, st *envdState) error {
 	if len(args) != 2 {
-		return fmt.Errorf("usage: envd pkg add PROFILE apt:PACKAGE")
+		return fmt.Errorf("usage: envd pkg add PROFILE apt:PACKAGE|npm:PACKAGE|pip:PACKAGE|tool:NAME")
 	}
 	profileName := args[0]
 	if err := validateProfileName(profileName); err != nil {
@@ -2047,7 +2055,7 @@ func (a app) ensureProfileImage(st *envdState, profileName string) (string, int,
 	}
 	profile, ok := st.Profiles[profileName]
 	if !ok {
-		return "", 0, fmt.Errorf("profile %q not found; add packages first with: envd pkg add %s apt:PACKAGE", profileName, profileName)
+		return "", 0, fmt.Errorf("profile %q not found; add packages first with: envd pkg add %s apt:PACKAGE|npm:PACKAGE|pip:PACKAGE|tool:NAME", profileName, profileName)
 	}
 	if profile.ID == "" {
 		id, err := newProfileID(st)
@@ -8604,12 +8612,12 @@ func validateProfileName(name string) error {
 func parseProfilePackage(spec string) (profilePackage, error) {
 	source, name, ok := strings.Cut(spec, ":")
 	if !ok || source == "" || name == "" {
-		return profilePackage{}, fmt.Errorf("package must use apt:PACKAGE, npm:PACKAGE, or tool:NAME")
+		return profilePackage{}, fmt.Errorf("package must use apt:PACKAGE, npm:PACKAGE, pip:PACKAGE, or tool:NAME")
 	}
 	switch source {
-	case "apt", "npm", "tool":
+	case "apt", "npm", "pip", "tool":
 	default:
-		return profilePackage{}, fmt.Errorf("unsupported package source %q: use apt, npm, or tool", source)
+		return profilePackage{}, fmt.Errorf("unsupported package source %q: use apt, npm, pip, or tool", source)
 	}
 	if err := validatePackageName(name); err != nil {
 		return profilePackage{}, err
@@ -8796,6 +8804,7 @@ func profileBuildDir(profileID string) (string, error) {
 func profileDockerfile(profile profileRecord) string {
 	aptSet := map[string]bool{}
 	npm := []string{}
+	pip := []string{}
 	for _, pkg := range profile.Packages {
 		switch pkg.Source {
 		case "apt":
@@ -8804,9 +8813,19 @@ func profileDockerfile(profile profileRecord) string {
 			aptSet["nodejs"] = true
 			aptSet["npm"] = true
 			npm = append(npm, pkg.Name)
+		case "pip":
+			aptSet["python3"] = true
+			aptSet["python3-pip"] = true
+			aptSet["python3-venv"] = true
+			pip = append(pip, pkg.Name)
 		case "tool":
 			for _, aptName := range toolAptPackages(pkg.Name) {
 				aptSet[aptName] = true
+			}
+			for _, npmName := range toolNpmPackages(pkg.Name) {
+				aptSet["nodejs"] = true
+				aptSet["npm"] = true
+				npm = append(npm, npmName)
 			}
 		}
 	}
@@ -8831,6 +8850,13 @@ func profileDockerfile(profile profileRecord) string {
 		}
 		b.WriteString("\n")
 	}
+	if len(pip) > 0 {
+		b.WriteString("RUN python3 -m pip install --break-system-packages")
+		for _, name := range pip {
+			b.WriteString(" " + shellQuote(name))
+		}
+		b.WriteString("\n")
+	}
 	return b.String()
 }
 
@@ -8838,6 +8864,8 @@ func toolAptPackages(name string) []string {
 	switch name {
 	case "build-essential":
 		return []string{"build-essential"}
+	case "codex":
+		return []string{"nodejs", "npm"}
 	case "curl":
 		return []string{"curl"}
 	case "ffmpeg":
@@ -8860,6 +8888,15 @@ func toolAptPackages(name string) []string {
 		return []string{"zip"}
 	default:
 		return []string{name}
+	}
+}
+
+func toolNpmPackages(name string) []string {
+	switch name {
+	case "codex":
+		return []string{"@openai/codex"}
+	default:
+		return nil
 	}
 }
 

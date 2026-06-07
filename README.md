@@ -86,6 +86,7 @@ envd gateway status                # show active gateway
 envd gateway rollback              # return to previous verified gateway
 envd user uri ams1                 # print app import URI
 envd pkg add web apt:ffmpeg        # add package intent to a profile
+envd pkg add web pip:poetry        # Python CLI packages are profile intent too
 envd start app --profile web         # lazily build/use that profile
 ssh books                          # connect through envd-managed SSH
 envd lock                          # stop workloads and hide envd SSH targets

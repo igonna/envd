@@ -898,6 +898,13 @@ func TestParseProfilePackage(t *testing.T) {
 	if pkg.Source != "apt" || pkg.Name != "ffmpeg" {
 		t.Fatalf("unexpected package: %+v", pkg)
 	}
+	pkg, err = parseProfilePackage("pip:poetry")
+	if err != nil {
+		t.Fatalf("parse pip package failed: %v", err)
+	}
+	if pkg.Source != "pip" || pkg.Name != "poetry" {
+		t.Fatalf("unexpected pip package: %+v", pkg)
+	}
 	if _, err := parseProfilePackage("gem:rails"); err == nil {
 		t.Fatal("unsupported source accepted")
 	}
@@ -1000,6 +1007,8 @@ func TestProfileDockerfile(t *testing.T) {
 	profile := profileRecord{Packages: []profilePackage{
 		{Source: "npm", Name: "pnpm"},
 		{Source: "tool", Name: "rg"},
+		{Source: "tool", Name: "codex"},
+		{Source: "pip", Name: "poetry"},
 		{Source: "apt", Name: "ffmpeg"},
 	}}
 	got := profileDockerfile(profile)
@@ -1010,7 +1019,12 @@ func TestProfileDockerfile(t *testing.T) {
 		"'nodejs'",
 		"'npm'",
 		"'ripgrep'",
+		"'python3'",
+		"'python3-pip'",
+		"'python3-venv'",
 		"npm install -g 'pnpm'",
+		"'@openai/codex'",
+		"python3 -m pip install --break-system-packages 'poetry'",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Dockerfile missing %q:\n%s", want, got)
