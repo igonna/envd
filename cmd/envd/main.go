@@ -1725,13 +1725,10 @@ func browserLaunchFlags(profileDir, socksProxy string) []string {
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--custom-ntp=" + fileURL(browserNewTabPagePath(filepath.Dir(profileDir))),
+		"--extension-mime-request-handling=always-prompt-for-install",
 	}
 	if extensionDirs := browserExtensionDirsForProfile(profileDir); len(extensionDirs) > 0 {
-		extensionList := strings.Join(extensionDirs, ",")
-		flags = append(flags,
-			"--disable-extensions-except="+extensionList,
-			"--load-extension="+extensionList,
-		)
+		flags = append(flags, "--load-extension="+strings.Join(extensionDirs, ","))
 	}
 	return flags
 }

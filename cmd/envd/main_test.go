@@ -350,7 +350,7 @@ func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
 		"ublock-origin-lite",
 		"chromium-web-store",
 		"--custom-ntp=" + fileURL(browserNewTabPagePath(filepath.Dir(profile))),
-		"--disable-extensions-except=",
+		"--extension-mime-request-handling=always-prompt-for-install",
 		"--load-extension=",
 	} {
 		if !strings.Contains(flags, want) {
@@ -362,6 +362,9 @@ func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
 	}
 	if strings.Contains(flags, "chrome-extension://") {
 		t.Fatalf("browser flags should not directly open extension URLs:\n%s", flags)
+	}
+	if strings.Contains(flags, "--disable-extensions-except") {
+		t.Fatalf("browser flags should not block user-installed extensions:\n%s", flags)
 	}
 	if strings.Contains(flags, "vhrome-new-tab") || strings.Contains(flags, "blank-new-tab-page") {
 		t.Fatalf("browser flags should not allow stale Vhrome extensions:\n%s", flags)
