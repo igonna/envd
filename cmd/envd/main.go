@@ -365,6 +365,11 @@ func (a app) run(args []string) error {
 			return a.printCommandHelp([]string{"vscode"})
 		}
 		return a.runVSCode(args[1:])
+	case "idle":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"idle"})
+		}
+		return a.runIdle(args[1:])
 	case "network":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"network"})
@@ -458,7 +463,7 @@ func (a app) runStatus(args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("usage: envd status")
 	}
-	_ = ensureRuntimeIdleScheduler()
+	_ = runOpportunisticIdleSweep()
 	if _, ok := cachedMasterPassword(); !ok && os.Getenv("ENVD_MASTER_PASSWORD") == "" {
 		return a.printRuntimeStatus(true)
 	}
@@ -502,7 +507,7 @@ func (a app) printStatusSummary(st *envdState, access runtimeAccessState, gatewa
 		fmt.Fprintf(a.stdout, " (%s)", st.ActiveGateway)
 	}
 	fmt.Fprintln(a.stdout)
-	fmt.Fprintf(a.stdout, "Idle:    on, stops after %s disconnected\n", defaultIdleTimeout)
+	fmt.Fprintf(a.stdout, "Idle:    %s\n", idleStatusText())
 	fmt.Fprintf(a.stdout, "Envs:    %d\n\n", envCount)
 }
 
@@ -528,7 +533,7 @@ func (a app) printRuntimeStatus(showRouteNames bool) error {
 		fmt.Fprintf(a.stdout, "Identity:     %s\n", agentState)
 	}
 	fmt.Fprintf(a.stdout, "Gateway:      %s\n", gatewayState)
-	fmt.Fprintf(a.stdout, "Idle:         on, stops after %s disconnected\n", defaultIdleTimeout)
+	fmt.Fprintf(a.stdout, "Idle:         %s\n", idleStatusText())
 	if showRouteNames {
 		return a.printRuntimeEnvStatusTable(access)
 	}
@@ -951,6 +956,7 @@ Setup:
   lock                 stop envd-managed workloads
   unlock               restore access after lock
   password             change master password
+  idle                 manage background idle cleanup
   reset-state          reset forgotten-password state
 
 Environment:
@@ -1010,6 +1016,8 @@ The current password is requested explicitly even if the short-lived unlock
 cache is active.
 
 `)
+	case "idle":
+		a.printIdleHelp()
 	case "reset-state":
 		fmt.Fprint(a.stdout, `Usage: envd reset-state --delete --i-understand-this-deletes-envd-state --yes
 
@@ -2559,6 +2567,20 @@ Effect:
   keeps existing unrelated settings
   writes a .bak backup before changing settings
   installs Remote SSH when the code CLI is available
+
+`)
+}
+
+func (a app) printIdleHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd idle status
+  envd idle on
+  envd idle off
+
+Effect:
+  on      enables cleanup during normal envd commands
+  off     disables cleanup and removes old background scheduler
+  status  shows whether idle cleanup is enabled
 
 `)
 }
@@ -4319,6 +4341,9 @@ func processLikelyAlive(pid int) bool {
 }
 
 func runRuntimeIdleTick(idle time.Duration) error {
+	if !idleSchedulerEnabled() {
+		return nil
+	}
 	stopped, err := runtimeIdleTick(idle, time.Now().UTC(), dockerRouteIsRunning, stopRuntimeRouteWorkload)
 	if err != nil {
 		return err
@@ -4327,6 +4352,21 @@ func runRuntimeIdleTick(idle time.Duration) error {
 		fmt.Fprintf(os.Stdout, "Idle: stopped %d envs\n", stopped)
 	}
 	return nil
+}
+
+func runOpportunisticIdleSweep() error {
+	if strings.HasSuffix(os.Args[0], ".test") || !idleSchedulerEnabled() {
+		return nil
+	}
+	_, err := opportunisticIdleSweep(time.Now().UTC(), dockerRouteIsRunning, stopRuntimeRouteWorkload)
+	return err
+}
+
+func opportunisticIdleSweep(now time.Time, running func(runtimeSSHRoute) bool, stop func(runtimeSSHRoute) error) (int, error) {
+	if !idleSchedulerEnabled() {
+		return 0, nil
+	}
+	return runtimeIdleTick(defaultIdleTimeout, now, running, stop)
 }
 
 func runtimeIdleTick(idle time.Duration, now time.Time, running func(runtimeSSHRoute) bool, stop func(runtimeSSHRoute) error) (int, error) {
@@ -4413,11 +4453,99 @@ func ensureRuntimeIdleScheduler() error {
 	if strings.HasSuffix(os.Args[0], ".test") || os.Getenv("ENVD_DISABLE_IDLE_SCHEDULER") == "1" {
 		return nil
 	}
+	if !idleSchedulerEnabled() {
+		return nil
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return ensureLaunchdIdleScheduler()
 	case "linux":
 		return ensureSystemdIdleScheduler()
+	default:
+		return nil
+	}
+}
+
+func (a app) runIdle(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: envd idle status|on|off")
+	}
+	switch args[0] {
+	case "status":
+		fmt.Fprintf(a.stdout, "Idle: %s\n", idleStatusText())
+		return nil
+	case "on":
+		if err := setIdleSchedulerEnabled(true); err != nil {
+			return err
+		}
+		_ = disableRuntimeIdleScheduler()
+		fmt.Fprintf(a.stdout, "Idle: %s\n", idleStatusText())
+		return nil
+	case "off":
+		if err := setIdleSchedulerEnabled(false); err != nil {
+			return err
+		}
+		if err := disableRuntimeIdleScheduler(); err != nil {
+			return err
+		}
+		fmt.Fprintln(a.stdout, "Idle: off")
+		return nil
+	default:
+		return fmt.Errorf("usage: envd idle status|on|off")
+	}
+}
+
+func idleStatusText() string {
+	if idleSchedulerEnabled() {
+		return "on, opportunistic after " + defaultIdleTimeout.String() + " disconnected"
+	}
+	return "off"
+}
+
+func idleSchedulerEnabled() bool {
+	path, err := idlePreferencePath()
+	if err != nil {
+		return true
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	if err != nil {
+		return true
+	}
+	return strings.TrimSpace(string(raw)) != "off"
+}
+
+func setIdleSchedulerEnabled(enabled bool) error {
+	path, err := idlePreferencePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	value := "off\n"
+	if enabled {
+		value = "on\n"
+	}
+	return os.WriteFile(path, []byte(value), 0o600)
+}
+
+func idlePreferencePath() (string, error) {
+	dir, err := envdDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "runtime", "idle"), nil
+}
+
+func disableRuntimeIdleScheduler() error {
+	switch runtime.GOOS {
+	case "darwin":
+		return disableLaunchdIdleScheduler()
+	case "linux":
+		return disableSystemdIdleScheduler()
 	default:
 		return nil
 	}
@@ -4534,6 +4662,42 @@ func launchdServiceLoaded(label string) bool {
 	return exec.Command("launchctl", "print", domain+"/"+label).Run() == nil
 }
 
+func disableLaunchdIdleScheduler() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	label := "dev.envd.idle"
+	plist := filepath.Join(home, "Library", "LaunchAgents", label+".plist")
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	_ = exec.Command("launchctl", "bootout", domain+"/"+label).Run()
+	_ = exec.Command("launchctl", "disable", domain+"/"+label).Run()
+	if err := os.Remove(plist); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func disableSystemdIdleScheduler() error {
+	_ = exec.Command("systemctl", "--user", "disable", "--now", "envd-idle.timer").Run()
+	configHome := os.Getenv("XDG_CONFIG_HOME")
+	if configHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		configHome = filepath.Join(home, ".config")
+	}
+	unitDir := filepath.Join(configHome, "systemd", "user")
+	for _, name := range []string{"envd-idle.service", "envd-idle.timer"} {
+		if err := os.Remove(filepath.Join(unitDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+	return nil
+}
+
 func lockRuntimeAccess() error {
 	_ = removeIdentityAgentSockets()
 	return saveRuntimeAccess(runtimeAccessState{Locked: true, Routes: map[string]runtimeSSHRoute{}})
@@ -4586,7 +4750,7 @@ func publishRuntimeRoute(ref envRef, network string) error {
 	if err := saveRuntimeAccess(access); err != nil {
 		return err
 	}
-	_ = ensureRuntimeIdleScheduler()
+	_ = runOpportunisticIdleSweep()
 	return nil
 }
 
@@ -5466,6 +5630,7 @@ exec ` + strings.Join(quoted, " ")
 }
 
 func (a app) runSSHProxy(args []string) error {
+	_ = runOpportunisticIdleSweep()
 	envName := ""
 	if len(args) == 1 {
 		envName = args[0]
@@ -5488,7 +5653,9 @@ func (a app) runSSHProxy(args []string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = a.stdout
 	cmd.Stderr = a.stderr
-	return cmd.Run()
+	err = cmd.Run()
+	_ = runOpportunisticIdleSweep()
+	return err
 }
 
 func (a app) startSSHProxyIdentityAgent(envName string) (func(), error) {

@@ -366,6 +366,25 @@ func TestWriteFileIfChangedReportsChanges(t *testing.T) {
 	}
 }
 
+func TestIdlePreferenceStatusText(t *testing.T) {
+	t.Setenv("ENVD_DATA_DIR", t.TempDir())
+	if !idleSchedulerEnabled() {
+		t.Fatal("idle should default on")
+	}
+	if got := idleStatusText(); !strings.Contains(got, "opportunistic") {
+		t.Fatalf("unexpected default idle status: %q", got)
+	}
+	if err := setIdleSchedulerEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	if idleSchedulerEnabled() {
+		t.Fatal("idle should be disabled")
+	}
+	if got := idleStatusText(); got != "off" {
+		t.Fatalf("unexpected disabled idle status: %q", got)
+	}
+}
+
 func TestApplyMinimalVSCodeSettingsMergesAndBacksUp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	original := []byte(`{
@@ -2012,6 +2031,48 @@ func TestRuntimeIdleTickStopsDisconnectedOldEnv(t *testing.T) {
 	}
 	if count != 1 || strings.Join(stopped, ",") != "idle" {
 		t.Fatalf("unexpected idle stops: count=%d stopped=%v", count, stopped)
+	}
+}
+
+func TestOpportunisticIdleSweepHonorsPreference(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("ENVD_DATA_DIR", dataDir)
+	now := time.Unix(10000, 0).UTC()
+	if err := saveRuntimeAccess(runtimeAccessState{Routes: map[string]runtimeSSHRoute{
+		"idle": {Name: "idle", ID: "aaa111", DevName: "envd-aaa111-dev", UserName: "dev", Network: "sealed", Storage: "plain", UpdatedAt: now.Add(-3 * time.Hour)},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := touchRuntimeActivity("idle", now.Add(-3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := setIdleSchedulerEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	count, err := opportunisticIdleSweep(now, func(runtimeSSHRoute) bool {
+		return true
+	}, func(runtimeSSHRoute) error {
+		t.Fatal("disabled idle sweep stopped an env")
+		return nil
+	})
+	if err != nil || count != 0 {
+		t.Fatalf("disabled sweep count=%d err=%v", count, err)
+	}
+	if err := setIdleSchedulerEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	var stopped []string
+	count, err = opportunisticIdleSweep(now, func(runtimeSSHRoute) bool {
+		return true
+	}, func(route runtimeSSHRoute) error {
+		stopped = append(stopped, route.Name)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || strings.Join(stopped, ",") != "idle" {
+		t.Fatalf("enabled sweep did not stop idle env: count=%d stopped=%v", count, stopped)
 	}
 }
 
