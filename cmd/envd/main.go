@@ -2178,6 +2178,7 @@ func devContainerRunArgs(envName, userName, id, devName, netName, storageMode, h
 	argsRun = append(argsRun,
 		"-e", "DEV_USER="+userName,
 		"-e", "REPO_DIR="+repoMount,
+		"-e", "ENVD_ENV_NAME="+envName,
 		"-e", "ENVD_ENV_ID="+id,
 	)
 	if strings.TrimSpace(authorizedKey) != "" {
@@ -3243,6 +3244,9 @@ func prepareSSHProxyDockerArgs(args []string) ([]string, error) {
 	}
 	ref := envRef{Name: route.Name, ID: route.ID, UserName: route.UserName, DevName: route.DevName, Network: route.Network}
 	if err := ensureEnvAuthorizedKey(ref); err != nil {
+		return nil, err
+	}
+	if err := ensureEnvPrompt(ref); err != nil {
 		return nil, err
 	}
 	return []string{
@@ -6994,6 +6998,9 @@ func repairEnvSSHAccessForRef(ref envRef) error {
 		if err := ensureEnvAuthorizedKey(ref); err != nil {
 			return err
 		}
+		if err := ensureEnvPrompt(ref); err != nil {
+			return err
+		}
 	}
 	return publishRuntimeRoute(ref, networkOrSealed(ref.Network))
 }
@@ -7022,6 +7029,54 @@ chmod 700 "${ssh_dir}"
 chmod 600 "${authorized_keys}"
 `
 	return dockerRun("exec", "-e", "DEV_USER="+userName, "-e", "ENVD_AUTHORIZED_KEY="+authKey.PublicKey, ref.DevName, "sh", "-lc", script)
+}
+
+func ensureEnvPrompt(ref envRef) error {
+	userName := ref.UserName
+	if userName == "" {
+		userName = "dev"
+	}
+	envName := ref.Name
+	if envName == "" {
+		envName = "envd"
+	}
+	script := `
+set -eu
+home_dir="/home/${DEV_USER}"
+bashrc="${home_dir}/.bashrc"
+touch "${bashrc}"
+tmp="${bashrc}.envd-tmp"
+awk '
+  /# --- envd: prompt start ---/ {skip=1; next}
+  /# --- envd: prompt end ---/ {skip=0; next}
+  /# --- envd: ensure colored prompt ---/ {skip=1; next}
+  /^unset color_prompt force_color_prompt$/ && skip == 1 {skip=0; next}
+  skip != 1 {print}
+' "${bashrc}" > "${tmp}"
+cat >> "${tmp}" <<EOF
+
+# --- envd: prompt start ---
+export ENVD_ENV_NAME="${ENVD_ENV_NAME_VALUE}"
+if [ -n "\${BASH_VERSION:-}" ]; then
+  __envd_prompt() {
+    if [ -z "\${ENVD_AUTO_CD_DONE:-}" ] && [ "\${PWD}" = "\${HOME}" ] && [ -d /repo ]; then
+      cd /repo 2>/dev/null || true
+      export ENVD_AUTO_CD_DONE=1
+    fi
+    PS1='[\[\e[01;32m\]\${ENVD_ENV_NAME}\[\e[00m\]] \u@envd:\w\$ '
+  }
+  case ";\${PROMPT_COMMAND:-};" in
+    *";__envd_prompt;"*) ;;
+    *) PROMPT_COMMAND="__envd_prompt\${PROMPT_COMMAND:+;\${PROMPT_COMMAND}}" ;;
+  esac
+  __envd_prompt
+fi
+# --- envd: prompt end ---
+EOF
+mv "${tmp}" "${bashrc}"
+chown "${DEV_USER}:${DEV_USER}" "${bashrc}"
+`
+	return dockerRun("exec", "-e", "DEV_USER="+userName, "-e", "ENVD_ENV_NAME_VALUE="+envName, ref.DevName, "sh", "-lc", script)
 }
 
 func setVSCodeExtensionsLocked(ref envRef, locked bool) error {

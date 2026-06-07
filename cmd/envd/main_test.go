@@ -1016,6 +1016,7 @@ func TestDevContainerArgsBlockHostDockerAndHostAccessByDefault(t *testing.T) {
 		"-e ENVD_SEALED_DNS=1",
 		"-e DOCKER_HOST=tcp://127.0.0.1:2375",
 		"-e COMPOSE_PROJECT_NAME=envd_abc123",
+		"-e ENVD_ENV_NAME=books",
 		"-e ENVD_ENV_ID=abc123",
 		"-e ENVD_AUTHORIZED_KEY=ssh-ed25519 AAAATEST envd",
 		"--label envd.name=books",
