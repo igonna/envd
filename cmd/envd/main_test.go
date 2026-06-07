@@ -338,52 +338,15 @@ func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
 	}
 }
 
-func TestSeedBrowserProfileWritesSearchAndUBlockLite(t *testing.T) {
+func TestSeedBrowserProfileDoesNotWriteProtectedSearchPrefs(t *testing.T) {
 	profile := t.TempDir()
 	if err := seedBrowserProfile(profile); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(filepath.Join(profile, "Default", "Preferences"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var prefs map[string]any
-	if err := json.Unmarshal(raw, &prefs); err != nil {
-		t.Fatal(err)
-	}
-	search := prefs["default_search_provider"].(map[string]any)
-	if search["name"] != "GoogleEn" ||
-		search["search_url"] != "https://www.google.com/search?q={searchTerms}&hl=en" ||
-		search["suggest_url"] != "https://www.google.com/complete/search?client=chrome&q={searchTerms}&hl=en" {
-		t.Fatalf("unexpected search prefs: %+v", search)
-	}
-	searchData := prefs["default_search_provider_data"].(map[string]any)
-	mirrored := searchData["mirrored_template_url_data"].(map[string]any)
-	if mirrored["short_name"] != "GoogleEn" ||
-		mirrored["keyword"] != "google.com/?hl=en" ||
-		mirrored["url"] != "https://www.google.com/search?q={searchTerms}&hl=en" {
-		t.Fatalf("unexpected mirrored search prefs: %+v", mirrored)
-	}
-	secureRaw, err := os.ReadFile(filepath.Join(profile, "Default", "Secure Preferences"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var securePrefs map[string]any
-	if err := json.Unmarshal(secureRaw, &securePrefs); err != nil {
-		t.Fatal(err)
-	}
-	secureSearchData := securePrefs["default_search_provider_data"].(map[string]any)
-	template := secureSearchData["template_url_data"].(map[string]any)
-	if template["short_name"] != "GoogleEn" ||
-		template["keyword"] != "google.com/?hl=en" ||
-		template["url"] != "https://www.google.com/search?q={searchTerms}&hl=en" {
-		t.Fatalf("unexpected template search prefs: %+v", template)
-	}
-	extensions := prefs["extensions"].(map[string]any)
-	settings := extensions["settings"].(map[string]any)
-	ublock := settings[ublockOriginLiteID].(map[string]any)
-	if ublock["external_update_url"] != chromeWebStoreUpdate {
-		t.Fatalf("unexpected uBO Lite prefs: %+v", ublock)
+	for _, name := range []string{"Preferences", "Secure Preferences"} {
+		if _, err := os.Stat(filepath.Join(profile, "Default", name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s should not be created by browser seed; err=%v", name, err)
+		}
 	}
 }
 

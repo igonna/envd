@@ -2036,130 +2036,8 @@ func seedBrowserProfile(profileDir string) error {
 	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
 		return err
 	}
-	rowID, err := seedBrowserSearchEngine(defaultDir)
-	if err != nil {
-		return err
-	}
-	if err := seedBrowserPreferenceFile(filepath.Join(defaultDir, "Preferences"), rowID, false); err != nil {
-		return err
-	}
-	if err := seedBrowserPreferenceFile(filepath.Join(defaultDir, "Secure Preferences"), rowID, true); err != nil {
-		return err
-	}
-	return nil
-}
-
-func seedBrowserPreferenceFile(prefsPath, rowID string, secure bool) error {
-	prefs := map[string]any{}
-	if raw, err := os.ReadFile(prefsPath); err == nil && len(bytes.TrimSpace(raw)) > 0 {
-		_ = json.Unmarshal(raw, &prefs)
-	}
-	defaultSearchProvider := map[string]any{
-		"enabled":     true,
-		"guid":        "envd-google-en",
-		"name":        "GoogleEn",
-		"keyword":     "google.com/?hl=en",
-		"search_url":  "https://www.google.com/search?q={searchTerms}&hl=en",
-		"suggest_url": "https://www.google.com/complete/search?client=chrome&q={searchTerms}&hl=en",
-	}
-	prefs["default_search_provider"] = defaultSearchProvider
-	searchData := googleEnTemplateURLData(rowID, prefs)
-	if secure {
-		prefs["default_search_provider_data"] = map[string]any{
-			"template_url_data": searchData,
-		}
-	} else {
-		prefs["default_search_provider_data"] = map[string]any{
-			"mirrored_template_url_data": searchData,
-		}
-	}
-	extensions, _ := prefs["extensions"].(map[string]any)
-	if extensions == nil {
-		extensions = map[string]any{}
-	}
-	settings, _ := extensions["settings"].(map[string]any)
-	if settings == nil {
-		settings = map[string]any{}
-	}
-	settings[ublockOriginLiteID] = map[string]any{
-		"state":               1,
-		"location":            1,
-		"external_update_url": chromeWebStoreUpdate,
-		"manifest": map[string]any{
-			"name":             "uBlock Origin Lite",
-			"version":          "0.0",
-			"manifest_version": 3,
-			"update_url":       chromeWebStoreUpdate,
-		},
-	}
-	extensions["settings"] = settings
-	prefs["extensions"] = extensions
-	raw, err := json.MarshalIndent(prefs, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(prefsPath, append(raw, '\n'), 0o600); err != nil {
-		return err
-	}
-	return nil
-}
-
-func googleEnTemplateURLData(rowID string, prefs map[string]any) map[string]any {
-	now := strconv.FormatInt(chromiumTime(time.Now()), 10)
-	if strings.TrimSpace(rowID) == "" {
-		rowID = "0"
-	}
-	if existing := existingGoogleEnTemplateURLData(prefs); existing != nil {
-		existing["id"] = rowID
-		existing["is_active"] = 1
-		existing["synced_guid"] = "envd-google-en"
-		return existing
-	}
-	return map[string]any{
-		"id":                          rowID,
-		"short_name":                  "GoogleEn",
-		"keyword":                     "google.com/?hl=en",
-		"prepopulate_id":              0,
-		"starter_pack_id":             0,
-		"synced_guid":                 "envd-google-en",
-		"url":                         "https://www.google.com/search?q={searchTerms}&hl=en",
-		"suggestions_url":             "https://www.google.com/complete/search?client=chrome&q={searchTerms}&hl=en",
-		"image_url":                   "",
-		"new_tab_url":                 "",
-		"contextual_search_url":       "",
-		"favicon_url":                 "",
-		"originating_url":             "",
-		"search_url_post_params":      "",
-		"suggestions_url_post_params": "",
-		"image_url_post_params":       "",
-		"safe_for_autoreplace":        false,
-		"date_created":                now,
-		"last_modified":               now,
-		"last_visited":                "0",
-		"usage_count":                 0,
-		"alternate_urls":              []any{},
-		"input_encodings":             []any{"UTF-8"},
-		"is_active":                   1,
-		"enforced_by_policy":          false,
-	}
-}
-
-func existingGoogleEnTemplateURLData(prefs map[string]any) map[string]any {
-	defaultData, _ := prefs["default_search_provider_data"].(map[string]any)
-	for _, key := range []string{"template_url_data", "mirrored_template_url_data"} {
-		data, _ := defaultData[key].(map[string]any)
-		if data == nil {
-			continue
-		}
-		if data["short_name"] == "GoogleEn" || data["keyword"] == "google.com/?hl=en" || data["synced_guid"] == "envd-google-en" {
-			copyData := map[string]any{}
-			for k, v := range data {
-				copyData[k] = v
-			}
-			return copyData
-		}
-	}
-	return nil
+	_, err := seedBrowserSearchEngine(defaultDir)
+	return err
 }
 
 func seedBrowserSearchEngine(defaultDir string) (string, error) {
@@ -2178,7 +2056,6 @@ func seedBrowserSearchEngine(defaultDir string) (string, error) {
 	}
 	now := chromiumTime(time.Now())
 	sql := fmt.Sprintf(`
-UPDATE keywords SET is_active = 0 WHERE starter_pack_id = 0;
 DELETE FROM keywords WHERE short_name = 'GoogleEn' OR keyword = 'google.com/?hl=en';
 INSERT INTO keywords (
   short_name, keyword, favicon_url, url, safe_for_autoreplace, originating_url,
@@ -2537,6 +2414,8 @@ func (a app) printBrowserHelp() {
 
 Vhrome is an envd-managed Chromium profile forced through the active gateway.
 It protects browser traffic only; it is not a whole-machine VPN.
+Search: GoogleEn is added as a search option, but Chromium protects the
+default-search setting. Choose it manually in Vhrome settings if needed.
 
 `)
 }
