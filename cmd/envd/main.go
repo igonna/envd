@@ -506,13 +506,8 @@ func (a app) printRuntimeStatus(showRouteNames bool) error {
 	}
 	fmt.Fprintf(a.stdout, "Gateway:      %s\n", gatewayState)
 	fmt.Fprintf(a.stdout, "Idle:         on, stops after %s disconnected\n", defaultIdleTimeout)
-	if showRouteNames && len(access.Routes) > 0 {
-		names := make([]string, 0, len(access.Routes))
-		for name := range access.Routes {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		fmt.Fprintf(a.stdout, "Envs:         %s\n", strings.Join(names, ", "))
+	if showRouteNames {
+		return a.printRuntimeEnvStatusTable(access)
 	}
 	return nil
 }
@@ -532,6 +527,21 @@ func (a app) printEnvStatusTable(st *envdState, access runtimeAccessState, conta
 		fmt.Fprintln(a.stdout, "No environments.")
 		return nil
 	}
+	printEnvStatusRows(a.stdout, rows)
+	return nil
+}
+
+func (a app) printRuntimeEnvStatusTable(access runtimeAccessState) error {
+	rows := runtimeEnvStatusRows(access)
+	if len(rows) == 0 {
+		return nil
+	}
+	fmt.Fprintln(a.stdout)
+	printEnvStatusRows(a.stdout, rows)
+	return nil
+}
+
+func printEnvStatusRows(w io.Writer, rows []envStatusRow) {
 	widths := []int{4, 5, 3, 7, 6}
 	for _, row := range rows {
 		widths[0] = maxInt(widths[0], len(row.Name))
@@ -541,11 +551,10 @@ func (a app) printEnvStatusTable(st *envdState, access runtimeAccessState, conta
 		widths[4] = maxInt(widths[4], len(row.Egress))
 	}
 	format := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%-%ds  %%-%ds  %%s\n", widths[0], widths[1], widths[2], widths[3], widths[4])
-	fmt.Fprintf(a.stdout, format, "NAME", "STATE", "NET", "STORAGE", "EGRESS", "ISSUE")
+	fmt.Fprintf(w, format, "NAME", "STATE", "NET", "STORAGE", "EGRESS", "ISSUE")
 	for _, row := range rows {
-		fmt.Fprintf(a.stdout, format, row.Name, row.State, row.Network, row.Storage, row.Egress, row.Issue)
+		fmt.Fprintf(w, format, row.Name, row.State, row.Network, row.Storage, row.Egress, row.Issue)
 	}
-	return nil
 }
 
 func envStatusRows(st *envdState, access runtimeAccessState, containerStates map[string]string) []envStatusRow {
@@ -572,6 +581,45 @@ func envStatusRows(st *envdState, access runtimeAccessState, containerStates map
 			Network: network,
 			Storage: storageOrPlain(rec.Storage),
 			Egress:  envStatusEgress(st, network),
+			Issue:   issue,
+		})
+	}
+	return rows
+}
+
+func runtimeEnvStatusRows(access runtimeAccessState) []envStatusRow {
+	if len(access.Routes) == 0 {
+		return nil
+	}
+	containerStates, err := dockerContainerStates()
+	if err != nil {
+		containerStates = map[string]string{}
+	}
+	names := make([]string, 0, len(access.Routes))
+	for name := range access.Routes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	rows := make([]envStatusRow, 0, len(names))
+	for _, name := range names {
+		route := access.Routes[name]
+		state := containerStates[route.DevName]
+		if state == "" {
+			state = "missing"
+		}
+		if access.Locked {
+			state = "locked"
+		}
+		issue := ""
+		if state == "missing" {
+			issue = "run envd start " + name
+		}
+		rows = append(rows, envStatusRow{
+			Name:    name,
+			State:   state,
+			Network: networkOrSealed(route.Network),
+			Storage: storageOrPlain(route.Storage),
+			Egress:  "-",
 			Issue:   issue,
 		})
 	}

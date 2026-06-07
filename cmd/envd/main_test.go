@@ -213,6 +213,11 @@ func TestRuntimeAccessUnpublish(t *testing.T) {
 
 func TestStatusDoesNotNeedEncryptedState(t *testing.T) {
 	t.Setenv("ENVD_DATA_DIR", t.TempDir())
+	if err := saveRuntimeAccess(runtimeAccessState{Locked: false, Routes: map[string]runtimeSSHRoute{
+		"books": {Name: "books", ID: "abc123", DevName: "envd-abc123-dev", Network: "sealed", Storage: "protected"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
 	var out bytes.Buffer
 	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
 	if err := a.run([]string{"status"}); err != nil {
@@ -220,6 +225,11 @@ func TestStatusDoesNotNeedEncryptedState(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Access:") || !strings.Contains(out.String(), "Master cache:") {
 		t.Fatalf("status output missing expected fields: %q", out.String())
+	}
+	for _, want := range []string{"NAME", "books", "sealed", "protected"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("runtime status missing %q:\n%s", want, out.String())
+		}
 	}
 }
 
