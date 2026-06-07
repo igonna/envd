@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -10,12 +11,16 @@ import (
 	"crypto/tls"
 	_ "embed"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"io/fs"
 	"net"
@@ -244,7 +249,11 @@ func main() {
 	}
 
 	a := app{stdout: os.Stdout, stderr: os.Stderr, root: root}
-	if err := a.run(os.Args[1:]); err != nil {
+	args := os.Args[1:]
+	if strings.EqualFold(filepath.Base(os.Args[0]), "Vhrome") {
+		args = append([]string{"browser"}, args...)
+	}
+	if err := a.run(args); err != nil {
 		fmt.Fprintf(a.stderr, "ERROR: %s\n", redactSensitive(err.Error()))
 		os.Exit(1)
 	}
@@ -300,6 +309,14 @@ func (a app) run(args []string) error {
 			return a.printCommandHelp([]string{"hosting"})
 		}
 		return a.withState(func(st *envdState) error { return a.runHosting(args[1:], st) })
+	case "browser":
+		if len(args) > 1 && isHelpArg(args[1]) {
+			return a.printCommandHelp([]string{"browser"})
+		}
+		if len(args) == 1 || args[1] == "install" || args[1] == "update" || args[1] == "reset" || args[1] == "status" {
+			return a.runBrowser(args[1:], nil)
+		}
+		return a.withState(func(st *envdState) error { return a.runBrowser(args[1:], st) })
 	case "identity":
 		if len(args) > 1 && args[1] == "broker" {
 			return a.runIdentityBroker(args[2:])
@@ -946,6 +963,7 @@ Diagnostics:
   doctor               diagnose what is broken
 
 Advanced:
+  browser              install/open Vhrome sealed browser
   hosting              find reachable VPS providers
   network              change network mode
   pkg                  manage package profiles
@@ -1017,6 +1035,8 @@ Next command: envd init
 		a.printDoctorHelp()
 	case "hosting":
 		a.printHostingHelp()
+	case "browser":
+		a.printBrowserHelp()
 	case "network":
 		a.printNetworkHelp()
 	case "pkg":
@@ -1384,6 +1404,1076 @@ Commands:
 `)
 }
 
+const (
+	vhromeName           = "Vhrome"
+	ublockOriginLiteID   = "ddkjiahejlhfcafbddmgiahcphecmpfh"
+	chromeWebStoreUpdate = "https://clients2.google.com/service/update2/crx"
+	chromiumSnapshots    = "https://storage.googleapis.com/chromium-browser-snapshots"
+)
+
+type browserInstall struct {
+	Root         string
+	BrowserDir   string
+	ProfileDir   string
+	DownloadDir  string
+	ExtensionDir string
+	Executable   string
+	VersionFile  string
+	Launcher     string
+}
+
+func (a app) runBrowser(args []string, st *envdState) error {
+	if len(args) == 0 {
+		return a.runBrowserOpen(nil, st)
+	}
+	switch args[0] {
+	case "help", "-h", "--help":
+		a.printBrowserHelp()
+		return nil
+	case "install":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: envd browser install")
+		}
+		return a.runBrowserInstall(false)
+	case "update":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: envd browser update")
+		}
+		return a.runBrowserInstall(true)
+	case "status":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: envd browser status")
+		}
+		return a.runBrowserStatus(st)
+	case "reset":
+		if len(args) != 2 || args[1] != "--yes" {
+			return fmt.Errorf("usage: envd browser reset --yes")
+		}
+		return a.runBrowserReset()
+	case "open":
+		return a.runBrowserOpen(args[1:], st)
+	default:
+		return a.runBrowserOpen(args, st)
+	}
+}
+
+func (a app) runBrowserInstall(force bool) error {
+	inst, err := browserInstallPaths()
+	if err != nil {
+		return err
+	}
+	if runtime.GOOS == "darwin" && preferredMacChromiumEngine() == "" {
+		if err := installMacStableChromium(); err != nil {
+			return err
+		}
+		inst, err = browserInstallPaths()
+		if err != nil {
+			return err
+		}
+	}
+	if force {
+		_ = os.RemoveAll(inst.BrowserDir)
+	}
+	if _, err := os.Stat(inst.Executable); errors.Is(err, os.ErrNotExist) {
+		revision, err := installChromiumSnapshot(inst)
+		if err != nil {
+			return err
+		}
+		_ = os.RemoveAll(filepath.Join(inst.Root, "chrome-for-testing"))
+		fmt.Fprintf(a.stdout, "Browser: installed Chromium %s\n", revision)
+	} else if err != nil {
+		return err
+	} else {
+		fmt.Fprintln(a.stdout, "Browser: already installed")
+	}
+	if err := seedBrowserProfile(inst.ProfileDir); err != nil {
+		return err
+	}
+	if err := installUBlockLite(inst); err != nil {
+		fmt.Fprintf(a.stderr, "WARN: uBlock Origin Lite install failed: %s\n", redactSensitive(err.Error()))
+	}
+	if err := installVhromeLauncher(inst); err != nil {
+		return err
+	}
+	cleanupOldVhromeLaunchers(inst.Launcher)
+	fmt.Fprintf(a.stdout, "App:     %s\n", inst.Launcher)
+	fmt.Fprintf(a.stdout, "Profile: %s\n", inst.ProfileDir)
+	return nil
+}
+
+func (a app) runBrowserStatus(st *envdState) error {
+	inst, err := browserInstallPaths()
+	if err != nil {
+		return err
+	}
+	browser := "missing"
+	if _, err := os.Stat(inst.Executable); err == nil {
+		browser = "installed"
+	}
+	appStatus := "missing"
+	if _, err := os.Stat(inst.Launcher); err == nil {
+		appStatus = "installed"
+	}
+	gateway := "unknown"
+	proxy := "-"
+	egress := "-"
+	if st != nil {
+		if cfg, _, err := a.activeGatewayConfig(st); err == nil {
+			host := hostForClient(cfg.BindIP)
+			proxy = net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort))
+			if ip, err := a.gatewayEgressIP(cfg); err == nil {
+				gateway = "running"
+				egress = strings.TrimSpace(ip)
+			} else {
+				gateway = "unreachable"
+			}
+		} else if st.ActiveGateway == "" {
+			gateway = "none"
+		} else {
+			gateway = "broken"
+		}
+	} else if socks, httpProxy, err := gatewayRuntimeProxyEndpoints(); err == nil {
+		proxy = socks
+		if probeTCP("Gateway SOCKS port", socks, 3*time.Second).Err == nil &&
+			probeHTTPProxy("Gateway HTTP HTTPS", httpProxy, "api.ipify.org:443", 10*time.Second).Err == nil {
+			gateway = "running"
+			if ip, err := fetchViaHTTPProxy(httpProxy, "https://api.ipify.org/", 5*time.Second); err == nil {
+				egress = strings.TrimSpace(ip)
+			}
+		} else {
+			gateway = "unreachable"
+		}
+	}
+	fmt.Fprintf(a.stdout, "Browser: %s\n", browser)
+	fmt.Fprintf(a.stdout, "App:     %s\n", appStatus)
+	fmt.Fprintf(a.stdout, "Gateway: %s\n", gateway)
+	fmt.Fprintf(a.stdout, "Proxy:   %s\n", proxy)
+	fmt.Fprintf(a.stdout, "Profile: %s\n", inst.ProfileDir)
+	fmt.Fprintf(a.stdout, "Egress:  %s\n", egress)
+	return nil
+}
+
+func (a app) runBrowserReset() error {
+	inst, err := browserInstallPaths()
+	if err != nil {
+		return err
+	}
+	_ = stopVhromeProcesses(inst.ProfileDir)
+	if err := os.RemoveAll(inst.ProfileDir); err != nil {
+		return err
+	}
+	if err := seedBrowserProfile(inst.ProfileDir); err != nil {
+		return err
+	}
+	fmt.Fprintln(a.stdout, "Browser profile reset")
+	return nil
+}
+
+func (a app) runBrowserOpen(urls []string, st *envdState) error {
+	if st == nil {
+		if err := a.runBrowserOpenRuntime(urls); err == nil {
+			return nil
+		} else if !stdinIsTerminal() {
+			return err
+		}
+		return a.withState(func(st *envdState) error { return a.runBrowserOpen(urls, st) })
+	}
+	inst, err := browserInstallPaths()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(inst.Executable); errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("Vhrome is not installed; run envd browser install")
+	}
+	if err := seedBrowserProfile(inst.ProfileDir); err != nil {
+		return err
+	}
+	cfg, _, err := a.activeGatewayConfig(st)
+	if err != nil {
+		return err
+	}
+	host := hostForClient(cfg.BindIP)
+	socks := net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort))
+	httpProxy := net.JoinHostPort(host, strconv.Itoa(cfg.HTTPHostPort))
+	if res := probeTCP("Gateway SOCKS port", socks, 3*time.Second); res.Err != nil {
+		return res.Err
+	}
+	if res := probeHTTPProxy("Gateway HTTP HTTPS", httpProxy, "api.ipify.org:443", 10*time.Second); res.Err != nil {
+		return res.Err
+	}
+	if ip, err := a.gatewayEgressIP(cfg); err != nil || strings.TrimSpace(ip) == "" {
+		if err == nil {
+			err = fmt.Errorf("empty gateway egress")
+		}
+		return fmt.Errorf("gateway egress check failed: %w", err)
+	}
+	flags := browserLaunchFlags(inst.ProfileDir, socks)
+	flags = append(flags, urls...)
+	return launchVhrome(inst.Executable, flags)
+}
+
+func (a app) runBrowserOpenRuntime(urls []string) error {
+	inst, err := browserInstallPaths()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(inst.Executable); errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("Vhrome is not installed; run envd browser install")
+	}
+	access, err := loadRuntimeAccess()
+	if err != nil {
+		return err
+	}
+	if access.Locked {
+		return fmt.Errorf("envd is locked; run envd unlock")
+	}
+	if len(urls) == 0 && vhromeIsRunning(inst.ProfileDir) {
+		return activateVhrome(inst.Executable)
+	}
+	if err := seedBrowserProfile(inst.ProfileDir); err != nil {
+		return err
+	}
+	socks, httpProxy, err := gatewayRuntimeProxyEndpoints()
+	if err != nil {
+		return err
+	}
+	if res := probeTCP("Gateway SOCKS port", socks, 3*time.Second); res.Err != nil {
+		return res.Err
+	}
+	if res := probeHTTPProxy("Gateway HTTP HTTPS", httpProxy, "api.ipify.org:443", 10*time.Second); res.Err != nil {
+		return res.Err
+	}
+	if ip, err := fetchViaHTTPProxy(httpProxy, "https://api.ipify.org/", 10*time.Second); err != nil || strings.TrimSpace(ip) == "" {
+		if err == nil {
+			err = fmt.Errorf("empty gateway egress")
+		}
+		return fmt.Errorf("gateway egress check failed: %w", err)
+	}
+	flags := browserLaunchFlags(inst.ProfileDir, socks)
+	flags = append(flags, urls...)
+	return launchVhrome(inst.Executable, flags)
+}
+
+func stdinIsTerminal() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+func gatewayRuntimeProxyEndpoints() (string, string, error) {
+	dir, err := gatewayRuntimeDir()
+	if err != nil {
+		return "", "", err
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "compose.yml"))
+	if err != nil {
+		return "", "", fmt.Errorf("gateway runtime missing; run envd doctor")
+	}
+	socks := ""
+	httpProxy := ""
+	re := regexp.MustCompile(`"([^"]+):([0-9]+):(2088|2089)"`)
+	for _, match := range re.FindAllStringSubmatch(string(raw), -1) {
+		addr := net.JoinHostPort(match[1], match[2])
+		switch match[3] {
+		case "2088":
+			socks = addr
+		case "2089":
+			httpProxy = addr
+		}
+	}
+	if socks == "" || httpProxy == "" {
+		return "", "", fmt.Errorf("gateway runtime ports missing; run envd doctor")
+	}
+	return socks, httpProxy, nil
+}
+
+func browserLaunchFlags(profileDir, socksProxy string) []string {
+	flags := []string{
+		"--user-data-dir=" + profileDir,
+		"--proxy-server=socks5://" + socksProxy,
+		"--disable-quic",
+		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+		"--disable-background-networking",
+		"--disable-sync",
+		"--disable-features=OptimizationHints,MediaRouter",
+		"--use-mock-keychain",
+		"--no-first-run",
+		"--no-default-browser-check",
+	}
+	if extensionDir := browserExtensionDirForProfile(profileDir); dirHasManifest(extensionDir) {
+		flags = append(flags, "--load-extension="+extensionDir)
+	}
+	return flags
+}
+
+func browserInstallPaths() (browserInstall, error) {
+	dataDir, err := envdDataDir()
+	if err != nil {
+		return browserInstall{}, err
+	}
+	root := filepath.Join(dataDir, "browser")
+	inst := browserInstall{
+		Root:         root,
+		BrowserDir:   filepath.Join(root, "chromium"),
+		ProfileDir:   filepath.Join(root, "profile"),
+		DownloadDir:  filepath.Join(root, "downloads"),
+		ExtensionDir: filepath.Join(root, "extensions", "ublock-origin-lite"),
+		VersionFile:  filepath.Join(root, "chromium-revision.txt"),
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		inst.Executable = filepath.Join(inst.BrowserDir, "chrome-mac", "Chromium.app", "Contents", "MacOS", "Chromium")
+		if system := preferredMacChromiumEngine(); system != "" {
+			inst.Executable = system
+		}
+		if dirWritable("/Applications") {
+			inst.Launcher = filepath.Join("/Applications", "Vhrome.app")
+		} else {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return browserInstall{}, err
+			}
+			inst.Launcher = filepath.Join(home, "Applications", "Vhrome.app")
+		}
+	case "linux":
+		inst.Executable = filepath.Join(inst.BrowserDir, "chrome-linux", "chrome")
+		configHome := os.Getenv("XDG_DATA_HOME")
+		if configHome == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return browserInstall{}, err
+			}
+			configHome = filepath.Join(home, ".local", "share")
+		}
+		inst.Launcher = filepath.Join(configHome, "applications", "vhrome.desktop")
+	default:
+		return browserInstall{}, fmt.Errorf("envd browser is not supported on %s yet", runtime.GOOS)
+	}
+	return inst, nil
+}
+
+func preferredMacChromiumEngine() string {
+	for _, path := range []string{
+		"/Applications/Chromium.app/Contents/MacOS/Chromium",
+		"/Applications/hidden/Chromium.app/Contents/MacOS/Chromium",
+	} {
+		if st, err := os.Stat(path); err == nil && !st.IsDir() {
+			return path
+		}
+	}
+	for _, root := range []string{
+		"/opt/homebrew/Caskroom/ungoogled-chromium",
+		"/usr/local/Caskroom/ungoogled-chromium",
+	} {
+		if path := newestChromiumCaskExecutable(root); path != "" {
+			return path
+		}
+	}
+	return ""
+}
+
+func installMacStableChromium() error {
+	brew, err := exec.LookPath("brew")
+	if err != nil {
+		for _, path := range []string{"/opt/homebrew/bin/brew", "/usr/local/bin/brew"} {
+			if st, statErr := os.Stat(path); statErr == nil && !st.IsDir() {
+				brew = path
+				err = nil
+				break
+			}
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("stable Chromium is not installed; install Chromium or Homebrew ungoogled-chromium")
+	}
+	cmd := exec.Command(brew, "install", "--cask", "ungoogled-chromium")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("stable Chromium install failed: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	if preferredMacChromiumEngine() == "" {
+		return fmt.Errorf("stable Chromium install completed but Chromium.app was not found")
+	}
+	return nil
+}
+
+func newestChromiumCaskExecutable(root string) string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	for i := len(names) - 1; i >= 0; i-- {
+		path := filepath.Join(root, names[i], "Chromium.app", "Contents", "MacOS", "Chromium")
+		if st, err := os.Stat(path); err == nil && !st.IsDir() {
+			return path
+		}
+	}
+	return ""
+}
+
+func dirWritable(dir string) bool {
+	f, err := os.CreateTemp(dir, ".envd-write-test-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return true
+}
+
+type chromiumSnapshotPlatform struct {
+	Name string
+	Zip  string
+}
+
+func chromiumSnapshotPlatformForRuntime() (chromiumSnapshotPlatform, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		if runtime.GOARCH == "arm64" {
+			return chromiumSnapshotPlatform{Name: "Mac_Arm", Zip: "chrome-mac.zip"}, nil
+		}
+		if runtime.GOARCH == "amd64" {
+			return chromiumSnapshotPlatform{Name: "Mac", Zip: "chrome-mac.zip"}, nil
+		}
+	case "linux":
+		if runtime.GOARCH == "amd64" {
+			return chromiumSnapshotPlatform{Name: "Linux_x64", Zip: "chrome-linux.zip"}, nil
+		}
+	}
+	return chromiumSnapshotPlatform{}, fmt.Errorf("Chromium snapshot is not available for %s/%s", runtime.GOOS, runtime.GOARCH)
+}
+
+func installChromiumSnapshot(inst browserInstall) (string, error) {
+	platform, err := chromiumSnapshotPlatformForRuntime()
+	if err != nil {
+		return "", err
+	}
+	lastChangeURL := chromiumSnapshots + "/" + platform.Name + "/LAST_CHANGE"
+	resp, err := http.Get(lastChangeURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("Chromium snapshot metadata returned HTTP %d", resp.StatusCode)
+	}
+	rawRevision, err := io.ReadAll(io.LimitReader(resp.Body, 128))
+	if err != nil {
+		return "", err
+	}
+	revision := strings.TrimSpace(string(rawRevision))
+	if revision == "" {
+		return "", fmt.Errorf("Chromium snapshot metadata returned empty revision")
+	}
+	downloadURL := chromiumSnapshots + "/" + platform.Name + "/" + revision + "/" + platform.Zip
+	if err := os.MkdirAll(inst.Root, 0o700); err != nil {
+		return "", err
+	}
+	tmpZip := filepath.Join(inst.Root, "chromium-download.zip")
+	if err := downloadFile(tmpZip, downloadURL); err != nil {
+		return "", err
+	}
+	defer os.Remove(tmpZip)
+	_ = os.RemoveAll(inst.BrowserDir)
+	if err := unzipFile(tmpZip, inst.BrowserDir); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(inst.VersionFile, []byte(revision+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	return revision, nil
+}
+
+func installUBlockLite(inst browserInstall) error {
+	if dirHasManifest(inst.ExtensionDir) {
+		return nil
+	}
+	version := "120.0.0.0"
+	rawURL := "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=" + url.QueryEscape(version) +
+		"&acceptformat=crx2,crx3&x=id%3D" + ublockOriginLiteID + "%26installsource%3Dondemand%26uc"
+	crxPath := filepath.Join(inst.Root, "ublock-origin-lite.crx")
+	if err := downloadFile(crxPath, rawURL); err != nil {
+		return err
+	}
+	defer os.Remove(crxPath)
+	zipPath := filepath.Join(inst.Root, "ublock-origin-lite.zip")
+	if err := crxToZip(crxPath, zipPath); err != nil {
+		return err
+	}
+	defer os.Remove(zipPath)
+	_ = os.RemoveAll(inst.ExtensionDir)
+	if err := unzipFile(zipPath, inst.ExtensionDir); err != nil {
+		return err
+	}
+	if !dirHasManifest(inst.ExtensionDir) {
+		return fmt.Errorf("uBlock Origin Lite unpacked without manifest")
+	}
+	return nil
+}
+
+func crxToZip(crxPath, zipPath string) error {
+	raw, err := os.ReadFile(crxPath)
+	if err != nil {
+		return err
+	}
+	if len(raw) < 4 || string(raw[:4]) != "Cr24" {
+		return os.WriteFile(zipPath, raw, 0o600)
+	}
+	if len(raw) < 12 {
+		return fmt.Errorf("invalid CRX header")
+	}
+	version := binary.LittleEndian.Uint32(raw[4:8])
+	var offset uint32
+	switch version {
+	case 2:
+		if len(raw) < 16 {
+			return fmt.Errorf("invalid CRX2 header")
+		}
+		pubLen := binary.LittleEndian.Uint32(raw[8:12])
+		sigLen := binary.LittleEndian.Uint32(raw[12:16])
+		offset = 16 + pubLen + sigLen
+	case 3:
+		headerLen := binary.LittleEndian.Uint32(raw[8:12])
+		offset = 12 + headerLen
+	default:
+		return fmt.Errorf("unsupported CRX version %d", version)
+	}
+	if int(offset) >= len(raw) {
+		return fmt.Errorf("invalid CRX zip offset")
+	}
+	return os.WriteFile(zipPath, raw[offset:], 0o600)
+}
+
+func dirHasManifest(dir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(dir, "manifest.json"))
+	return err == nil
+}
+
+func browserExtensionDirForProfile(profileDir string) string {
+	return filepath.Join(filepath.Dir(profileDir), "extensions", "ublock-origin-lite")
+}
+
+func downloadFile(path, rawURL string) error {
+	resp, err := http.Get(rawURL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("download returned HTTP %d", resp.StatusCode)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
+}
+
+func unzipFile(zipPath, dest string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	cleanDest, err := filepath.Abs(dest)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(cleanDest, 0o700); err != nil {
+		return err
+	}
+	for _, f := range r.File {
+		target := filepath.Join(cleanDest, f.Name)
+		if !strings.HasPrefix(target, cleanDest+string(os.PathSeparator)) && target != cleanDest {
+			return fmt.Errorf("unsafe zip path %q", f.Name)
+		}
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, f.Mode())
+		if err != nil {
+			rc.Close()
+			return err
+		}
+		_, copyErr := io.Copy(out, rc)
+		closeErr := out.Close()
+		rc.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	return nil
+}
+
+func seedBrowserProfile(profileDir string) error {
+	defaultDir := filepath.Join(profileDir, "Default")
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		return err
+	}
+	rowID, err := seedBrowserSearchEngine(defaultDir)
+	if err != nil {
+		return err
+	}
+	if err := seedBrowserPreferenceFile(filepath.Join(defaultDir, "Preferences"), rowID, false); err != nil {
+		return err
+	}
+	if err := seedBrowserPreferenceFile(filepath.Join(defaultDir, "Secure Preferences"), rowID, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func seedBrowserPreferenceFile(prefsPath, rowID string, secure bool) error {
+	prefs := map[string]any{}
+	if raw, err := os.ReadFile(prefsPath); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		_ = json.Unmarshal(raw, &prefs)
+	}
+	defaultSearchProvider := map[string]any{
+		"enabled":     true,
+		"guid":        "envd-google-en",
+		"name":        "GoogleEn",
+		"keyword":     "google.com/?hl=en",
+		"search_url":  "https://www.google.com/search?q={searchTerms}&hl=en",
+		"suggest_url": "https://www.google.com/complete/search?client=chrome&q={searchTerms}&hl=en",
+	}
+	prefs["default_search_provider"] = defaultSearchProvider
+	searchData := googleEnTemplateURLData(rowID, prefs)
+	if secure {
+		prefs["default_search_provider_data"] = map[string]any{
+			"template_url_data": searchData,
+		}
+	} else {
+		prefs["default_search_provider_data"] = map[string]any{
+			"mirrored_template_url_data": searchData,
+		}
+	}
+	extensions, _ := prefs["extensions"].(map[string]any)
+	if extensions == nil {
+		extensions = map[string]any{}
+	}
+	settings, _ := extensions["settings"].(map[string]any)
+	if settings == nil {
+		settings = map[string]any{}
+	}
+	settings[ublockOriginLiteID] = map[string]any{
+		"state":               1,
+		"location":            1,
+		"external_update_url": chromeWebStoreUpdate,
+		"manifest": map[string]any{
+			"name":             "uBlock Origin Lite",
+			"version":          "0.0",
+			"manifest_version": 3,
+			"update_url":       chromeWebStoreUpdate,
+		},
+	}
+	extensions["settings"] = settings
+	prefs["extensions"] = extensions
+	raw, err := json.MarshalIndent(prefs, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(prefsPath, append(raw, '\n'), 0o600); err != nil {
+		return err
+	}
+	return nil
+}
+
+func googleEnTemplateURLData(rowID string, prefs map[string]any) map[string]any {
+	now := strconv.FormatInt(chromiumTime(time.Now()), 10)
+	if strings.TrimSpace(rowID) == "" {
+		rowID = "0"
+	}
+	if existing := existingGoogleEnTemplateURLData(prefs); existing != nil {
+		existing["id"] = rowID
+		existing["is_active"] = 1
+		existing["synced_guid"] = "envd-google-en"
+		return existing
+	}
+	return map[string]any{
+		"id":                          rowID,
+		"short_name":                  "GoogleEn",
+		"keyword":                     "google.com/?hl=en",
+		"prepopulate_id":              0,
+		"starter_pack_id":             0,
+		"synced_guid":                 "envd-google-en",
+		"url":                         "https://www.google.com/search?q={searchTerms}&hl=en",
+		"suggestions_url":             "https://www.google.com/complete/search?client=chrome&q={searchTerms}&hl=en",
+		"image_url":                   "",
+		"new_tab_url":                 "",
+		"contextual_search_url":       "",
+		"favicon_url":                 "",
+		"originating_url":             "",
+		"search_url_post_params":      "",
+		"suggestions_url_post_params": "",
+		"image_url_post_params":       "",
+		"safe_for_autoreplace":        false,
+		"date_created":                now,
+		"last_modified":               now,
+		"last_visited":                "0",
+		"usage_count":                 0,
+		"alternate_urls":              []any{},
+		"input_encodings":             []any{"UTF-8"},
+		"is_active":                   1,
+		"enforced_by_policy":          false,
+	}
+}
+
+func existingGoogleEnTemplateURLData(prefs map[string]any) map[string]any {
+	defaultData, _ := prefs["default_search_provider_data"].(map[string]any)
+	for _, key := range []string{"template_url_data", "mirrored_template_url_data"} {
+		data, _ := defaultData[key].(map[string]any)
+		if data == nil {
+			continue
+		}
+		if data["short_name"] == "GoogleEn" || data["keyword"] == "google.com/?hl=en" || data["synced_guid"] == "envd-google-en" {
+			copyData := map[string]any{}
+			for k, v := range data {
+				copyData[k] = v
+			}
+			return copyData
+		}
+	}
+	return nil
+}
+
+func seedBrowserSearchEngine(defaultDir string) (string, error) {
+	dbPath := filepath.Join(defaultDir, "Web Data")
+	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+		return "0", nil
+	} else if err != nil {
+		return "", err
+	}
+	sqlite, err := exec.LookPath("sqlite3")
+	if err != nil {
+		sqlite = "/usr/bin/sqlite3"
+	}
+	if _, err := os.Stat(sqlite); err != nil {
+		return "0", nil
+	}
+	now := chromiumTime(time.Now())
+	sql := fmt.Sprintf(`
+UPDATE keywords SET is_active = 0 WHERE starter_pack_id = 0;
+DELETE FROM keywords WHERE short_name = 'GoogleEn' OR keyword = 'google.com/?hl=en';
+INSERT INTO keywords (
+  short_name, keyword, favicon_url, url, safe_for_autoreplace, originating_url,
+  date_created, usage_count, input_encodings, suggest_url, prepopulate_id,
+  created_by_policy, last_modified, sync_guid, alternate_urls, image_url,
+  search_url_post_params, suggest_url_post_params, image_url_post_params,
+  new_tab_url, last_visited, created_from_play_api, is_active, starter_pack_id,
+  enforced_by_policy, featured_by_policy, url_hash
+) VALUES (
+  'GoogleEn',
+  'google.com/?hl=en',
+  '',
+  'https://www.google.com/search?q={searchTerms}&hl=en',
+  0,
+  '',
+  %d,
+  0,
+  'UTF-8',
+  'https://www.google.com/complete/search?client=chrome&q={searchTerms}&hl=en',
+  0,
+  0,
+  %d,
+  'envd-google-en',
+  '',
+  '',
+  '',
+  '',
+  '',
+  '',
+  0,
+  0,
+  1,
+  0,
+  0,
+  0,
+  X''
+);
+SELECT id FROM keywords WHERE sync_guid = 'envd-google-en' LIMIT 1;
+`, now, now)
+	out, err := exec.Command(sqlite, dbPath, sql).CombinedOutput()
+	if err != nil {
+		msg := strings.ToLower(string(out) + err.Error())
+		if strings.Contains(msg, "locked") || strings.Contains(msg, "no such table") {
+			return "0", nil
+		}
+		return "", fmt.Errorf("seed browser search engine failed: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	rowID := strings.TrimSpace(string(out))
+	if rowID == "" {
+		rowID = "0"
+	}
+	return rowID, nil
+}
+
+func chromiumTime(t time.Time) int64 {
+	return t.UTC().UnixMicro() + 11644473600000000
+}
+
+func installVhromeLauncher(inst browserInstall) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return installVhromeMacLauncher(inst)
+	case "linux":
+		return installVhromeLinuxLauncher(inst)
+	default:
+		return nil
+	}
+}
+
+func installVhromeMacLauncher(inst browserInstall) error {
+	if err := os.MkdirAll(filepath.Dir(inst.Launcher), 0o755); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(inst.Launcher)
+	logPath := "$HOME/.local/share/envd/browser/vhrome.log"
+	appDir := inst.Executable
+	for !strings.HasSuffix(appDir, ".app") && appDir != filepath.Dir(appDir) {
+		appDir = filepath.Dir(appDir)
+	}
+	flags := browserLaunchFlags(inst.ProfileDir, net.JoinHostPort("127.0.0.1", "11080"))
+	quotedFlags := make([]string, 0, len(flags))
+	for _, flag := range flags {
+		quotedFlags = append(quotedFlags, shellWords(flag))
+	}
+	shellScript := fmt.Sprintf(`PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+LOG=%s
+mkdir -p "$(dirname "$LOG")"
+ACCESS="$HOME/.local/share/envd/runtime/access.json"
+echo "Vhrome launch $(date)" >>"$LOG"
+if [ ! -f "$ACCESS" ] || /usr/bin/grep -Eq '"locked"[[:space:]]*:[[:space:]]*true' "$ACCESS"; then
+  echo "ERROR: envd is locked; run envd unlock" >>"$LOG"
+  exit 1
+fi
+if /usr/bin/pgrep -f -- %s >/dev/null 2>&1; then
+  /usr/bin/open %s >>"$LOG" 2>&1
+  echo "Vhrome focused $(date)" >>"$LOG"
+else
+  /usr/bin/open -na %s --args %s >>"$LOG" 2>&1
+  echo "Vhrome opened $(date)" >>"$LOG"
+fi`, logPath, shellWords(filepath.Join(appDir, "Contents", "MacOS", "Chromium")+" --user-data-dir="+inst.ProfileDir), shellWords(appDir), shellWords(appDir), strings.Join(quotedFlags, " "))
+	script := fmt.Sprintf("do shell script %q", shellScript)
+	if out, err := exec.Command("osacompile", "-o", inst.Launcher, "-e", script).CombinedOutput(); err != nil {
+		return fmt.Errorf("create Vhrome app failed: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	resourcesDir := filepath.Join(inst.Launcher, "Contents", "Resources")
+	iconPath := filepath.Join(resourcesDir, "applet.icns")
+	if err := writeVhromeICNS(iconPath); err != nil {
+		return err
+	}
+	_ = exec.Command("xattr", "-cr", inst.Launcher).Run()
+	_ = exec.Command("codesign", "--force", "--deep", "--sign", "-", inst.Launcher).Run()
+	registerMacAppBundle(inst.Launcher)
+	return nil
+}
+
+func writeVhromeICNS(path string) error {
+	var pngBuf bytes.Buffer
+	img := image.NewRGBA(image.Rect(0, 0, 1024, 1024))
+	for y := 0; y < 1024; y++ {
+		for x := 0; x < 1024; x++ {
+			bg := vhromeIconPixel(x, y)
+			img.SetRGBA(x, y, bg)
+		}
+	}
+	if err := png.Encode(&pngBuf, img); err != nil {
+		return err
+	}
+	return writePNGICNS(path, pngBuf.Bytes())
+}
+
+func copyFile(src, dst string, mode fs.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func vhromeIconPixel(x, y int) color.RGBA {
+	if !insideRoundedRect(x, y, 96, 96, 832, 832, 190) {
+		return color.RGBA{}
+	}
+	return color.RGBA{A: 255}
+}
+
+func insideRoundedRect(x, y, left, top, width, height, radius int) bool {
+	right := left + width
+	bottom := top + height
+	if x < left || x >= right || y < top || y >= bottom {
+		return false
+	}
+	cx := x
+	if x < left+radius {
+		cx = left + radius
+	} else if x >= right-radius {
+		cx = right - radius - 1
+	}
+	cy := y
+	if y < top+radius {
+		cy = top + radius
+	} else if y >= bottom-radius {
+		cy = bottom - radius - 1
+	}
+	dx := x - cx
+	dy := y - cy
+	return dx*dx+dy*dy <= radius*radius
+}
+
+func writePNGICNS(path string, pngBytes []byte) error {
+	totalLen := 8 + 8 + len(pngBytes)
+	var icns bytes.Buffer
+	icns.WriteString("icns")
+	_ = binary.Write(&icns, binary.BigEndian, uint32(totalLen))
+	icns.WriteString("ic10")
+	_ = binary.Write(&icns, binary.BigEndian, uint32(8+len(pngBytes)))
+	_, _ = icns.Write(pngBytes)
+	if err := os.WriteFile(path, icns.Bytes(), 0o644); err != nil {
+		return err
+	}
+	_ = os.Chmod(path, 0o644)
+	return nil
+}
+
+func registerMacAppBundle(appPath string) {
+	lsregister := "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+	_ = exec.Command(lsregister, "-f", appPath).Run()
+	_ = exec.Command("mdimport", appPath).Run()
+}
+
+func cleanupOldVhromeLaunchers(active string) {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	for _, old := range []string{filepath.Join(home, "Applications", "Vhrome.app")} {
+		if old != active {
+			_ = os.RemoveAll(old)
+		}
+	}
+}
+
+func installVhromeLinuxLauncher(inst browserInstall) error {
+	if err := os.MkdirAll(filepath.Dir(inst.Launcher), 0o700); err != nil {
+		return err
+	}
+	desktop := fmt.Sprintf(`[Desktop Entry]
+Type=Application
+Name=Vhrome
+Comment=envd sealed browser
+Exec=%s browser
+Terminal=false
+Categories=Network;WebBrowser;
+`, currentEnvdExecutable())
+	return os.WriteFile(inst.Launcher, []byte(desktop), 0o600)
+}
+
+func launchVhrome(executable string, flags []string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		appDir := executable
+		for !strings.HasSuffix(appDir, ".app") && appDir != filepath.Dir(appDir) {
+			appDir = filepath.Dir(appDir)
+		}
+		args := append([]string{"-na", appDir, "--args"}, flags...)
+		return exec.Command("open", args...).Start()
+	case "linux":
+		return exec.Command(executable, flags...).Start()
+	default:
+		return fmt.Errorf("envd browser is not supported on %s", runtime.GOOS)
+	}
+}
+
+func vhromeIsRunning(profileDir string) bool {
+	if strings.TrimSpace(profileDir) == "" {
+		return false
+	}
+	return exec.Command("pgrep", "-f", "--", "--user-data-dir="+profileDir).Run() == nil
+}
+
+func activateVhrome(executable string) error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	appDir := executable
+	for !strings.HasSuffix(appDir, ".app") && appDir != filepath.Dir(appDir) {
+		appDir = filepath.Dir(appDir)
+	}
+	return exec.Command("open", appDir).Start()
+}
+
+func stopVhromeProcesses(profileDir string) error {
+	if strings.TrimSpace(profileDir) == "" {
+		return nil
+	}
+	switch runtime.GOOS {
+	case "darwin", "linux":
+		killVhromePIDs(profileDir, "")
+		time.Sleep(2 * time.Second)
+		killVhromePIDs(profileDir, "-KILL")
+	}
+	return nil
+}
+
+func killVhromePIDs(profileDir, signal string) {
+	out, err := exec.Command("pgrep", "-f", "--", "--user-data-dir="+profileDir).Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		pidText := strings.TrimSpace(line)
+		if pidText == "" || pidText == strconv.Itoa(os.Getpid()) {
+			continue
+		}
+		args := []string{}
+		if signal != "" {
+			args = append(args, signal)
+		}
+		args = append(args, pidText)
+		_ = exec.Command("kill", args...).Run()
+	}
+}
+
 func (a app) printDoctorHelp() {
 	fmt.Fprint(a.stdout, `Usage:
   envd doctor
@@ -1433,6 +2523,20 @@ Check:
 Lists:
   envd hosting global
   envd hosting russian
+
+`)
+}
+
+func (a app) printBrowserHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd browser
+  envd browser install
+  envd browser status
+  envd browser update
+  envd browser reset --yes
+
+Vhrome is an envd-managed Chromium profile forced through the active gateway.
+It protects browser traffic only; it is not a whole-machine VPN.
 
 `)
 }
@@ -2659,6 +3763,9 @@ func (a app) lockEnvdWithStopper(args []string, st *envdState, stop workloadStop
 		stopped++
 	}
 	st.addEvent("lock", "", fmt.Sprintf("completed: stopped %d workloads; failed %d", stopped, failed))
+	if inst, err := browserInstallPaths(); err == nil {
+		_ = stopVhromeProcesses(inst.ProfileDir)
+	}
 	_ = clearCachedMasterPassword()
 	_ = hideEnvSSHConfig()
 	_ = lockRuntimeAccess()
@@ -8435,7 +9542,7 @@ func extractLastIPLine(raw string) string {
 func dockerContainerStatus(name string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Status}}", name)
+	cmd := exec.CommandContext(ctx, dockerBinary(), "inspect", "-f", "{{.State.Status}}", name)
 	out, err := cmd.Output()
 	if err != nil {
 		return "missing"
@@ -8444,11 +9551,27 @@ func dockerContainerStatus(name string) string {
 }
 
 func dockerRun(args ...string) error {
-	cmd := exec.Command("docker", args...)
+	cmd := exec.Command(dockerBinary(), args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("docker %s failed: %w\n%s", strings.Join(redactDockerArgs(args), " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func dockerBinary() string {
+	if path, err := exec.LookPath("docker"); err == nil {
+		return path
+	}
+	for _, path := range []string{
+		"/usr/local/bin/docker",
+		"/opt/homebrew/bin/docker",
+		"/Applications/Docker.app/Contents/Resources/bin/docker",
+	} {
+		if st, err := os.Stat(path); err == nil && !st.IsDir() {
+			return path
+		}
+	}
+	return "docker"
 }
 
 func redactDockerArgs(args []string) []string {
@@ -8465,11 +9588,11 @@ func redactDockerArgs(args []string) []string {
 }
 
 func containerExists(name string) bool {
-	return exec.Command("docker", "container", "inspect", name).Run() == nil
+	return exec.Command(dockerBinary(), "container", "inspect", name).Run() == nil
 }
 
 func volumeExists(name string) bool {
-	return exec.Command("docker", "volume", "inspect", name).Run() == nil
+	return exec.Command(dockerBinary(), "volume", "inspect", name).Run() == nil
 }
 
 func sealedRuntimeRecreateStatus(ref envRef) (bool, string, error) {

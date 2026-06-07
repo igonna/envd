@@ -319,6 +319,97 @@ func TestStatusReportsMissingIdentityAgent(t *testing.T) {
 	}
 }
 
+func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
+	flags := strings.Join(browserLaunchFlags("/tmp/profile", "127.0.0.1:11080"), " ")
+	for _, want := range []string{
+		"--user-data-dir=/tmp/profile",
+		"--proxy-server=socks5://127.0.0.1:11080",
+		"--disable-quic",
+		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+		"--disable-background-networking",
+		"--use-mock-keychain",
+	} {
+		if !strings.Contains(flags, want) {
+			t.Fatalf("browser flags missing %q:\n%s", want, flags)
+		}
+	}
+	if strings.Contains(flags, "--host-resolver-rules") {
+		t.Fatalf("browser flags should not trigger Chromium unsupported flag warning:\n%s", flags)
+	}
+}
+
+func TestSeedBrowserProfileWritesSearchAndUBlockLite(t *testing.T) {
+	profile := t.TempDir()
+	if err := seedBrowserProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(profile, "Default", "Preferences"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var prefs map[string]any
+	if err := json.Unmarshal(raw, &prefs); err != nil {
+		t.Fatal(err)
+	}
+	search := prefs["default_search_provider"].(map[string]any)
+	if search["name"] != "GoogleEn" ||
+		search["search_url"] != "https://www.google.com/search?q={searchTerms}&hl=en" ||
+		search["suggest_url"] != "https://www.google.com/complete/search?client=chrome&q={searchTerms}&hl=en" {
+		t.Fatalf("unexpected search prefs: %+v", search)
+	}
+	searchData := prefs["default_search_provider_data"].(map[string]any)
+	mirrored := searchData["mirrored_template_url_data"].(map[string]any)
+	if mirrored["short_name"] != "GoogleEn" ||
+		mirrored["keyword"] != "google.com/?hl=en" ||
+		mirrored["url"] != "https://www.google.com/search?q={searchTerms}&hl=en" {
+		t.Fatalf("unexpected mirrored search prefs: %+v", mirrored)
+	}
+	secureRaw, err := os.ReadFile(filepath.Join(profile, "Default", "Secure Preferences"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var securePrefs map[string]any
+	if err := json.Unmarshal(secureRaw, &securePrefs); err != nil {
+		t.Fatal(err)
+	}
+	secureSearchData := securePrefs["default_search_provider_data"].(map[string]any)
+	template := secureSearchData["template_url_data"].(map[string]any)
+	if template["short_name"] != "GoogleEn" ||
+		template["keyword"] != "google.com/?hl=en" ||
+		template["url"] != "https://www.google.com/search?q={searchTerms}&hl=en" {
+		t.Fatalf("unexpected template search prefs: %+v", template)
+	}
+	extensions := prefs["extensions"].(map[string]any)
+	settings := extensions["settings"].(map[string]any)
+	ublock := settings[ublockOriginLiteID].(map[string]any)
+	if ublock["external_update_url"] != chromeWebStoreUpdate {
+		t.Fatalf("unexpected uBO Lite prefs: %+v", ublock)
+	}
+}
+
+func TestInstallVhromeLinuxLauncher(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux launcher test")
+	}
+	dataDir := t.TempDir()
+	t.Setenv("ENVD_DATA_DIR", dataDir)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(dataDir, "xdg"))
+	inst, err := browserInstallPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := installVhromeLinuxLauncher(inst); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(inst.Launcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Name=Vhrome") || !strings.Contains(string(raw), "Exec=") || !strings.Contains(string(raw), " browser") {
+		t.Fatalf("unexpected launcher:\n%s", raw)
+	}
+}
+
 func TestSSHProxyIgnoresStaleIdentitySocketWithoutCache(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
