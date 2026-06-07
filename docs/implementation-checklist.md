@@ -17,7 +17,9 @@ failures by layer -> fail closed on unsafe network changes
 The original v1 boundary did not require protected APFS/LUKS storage, identity
 broker, VS Code proxy access, sealed project Docker, multi-hop gateways, or
 remote gateway install. Those items are tracked below and are marked complete
-only where implemented and release-gated.
+only where implemented and release-gated. Sealed project Docker was intentionally
+not kept in the current product path; standard Docker/Compose uses the host
+Docker daemon and is outside the sealed guarantee.
 
 ## v1 Product Checklist
 
@@ -332,23 +334,20 @@ only where implemented and release-gated.
 - [x] Implement gateway chain model.
 - [x] Ensure chains never degrade to direct or single-hop silently.
 
-## Post-v1 Project Docker
+## Docker/Compose From Environments
 
-- [x] Design envd-managed Docker-compatible project endpoint.
-- [x] Decide backend: rootless Docker, containerd/nerdctl, or explicit
-      compatibility backend.
-- [x] Ensure `docker` inside envd shell uses envd-managed endpoint.
-- [x] Ensure `docker compose` inside envd shell uses envd-managed endpoint.
-- [x] Store project Docker data in envd-managed storage using the environment's
-      declared storage mode.
-- [x] Route project Docker traffic through sealed gateway.
-- [x] Deny project Docker egress when gateway is unhealthy.
-- [x] Block host Docker socket mounts by default.
-- [x] Block host networking by default.
-- [x] Block privileged host access by default.
-- [x] Block arbitrary host path mounts by default.
-- [x] Ensure Compose `ports:` does not silently expose services to host/LAN.
-- [x] Add project Docker release gate tests.
+- [x] Do not reimplement Compose in envd.
+- [x] Let standard `docker` and `docker compose` work inside envd shells via
+      the host Docker socket when a host Docker socket is available.
+- [x] Do not claim host-Docker sibling containers are sealed.
+- [x] Remove the rootless project-Docker runtime from the active product path.
+- [x] Remove project-Docker image from required embedded runtime assets.
+- [x] Keep envd shell/network sealing scoped to processes running inside the dev
+      container.
+- [x] Test that Docker socket passthrough is explicit in container creation
+      args and can be disabled with `ENVD_DOCKER_SOCKET=none`.
+- [ ] Report host Docker passthrough as an environment risk in `envd inspect`
+      and `envd list`.
 
 ## Confirmed Non-Goals Unless Reopened
 

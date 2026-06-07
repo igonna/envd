@@ -167,12 +167,39 @@ func TestStatusDoesNotNeedEncryptedState(t *testing.T) {
 	}
 }
 
+func TestStatusReportsStaleIdentityAgent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, ".local", "share", "envd")
+	t.Setenv("ENVD_DATA_DIR", dataDir)
+	socketPath := filepath.Join(dataDir, "runtime", "identity-agents", "books.sock")
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socketPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	access := runtimeAccessState{Locked: false, Routes: map[string]runtimeSSHRoute{
+		"books": {Name: "books", ID: "abc123", DevName: "envd-abc123-dev", Network: "sealed"},
+	}}
+	if err := saveRuntimeAccess(access); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	if err := a.run([]string{"status"}); err != nil {
+		t.Fatalf("status failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Identity:") || !strings.Contains(out.String(), "stale for books") {
+		t.Fatalf("status did not report stale identity agent: %q", out.String())
+	}
+}
+
 func TestEnvCanBeExposedAfterUnlockSkipsDeadPlainState(t *testing.T) {
 	rec := envRecord{ID: "abc123", Storage: "plain", Network: "sealed"}
 	ref := envRef{
-		DevName:           devContainerName(rec.ID),
-		NetName:           netContainerName(rec.ID),
-		ProjectDockerName: projectDockerContainerName(rec.ID),
+		DevName: devContainerName(rec.ID),
+		NetName: netContainerName(rec.ID),
 	}
 	if envCanBeExposedAfterUnlock(ref, rec) {
 		t.Fatalf("dead plain state should not become visible after unlock")
@@ -992,6 +1019,7 @@ func TestProfileDockerfile(t *testing.T) {
 }
 
 func TestDevContainerArgsBlockHostDockerAndHostAccessByDefault(t *testing.T) {
+	t.Setenv("ENVD_DOCKER_SOCKET", "none")
 	args, err := devContainerRunArgs("books", "dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "plain", "envd-abc123-home", "envd-abc123-repo", "sealed", devImage, "ssh-ed25519 AAAATEST envd")
 	if err != nil {
 		t.Fatalf("devContainerRunArgs failed: %v", err)
@@ -1014,8 +1042,6 @@ func TestDevContainerArgsBlockHostDockerAndHostAccessByDefault(t *testing.T) {
 		"-v envd-abc123-home:/home/dev",
 		"-v envd-abc123-repo:/home/dev/repo",
 		"-e ENVD_SEALED_DNS=1",
-		"-e DOCKER_HOST=tcp://127.0.0.1:2375",
-		"-e COMPOSE_PROJECT_NAME=envd_abc123",
 		"-e ENVD_ENV_NAME=books",
 		"-e ENVD_ENV_ID=abc123",
 		"-e ENVD_AUTHORIZED_KEY=ssh-ed25519 AAAATEST envd",
@@ -1037,7 +1063,35 @@ func TestDevContainerArgsBlockHostDockerAndHostAccessByDefault(t *testing.T) {
 		t.Fatalf("direct mode enabled sealed DNS rewrite: %q", directArgs)
 	}
 	if strings.Contains(directArgs, "DOCKER_HOST=") {
-		t.Fatalf("direct mode enabled project Docker endpoint: %q", directArgs)
+		t.Fatalf("direct mode enabled Docker socket despite opt-out: %q", directArgs)
+	}
+}
+
+func TestDevContainerArgsExposeHostDockerSocketWhenAvailable(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "docker.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen unix socket: %v", err)
+	}
+	defer listener.Close()
+	t.Setenv("ENVD_DOCKER_SOCKET", socketPath)
+
+	args, err := devContainerRunArgs("books", "dev", "abc123", "envd-abc123-dev", "envd-abc123-net", "plain", "envd-abc123-home", "envd-abc123-repo", "sealed", devImage, "")
+	if err != nil {
+		t.Fatalf("devContainerRunArgs failed: %v", err)
+	}
+	got := strings.Join(args, " ")
+	for _, want := range []string{
+		"-v " + socketPath + ":/var/run/docker.sock",
+		"-e DOCKER_HOST=unix:///var/run/docker.sock",
+		"-e DOCKER_TLS_VERIFY=",
+		"-e DOCKER_CERT_PATH=",
+		"-e COMPOSE_PROJECT_NAME=envd_books",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("dev container args missing %q: %q", want, got)
+		}
 	}
 }
 
@@ -1104,7 +1158,7 @@ func TestSSHDevEntrypointInstallsEnvdAuthorizedKey(t *testing.T) {
 func TestEmbeddedAssetContextMaterializesWithoutRepo(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("ENVD_DATA_DIR", dataDir)
-	dir, err := materializeEmbeddedAssetContext(projectDockerImage, "containers/project-docker")
+	dir, err := materializeEmbeddedAssetContext(sidecarImage, "containers/net-sidecar")
 	if err != nil {
 		t.Fatalf("materialize embedded context failed: %v", err)
 	}
@@ -1115,37 +1169,8 @@ func TestEmbeddedAssetContextMaterializesWithoutRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("embedded Dockerfile missing: %v", err)
 	}
-	if !strings.Contains(string(raw), "docker:27-dind-rootless") {
+	if !strings.Contains(string(raw), "sing-box") || !strings.Contains(string(raw), "ENTRYPOINT") {
 		t.Fatalf("unexpected embedded Dockerfile: %s", raw)
-	}
-}
-
-func TestProjectDockerRunArgsUseSealedNamespaceAndEnvdStorage(t *testing.T) {
-	args := projectDockerRunArgs("books", "abc123", "envd-abc123-docker", "envd-abc123-net", "envd-abc123-docker")
-	got := strings.Join(args, " ")
-	for _, want := range []string{
-		"--network container:envd-abc123-net",
-		"-v envd-abc123-docker:/var/lib/docker",
-		"--label envd.role=project-docker",
-		"--label envd.name=books",
-		"envd-project-docker:27-rootless",
-		"--storage-driver=vfs",
-		"--dns=1.1.1.1",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("project Docker args missing %q: %q", want, got)
-		}
-	}
-	for _, forbidden := range []string{
-		"/var/run/docker.sock",
-		"--network host",
-		"-p ",
-		"--publish",
-		"--mount type=bind",
-	} {
-		if strings.Contains(got, forbidden) {
-			t.Fatalf("project Docker args include forbidden host exposure %q: %q", forbidden, got)
-		}
 	}
 }
 
@@ -1565,15 +1590,15 @@ func TestPrepareShellDockerArgs(t *testing.T) {
 	}
 	got = strings.Join(args, " ")
 	for _, want := range []string{
-		"-e DOCKER_HOST=tcp://127.0.0.1:2375",
-		"-e COMPOSE_PROJECT_NAME=envd_def456",
-		"-e ENVD_ENV_ID=def456",
 		"envd-def456-dev",
 		"docker info",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("sealed docker args missing %q: %q", want, got)
 		}
+	}
+	if strings.Contains(got, "DOCKER_HOST=") || strings.Contains(got, "COMPOSE_PROJECT_NAME=") {
+		t.Fatalf("shell exec should not inject Docker endpoint envs: %q", got)
 	}
 }
 

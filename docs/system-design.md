@@ -868,9 +868,9 @@ Rules:
 - No proxy environment variables inside sealed environments.
 - No copied long-lived identity files.
 - No direct-network fallback.
-- No silent Docker socket exposure.
 - No Compose reimplementation. Standard `docker compose` should work inside an
-  envd shell by using an envd-managed sealed Docker engine.
+  envd shell by using the host Docker daemon when available.
+- No claim that host-Docker sibling containers are sealed.
 - No expectation that users manually research VPS providers during outages.
   envd ships and updates a maintained hosting catalog.
 
@@ -1135,9 +1135,9 @@ state. If a user runs `docker image prune -a` or otherwise deletes images, the
 next command that needs those images should repair automatically.
 
 Installed `envd` binaries must be self-contained for envd-owned runtime assets.
-The binary embeds the default dev container, sidecar, project-Docker build
-contexts, and gateway render templates. Installed commands must not require
-repo-local Docker contexts, copied compose files, or gateway `.env` files.
+The binary embeds the default dev container, sidecar build contexts, and gateway
+render templates. Installed commands must not require repo-local Docker
+contexts, copied compose files, or gateway `.env` files.
 
 Normal gateway operation is state-driven:
 
@@ -1252,7 +1252,6 @@ An environment is considered active if any of these are true:
 - An envd-owned shell, SSH, VS Code, or one-shot command session is attached.
 - An envd-managed port forward has active connections.
 - An envd-managed service/app runtime is running and marked keep-alive.
-- A sealed project Docker operation is running.
 - A profile build, migration, recovery-point operation, or repair is running.
 - envd cannot confidently distinguish baseline container processes from user
   work.
@@ -1262,14 +1261,13 @@ An environment can be auto-stopped only when:
 - No envd-owned access sessions are attached.
 - No envd-managed keep-alive service is running.
 - No active envd-managed port connections exist.
-- No envd-managed project Docker operation is active.
 - No risky migration, recovery-point, or repair operation is active.
 - The environment has stayed idle for the configured grace period.
 
 When auto-stop happens:
 
 - Stop the dev environment.
-- Stop its sidecar and sealed project Docker engine if present.
+- Stop its sidecar if present.
 - Close protected storage if the environment uses it.
 - Keep envd state, recovery points, and profile images intact.
 - Record the reason in events.
@@ -1524,67 +1522,41 @@ envd cannot make arbitrary host Docker safe unless envd controls the Docker API
 endpoint being used. Global shell wrappers, warnings, or PATH tricks are not a
 security boundary because users and tools can bypass them.
 
-### Sealed Project Docker
+### Docker/Compose Inside Environments
 
-The safe model is a Docker-compatible project engine managed by envd.
+Current product decision: envd does not ship a sealed project-Docker engine.
+That subsystem was too large and too easy to make clunky. Standard Docker and
+Compose should still work from an envd shell, but they use the host Docker daemon
+when a host Docker socket is available.
 
-This is a major post-v1 subsystem, not a casual follow-on feature. It should ship
-only after sealed single-container environments, gateway switching, protected
-storage, and identity denial are already reliable and release-gated.
-
-User experience:
+User experience remains normal:
 
 ```bash
 envd shell books
 docker compose up
 ```
 
-Inside an envd shell, `docker` and `docker compose` should talk to the
-envd-managed project Docker engine, not the host Docker daemon. The user still
-uses standard Docker and Compose commands. envd does not reimplement Compose
-semantics.
+This keeps real Compose compatibility because envd does not proxy or translate
+Compose features.
 
-Implemented backend: sealed environments start an envd-owned rootless Docker
-project daemon from `envd-project-docker:27-rootless`. The daemon shares the
-sealed sidecar network namespace, listens only inside that namespace, and the
-dev container receives `DOCKER_HOST=tcp://127.0.0.1:2375`. The host Docker
-socket is not mounted into the dev container.
+Rules:
 
-Project engine rules:
-
-- The host Docker socket is not mounted by default.
-- `DOCKER_HOST` or Docker context inside the env points to the envd project
-  engine.
-- The project engine is created lazily on first Docker use.
-- The project engine runs under envd control and uses the sealed gateway route.
-- Images, Compose networks, Compose volumes, and build cache for the project
-  engine live in envd-managed storage using the environment's declared storage
-  mode.
-- If the sealed route is unhealthy, project Docker operations fail closed.
-- DNS, IPv4, and IPv6 for project containers must follow the sealed network
-  policy.
-- Compose `ports:` must not silently publish services to the host or LAN. Host
-  exposure goes through envd port policy.
-- Compose host path mounts are allowed only for envd-approved workspace paths.
-  Arbitrary host paths are blocked or require an explicit unsafe override.
-- Compose features that break isolation, such as host networking, raw host
-  Docker socket mounts, privileged host access, or arbitrary device mounts, are
-  blocked by default.
-
-`hack/verify/verify-project-docker.sh` is the release gate for this subsystem. It
-creates a sealed env, verifies `docker` and `docker compose` use the managed
-endpoint, verifies project-container egress matches gateway egress, proves
-published project ports are not reachable from the host, disconnects the sidecar
-from the gateway network, and proves project Docker egress fails closed.
-
-This makes common Compose development safe without inventing an `envd compose`
-command.
+- The envd dev shell/processes are sealed according to their env network mode.
+- Docker/Compose-launched sibling containers are host Docker containers.
+- Those sibling containers are outside the sealed network guarantee and may use
+  normal Docker networking.
+- `docker compose up` should work without `envd compose`.
+- Existing env containers may need recreation before they receive the host
+  Docker socket mount because Docker mounts cannot be added to an already-created
+  container.
+- `ENVD_DOCKER_SOCKET=none` disables socket passthrough for tests or hardened
+  launches.
 
 Expected status:
 
 ```text
-NAME   NET     DOCKER          VPN   STORAGE    ISSUE
-books  sealed  sealed-engine  ok    protected  -
+NAME   NET     DOCKER       VPN   STORAGE    ISSUE
+books  sealed  host-socket  ok    protected  host Docker outside sealed guarantee
 ```
 
 Useful commands:
@@ -1595,42 +1567,9 @@ envd doctor --deep
 ```
 
 Normal usage remains standard `docker` and `docker compose` inside the envd
-shell. envd should create, repair, stop, and clean up the sealed project Docker
-engine automatically when it has enough context. If it cannot, `envd doctor
---deep` explains why.
-
-Backend decision:
-
-- The initial secure backend should be a rootless Docker project daemon managed
-  by envd.
-- containerd/nerdctl remains a later option only if Docker Compose compatibility
-  is sufficient for real projects.
-- Privileged Docker-in-Docker is allowed only as an explicit compatibility
-  backend, never as the secure default.
-
-The backend is otherwise an implementation detail. The invariant is that the
-Docker API endpoint used inside envd is envd-managed, sealed, protected, and
-fail-closed.
-
-### Raw Host Docker
-
-Raw Docker opt-in:
-
-```bash
-envd start dev1 --docker raw
-```
-
-Rules:
-
-- Raw host Docker access must be shown in `envd list` as a risk.
-- Raw host Docker containers are not considered sealed.
-- Protected identities are denied while raw host Docker is attached unless a
-  separate explicit identity policy allows it.
-- envd should detect unmanaged host Docker containers and report them in
-  `envd status`, but detection is informational only.
-- envd should not install global `docker` wrappers as a security feature.
-- If a project truly requires raw host Docker, envd must label the environment
-  outside the sealed Docker guarantee.
+shell. envd should repair its own dev image and sidecar image automatically, but
+it does not own arbitrary Compose app containers unless they are explicitly
+registered for lock cleanup.
 
 ### Registered Docker Artifacts
 
@@ -1984,7 +1923,6 @@ Active tool behavior:
 - Close envd-managed port forwards.
 - Stop envd-managed dev environments.
 - Stop envd-managed services/app runtimes.
-- Stop sealed project Docker engines if enabled.
 - Stop/remove envd-marked app containers that are registered for lock cleanup.
 - Remove envd-managed temporary/build containers where safe.
 - Close protected storage for stopped environments.
@@ -2314,9 +2252,6 @@ Sealed container checks:
 - Sidecar exists and runs.
 - Sidecar healthcheck passes.
 - Protected storage mounted only when unlocked when required.
-- Project Docker engine uses envd-managed Docker endpoint when enabled.
-- Project Docker engine storage is protected when enabled.
-- Project Docker engine route follows sealed network policy when enabled.
 - Default route is TUN.
 - Kill-switch policies are installed.
 - DNS resolves.
@@ -3395,20 +3330,14 @@ Gateway gate:
   after a successful switch.
 - A failed reconciliation leaves affected environments closed, not direct.
 
-Project Docker gate:
+Host Docker/Compose gate:
 
-- `docker` and `docker compose` inside an envd shell must use the envd-managed
-  project Docker endpoint, not the host Docker socket.
-- Project Docker containers must have no direct egress when the gateway is down.
-- Project Docker DNS, IPv4, and IPv6 behavior must match sealed policy.
-- Compose `ports:` must not silently expose services to the host or LAN.
-- Host path mounts outside approved workspace paths must be blocked by default.
-- Host networking, raw host Docker socket mounts, privileged host access, and
-  arbitrary device mounts must be blocked by default.
-- `envd doctor --deep` must prove project Docker traffic is sealed by launching a
-  test container through the project engine.
-- Raw host Docker must be reported as outside envd guarantee, not treated as a
-  weaker sealed mode.
+- `docker` and `docker compose` inside an envd shell must work through the host
+  Docker socket when available.
+- Host-Docker sibling containers must be reported as outside the sealed
+  guarantee, not treated as a weaker sealed mode.
+- `ENVD_DOCKER_SOCKET=none` must disable socket passthrough for hardened/test
+  launches.
 
 Storage gate:
 
@@ -3472,8 +3401,9 @@ Editor/SSH access gate:
 Lock/session gate:
 
 - `envd lock` must terminate envd-managed shell, SSH, and one-shot command
-  sessions, stop envd-managed environments and service/app runtimes, stop sealed
-  project Docker engines, and close protected storage where present.
+  sessions, stop envd-managed environments and service/app runtimes, clean up
+  registered host-Docker artifacts asynchronously, and close protected storage
+  where present.
 - New envd-managed access sessions must be refused while locked.
 - envd-owned shell clients must stop accepting input, clear/reset the visible
   terminal state where supported, exit, and leave a locked message when they
@@ -3651,11 +3581,11 @@ Post-v1 resilience/censorship milestone:
 - User URI generation.
 - Gateway chains.
 
-Release-gated project Docker milestone:
+Release-gated host Docker/Compose milestone:
 
-- Sealed project Docker endpoint for standard `docker` and `docker compose`
-  inside envd shells.
-- Raw host Docker detection and risk reporting.
+- Standard `docker` and `docker compose` work inside envd shells through the host
+  Docker socket.
+- Host Docker passthrough is visible as outside the sealed guarantee.
 
 No later milestone can ship by intention alone. Each feature must satisfy its
 release gate before it becomes part of the supported product.

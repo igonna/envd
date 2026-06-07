@@ -168,7 +168,6 @@ Useful local gates:
 hack/verify/verify-embedded-assets.sh
 hack/verify/verify-cross-platform.sh
 hack/verify/verify-host-proxy-equivalence.sh
-hack/verify/verify-project-docker.sh
 ```
 
 `go` is not required on the host for normal install or verification; the scripts
