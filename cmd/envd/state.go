@@ -59,6 +59,8 @@ type envdState struct {
 	HostingChecks     []hostingCheckRecord            `json:"hosting_checks,omitempty"`
 }
 
+const maxStateEvents = 500
+
 type stateEvent struct {
 	Time    time.Time `json:"time"`
 	Kind    string    `json:"kind"`
@@ -261,6 +263,41 @@ func newStateStore() (stateStore, error) {
 
 func (s stateStore) withState(stderr io.Writer, fn func(*envdState) error) error {
 	return s.withStateMode(stderr, false, fn)
+}
+
+func (s stateStore) withStateReadOnly(stderr io.Writer, fn func(*envdState) error) error {
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return err
+	}
+	if !fileExists(s.path) {
+		return fmt.Errorf("envd is not initialized; run `envd init` first")
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	password, err := readMasterPassword(stderr)
+	if err != nil {
+		return err
+	}
+	clear := func() {
+		for i := range password {
+			password[i] = 0
+		}
+	}
+	defer clear()
+
+	st, err := s.loadOrCreate(password)
+	if err != nil {
+		_ = clearCachedMasterPassword()
+		return err
+	}
+	if err := cacheMasterPassword(password, unlockTTL()); err != nil {
+		return err
+	}
+	return fn(&st)
 }
 
 func (s stateStore) withStateSaveOnError(stderr io.Writer, fn func(*envdState) error) error {
@@ -1059,4 +1096,7 @@ func (s *envdState) addEvent(kind, subject, message string) {
 		Subject: subject,
 		Message: message,
 	})
+	if len(s.Events) > maxStateEvents {
+		s.Events = append([]stateEvent{}, s.Events[len(s.Events)-maxStateEvents:]...)
+	}
 }

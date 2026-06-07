@@ -47,7 +47,7 @@ func TestHelpDoesNotNeedState(t *testing.T) {
 	}
 }
 
-func TestHelpUsesStartAndListCommands(t *testing.T) {
+func TestHelpUsesStartAndStatusCommands(t *testing.T) {
 	var out bytes.Buffer
 	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
 
@@ -55,15 +55,42 @@ func TestHelpUsesStartAndListCommands(t *testing.T) {
 		t.Fatalf("help failed: %v", err)
 	}
 	got := out.String()
-	for _, want := range []string{"start                create or start an environment", "list                 list environments"} {
+	for _, want := range []string{"start                create or start an environment", "status               show access, gateway, and environments"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("help missing %q:\n%s", want, got)
 		}
 	}
-	for _, old := range []string{"run                  create", "ps                   list"} {
+	for _, old := range []string{"run                  create", "ps                   list", "list                 list environments"} {
 		if strings.Contains(got, old) {
 			t.Fatalf("help still contains old command %q:\n%s", old, got)
 		}
+	}
+}
+
+func TestTopLevelListCommandRemoved(t *testing.T) {
+	a := app{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, root: t.TempDir()}
+
+	err := a.run([]string{"list"})
+	if err == nil || !strings.Contains(err.Error(), `unknown command "list"`) {
+		t.Fatalf("expected list to be removed, got %v", err)
+	}
+}
+
+func TestRemovedTopLevelCommands(t *testing.T) {
+	a := app{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	for _, cmd := range []string{"internet", "events", "why", "inspect", "supervisor"} {
+		err := a.run([]string{cmd})
+		if err == nil || !strings.Contains(err.Error(), `unknown command "`+cmd+`"`) {
+			t.Fatalf("expected %s to be removed, got %v", cmd, err)
+		}
+	}
+}
+
+func TestDoctorInternetCommandRemoved(t *testing.T) {
+	a := app{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	err := a.runDoctor([]string{"internet"}, &envdState{})
+	if err == nil || !strings.Contains(err.Error(), `unknown doctor subcommand "internet"`) {
+		t.Fatalf("expected doctor internet to be removed, got %v", err)
 	}
 }
 
@@ -74,12 +101,12 @@ func TestStatefulCommandRequiresInit(t *testing.T) {
 	var out bytes.Buffer
 	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
 
-	err := a.run([]string{"events"})
+	err := a.run([]string{"doctor", "history"})
 	if err == nil || !strings.Contains(err.Error(), "envd init") {
 		t.Fatalf("expected init error, got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(stateDir, "state.enc")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("state.enc should not be created by events before init: %v", err)
+		t.Fatalf("state.enc should not be created by doctor history before init: %v", err)
 	}
 }
 
@@ -100,11 +127,11 @@ func TestInitCreatesEncryptedState(t *testing.T) {
 		t.Fatalf("state.enc was not created: %v", err)
 	}
 	out.Reset()
-	if err := a.run([]string{"events"}); err != nil {
-		t.Fatalf("events after init failed: %v", err)
+	if err := a.run([]string{"doctor", "history"}); err != nil {
+		t.Fatalf("doctor history after init failed: %v", err)
 	}
 	if !strings.Contains(out.String(), "encrypted state initialized") {
-		t.Fatalf("events output did not include initial state event: %q", out.String())
+		t.Fatalf("doctor history output did not include initial state event: %q", out.String())
 	}
 	if err := a.run([]string{"init"}); err == nil || !strings.Contains(err.Error(), "already initialized") {
 		t.Fatalf("second init should fail, got %v", err)
@@ -127,6 +154,19 @@ func TestUnlockValidatesExistingState(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Unlocked:") {
 		t.Fatalf("unlock output = %q", out.String())
+	}
+}
+
+func TestStateEventsAreBounded(t *testing.T) {
+	st := envdState{}
+	for i := 0; i < maxStateEvents+25; i++ {
+		st.addEvent("test", "", fmt.Sprintf("event-%d", i))
+	}
+	if len(st.Events) != maxStateEvents {
+		t.Fatalf("event history length = %d", len(st.Events))
+	}
+	if got := st.Events[0].Message; got != "event-25" {
+		t.Fatalf("oldest retained event = %q", got)
 	}
 }
 
@@ -154,6 +194,23 @@ func TestRuntimeAccessPublishAndLock(t *testing.T) {
 	}
 }
 
+func TestRuntimeAccessUnpublish(t *testing.T) {
+	t.Setenv("ENVD_DATA_DIR", t.TempDir())
+	ref := envRef{Name: "books", ID: "abc123", UserName: "dev", DevName: "envd-abc123-dev", Network: "sealed"}
+	if err := publishRuntimeRoute(ref, "sealed"); err != nil {
+		t.Fatalf("publish runtime route failed: %v", err)
+	}
+	if _, err := runtimeRoute("books"); err != nil {
+		t.Fatalf("runtime route missing before unpublish: %v", err)
+	}
+	if err := unpublishRuntimeRoute("books"); err != nil {
+		t.Fatalf("unpublish runtime route failed: %v", err)
+	}
+	if _, err := runtimeRoute("books"); err == nil || !strings.Contains(err.Error(), "not published") {
+		t.Fatalf("runtime route should be gone after unpublish, got %v", err)
+	}
+}
+
 func TestStatusDoesNotNeedEncryptedState(t *testing.T) {
 	t.Setenv("ENVD_DATA_DIR", t.TempDir())
 	var out bytes.Buffer
@@ -163,6 +220,46 @@ func TestStatusDoesNotNeedEncryptedState(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Access:") || !strings.Contains(out.String(), "Master cache:") {
 		t.Fatalf("status output missing expected fields: %q", out.String())
+	}
+}
+
+func TestDetailRowsAlignLongLabels(t *testing.T) {
+	var out bytes.Buffer
+	printDetailRows(&out, []detailRow{
+		{Label: "Name", Value: "test1"},
+		{Label: "Gateway generation", Value: "1"},
+		{Label: "Image ID", Value: "sha256:abc"},
+	})
+	got := out.String()
+	for _, want := range []string{
+		"Name:                test1\n",
+		"Gateway generation:  1\n",
+		"Image ID:            sha256:abc\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("details alignment missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestProbeResultsAlignLongNames(t *testing.T) {
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	ok, failures := a.printProbeResults([]probeResult{
+		{Name: "Env bet1", Detail: "sealed running"},
+		{Name: "Env sealed-storage-test", Detail: "sealed running"},
+	})
+	if !ok || len(failures) != 0 {
+		t.Fatalf("expected ok probe results, ok=%v failures=%v", ok, failures)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Env bet1                 OK    sealed running\n",
+		"Env sealed-storage-test  OK    sealed running\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("probe alignment missing %q:\n%s", want, got)
+		}
 	}
 }
 
@@ -191,6 +288,69 @@ func TestStatusReportsStaleIdentityAgent(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Identity:") || !strings.Contains(out.String(), "stale for books") {
 		t.Fatalf("status did not report stale identity agent: %q", out.String())
+	}
+}
+
+func TestStatusReportsMissingIdentityAgent(t *testing.T) {
+	t.Setenv("ENVD_DATA_DIR", t.TempDir())
+	access := runtimeAccessState{Locked: false, Routes: map[string]runtimeSSHRoute{
+		"books": {Name: "books", ID: "abc123", DevName: "envd-abc123-dev", Network: "sealed"},
+	}}
+	if err := saveRuntimeAccess(access); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	if err := a.run([]string{"status"}); err != nil {
+		t.Fatalf("status failed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Identity:") || !strings.Contains(out.String(), "missing for books") {
+		t.Fatalf("status did not report missing identity agent: %q", out.String())
+	}
+}
+
+func TestSSHProxyIgnoresStaleIdentitySocketWithoutCache(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("ENVD_DATA_DIR", filepath.Join(home, ".local", "share", "envd"))
+	stateDir := filepath.Join(home, ".local", "state", "envd")
+	t.Setenv("ENVD_STATE_DIR", stateDir)
+	t.Setenv("ENVD_NONINTERACTIVE", "1")
+	t.Setenv("ENVD_UNLOCK_SOCKET", filepath.Join(home, "unlock.sock"))
+	store := stateStore{dir: stateDir, path: filepath.Join(stateDir, "state.enc")}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	st := envdState{
+		Environments: map[string]envRecord{"books": {ID: "abc123", Network: "sealed", GatewayGeneration: 1}},
+		Identities: map[string]identityRecord{"github": {
+			Name:       "github",
+			Type:       "ssh",
+			PrivateKey: "secret",
+			Policy:     defaultIdentityPolicy(),
+		}},
+		GatewayGeneration: 1,
+	}
+	if err := store.save(st, []byte("test-password")); err != nil {
+		t.Fatal(err)
+	}
+	socketPath, err := identityAgentSocketPath("books")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socketPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stop, err := (app{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, root: t.TempDir()}).startSSHProxyIdentityAgent("books")
+	if err != nil {
+		t.Fatalf("stale identity socket blocked ssh proxy: %v", err)
+	}
+	stop()
+	if _, err := os.Stat(socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale socket was not removed: %v", err)
 	}
 }
 
@@ -1244,6 +1404,19 @@ func TestProtectedStorageBackendSelection(t *testing.T) {
 	}
 }
 
+func TestValidateEnvNameAllowsHyphens(t *testing.T) {
+	for _, name := range []string{"books", "sealed-storage-test", "dev1-test2"} {
+		if err := validateEnvName(name); err != nil {
+			t.Fatalf("valid env name %q rejected: %v", name, err)
+		}
+	}
+	for _, name := range []string{"-bad", "bad-", "Bad", "bad_name", "bad.name"} {
+		if err := validateEnvName(name); err == nil {
+			t.Fatalf("invalid env name %q accepted", name)
+		}
+	}
+}
+
 func TestParseProjectManifest(t *testing.T) {
 	manifest, err := parseProjectManifest([]byte("network: direct\nstorage: plain\nprofile: web\n"))
 	if err != nil {
@@ -1565,6 +1738,69 @@ func TestSupervisorTickStopsOnlyIdleRunningWorkloads(t *testing.T) {
 	}
 }
 
+func TestRuntimeIdleTickDoesNotStopActiveSession(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("ENVD_DATA_DIR", dataDir)
+	now := time.Unix(10000, 0).UTC()
+	if err := saveRuntimeAccess(runtimeAccessState{Routes: map[string]runtimeSSHRoute{
+		"books": {Name: "books", ID: "abc123", DevName: "envd-abc123-dev", UserName: "dev", Network: "sealed", Storage: "plain", UpdatedAt: now.Add(-3 * time.Hour)},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := touchRuntimeActivity("books", now.Add(-3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	stopSession, err := startRuntimeSession("books", "ssh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stopSession()
+	var stopped []string
+	count, err := runtimeIdleTick(defaultIdleTimeout, now, func(runtimeSSHRoute) bool {
+		return true
+	}, func(route runtimeSSHRoute) error {
+		stopped = append(stopped, route.Name)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("idle tick failed: %v", err)
+	}
+	if count != 0 || len(stopped) != 0 {
+		t.Fatalf("active session was stopped: count=%d stopped=%v", count, stopped)
+	}
+}
+
+func TestRuntimeIdleTickStopsDisconnectedOldEnv(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("ENVD_DATA_DIR", dataDir)
+	now := time.Unix(10000, 0).UTC()
+	if err := saveRuntimeAccess(runtimeAccessState{Routes: map[string]runtimeSSHRoute{
+		"idle":   {Name: "idle", ID: "aaa111", DevName: "envd-aaa111-dev", UserName: "dev", Network: "sealed", Storage: "plain", UpdatedAt: now.Add(-3 * time.Hour)},
+		"recent": {Name: "recent", ID: "bbb222", DevName: "envd-bbb222-dev", UserName: "dev", Network: "sealed", Storage: "plain", UpdatedAt: now.Add(-time.Hour)},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := touchRuntimeActivity("idle", now.Add(-3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := touchRuntimeActivity("recent", now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var stopped []string
+	count, err := runtimeIdleTick(defaultIdleTimeout, now, func(runtimeSSHRoute) bool {
+		return true
+	}, func(route runtimeSSHRoute) error {
+		stopped = append(stopped, route.Name)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("idle tick failed: %v", err)
+	}
+	if count != 1 || strings.Join(stopped, ",") != "idle" {
+		t.Fatalf("unexpected idle stops: count=%d stopped=%v", count, stopped)
+	}
+}
+
 func TestTouchEnvUsed(t *testing.T) {
 	now := time.Now().UTC()
 	st := envdState{Environments: map[string]envRecord{"books": {ID: "abc123"}}}
@@ -1622,6 +1858,55 @@ func TestShellCommandWithEphemeralSSHAgent(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("wrapped shell command missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestShellCommandWithEphemeralGitHTTPSHelper(t *testing.T) {
+	command := shellCommandWithEphemeralGitHTTPSHelper([]string{"git", "clone", "https://github.com/owner/repo.git", "."})
+	got := strings.Join(command, " ")
+	for _, want := range []string{"sh -lc", "GIT_CONFIG_KEY_0=credential.helper", "ENVD_GIT_HTTPS_USERNAME", "ENVD_GIT_HTTPS_PASSWORD_B64", "exec 'git' 'clone'"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("wrapped git https command missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "secret-token") {
+		t.Fatalf("wrapped git https command leaked token: %s", got)
+	}
+}
+
+func TestPrepareShellDockerArgsInjectsGitHTTPSIdentity(t *testing.T) {
+	oldHealth := shellIdentityBrokerHealth
+	shellIdentityBrokerHealth = func(*envdState, string) identityBrokerHealth {
+		return func() error { return nil }
+	}
+	defer func() { shellIdentityBrokerHealth = oldHealth }()
+	st := envdState{
+		GatewayGeneration: 1,
+		Environments: map[string]envRecord{
+			"books": {ID: "abc123", Network: "sealed", GatewayGeneration: 1},
+		},
+		Identities: map[string]identityRecord{
+			"githubhttps": {
+				Name:     "githubhttps",
+				Type:     "git-https",
+				Username: "alice",
+				Password: "secret-token",
+				Policy:   defaultIdentityPolicy(),
+			},
+		},
+	}
+	args, err := prepareShellDockerArgs([]string{"books", "git", "clone", "https://github.com/owner/repo.git", "."}, &st)
+	if err != nil {
+		t.Fatalf("prepareShellDockerArgs failed: %v", err)
+	}
+	got := strings.Join(args, " ")
+	for _, want := range []string{"ENVD_GIT_HTTPS_USERNAME=alice", "ENVD_GIT_HTTPS_PASSWORD_B64=", "credential.helper"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("git https shell args missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "secret-token") {
+		t.Fatalf("git https shell args leaked token: %s", got)
 	}
 }
 
@@ -1803,7 +2088,7 @@ func TestRemoteGatewayConfigWithShares(t *testing.T) {
 	}
 }
 
-func TestRunUserURI(t *testing.T) {
+func TestRunGatewayViewDefaultShare(t *testing.T) {
 	now := time.Now().UTC()
 	st := envdState{Gateways: map[string]gatewayRecord{
 		"ams1": gatewayRecordFromConfig("ams1", gatewayConfig{
@@ -1818,14 +2103,11 @@ func TestRunUserURI(t *testing.T) {
 		}, now),
 	}}
 	var out bytes.Buffer
-	if err := (app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}).runUserURI([]string{"ams1"}, &st); err != nil {
-		t.Fatalf("runUserURI failed: %v", err)
+	if err := (app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}).runGatewayView([]string{"ams1", "default"}, &st); err != nil {
+		t.Fatalf("runGatewayView failed: %v", err)
 	}
 	if !strings.HasPrefix(out.String(), "vless://") {
 		t.Fatalf("unexpected URI output: %q", out.String())
-	}
-	if len(st.Events) != 1 || !strings.Contains(st.Events[0].Message, "generated user import URI") {
-		t.Fatalf("missing URI event: %+v", st.Events)
 	}
 }
 
@@ -2357,6 +2639,7 @@ func TestEnsureEnvSSHConfigWritesStandardSSHHost(t *testing.T) {
 		"ProxyCommand '/tmp/envd tool/envd' ssh-proxy books",
 		"IdentityFile " + shellWords(filepath.Join(home, ".ssh", "envd_ed25519")),
 		"IdentitiesOnly yes",
+		"PubkeyAuthentication unbound",
 		"ForwardAgent yes",
 		"IdentityAgent " + shellWords(filepath.Join(home, ".local", "share", "envd", "runtime", "identity-agents", "books.sock")),
 		"HostKeyAlias envd-books",
@@ -2883,7 +3166,7 @@ func TestRunDoctorIdentityOnlySkipsGateway(t *testing.T) {
 	}
 }
 
-func TestInternetSummaryAndHistoryPruning(t *testing.T) {
+func TestNetworkSummaryAndHistoryPruning(t *testing.T) {
 	results := []internetProbeRecord{
 		{Name: "a", Status: "ok"},
 		{Name: "b", Status: "fail"},
@@ -2895,7 +3178,7 @@ func TestInternetSummaryAndHistoryPruning(t *testing.T) {
 	}
 	st := envdState{}
 	for i := 0; i < 55; i++ {
-		recordInternetCheck(&st, internetCheckRecord{
+		recordNetworkCheck(&st, internetCheckRecord{
 			Time:    time.Unix(int64(i), 0).UTC(),
 			Results: results,
 			Summary: summary,
@@ -2918,7 +3201,7 @@ func TestHTTPStatusDetail(t *testing.T) {
 	}
 }
 
-func TestPrintInternetCheck(t *testing.T) {
+func TestPrintNetworkCheck(t *testing.T) {
 	check := internetCheckRecord{
 		Time: time.Unix(0, 0).UTC(),
 		Results: []internetProbeRecord{{
@@ -2930,10 +3213,30 @@ func TestPrintInternetCheck(t *testing.T) {
 		Summary: internetCheckSummary{OK: 1, Total: 1},
 	}
 	var out bytes.Buffer
-	printInternetCheck(&out, check)
+	printNetworkCheck(&out, check)
 	got := out.String()
-	if !strings.Contains(got, "Summary: ok=1 fail=0 skip=0 total=1") || !strings.Contains(got, "Direct HTTPS") {
-		t.Fatalf("unexpected internet check output: %q", got)
+	if !strings.Contains(got, "Checked: 1970-01-01T00:00:00Z ok=1 fail=0 skip=0 total=1") || !strings.Contains(got, "Direct HTTPS  OK    egress 1.2.3.4") {
+		t.Fatalf("unexpected network check output: %q", got)
+	}
+}
+
+func TestNetworkCheckProbeResultsUseDoctorStyle(t *testing.T) {
+	results := networkCheckProbeResults(internetCheckRecord{Results: []internetProbeRecord{
+		{Name: "Direct HTTPS", Status: "ok", Detail: "egress 1.2.3.4"},
+		{Name: "Gateway HTTPS", Status: "fail", Detail: "timeout"},
+		{Name: "Gateway Docker Hub", Status: "skip", Detail: "gateway unavailable"},
+	}})
+	if len(results) != 3 {
+		t.Fatalf("results len = %d", len(results))
+	}
+	if results[0].Err != nil || results[0].Detail != "egress 1.2.3.4" {
+		t.Fatalf("unexpected ok result: %+v", results[0])
+	}
+	if results[1].Err == nil || !strings.Contains(results[1].Err.Error(), "timeout") {
+		t.Fatalf("unexpected fail result: %+v", results[1])
+	}
+	if results[2].Err != nil || !strings.Contains(results[2].Detail, "skipped: gateway unavailable") {
+		t.Fatalf("unexpected skip result: %+v", results[2])
 	}
 }
 

@@ -213,8 +213,8 @@ Command design should leave room for this:
 envd gateway install ams1 --host 1.2.3.4 --user root --provider xray
 envd gateway inspect ams1
 envd gateway use ams1
-envd user add phone
-envd user uri phone
+envd gateway share ams1 phone
+envd gateway view ams1 phone
 envd gateway doctor
 ```
 
@@ -325,15 +325,15 @@ Non-goals:
 Commands:
 
 ```bash
-envd internet status
-envd internet report
+envd doctor network
+envd doctor network history
 envd hosting check
 envd hosting list
-envd hosting shortlist
+envd hosting global
 envd gateway risk ams1
 ```
 
-`envd internet status` should summarize the user's current network:
+`envd doctor network` should summarize the user's current network:
 
 ```text
 Network:        RU, ASxxxxx
@@ -465,11 +465,11 @@ catalog editing is not normal UX.
 Gateway acquisition flow:
 
 ```bash
-envd hosting shortlist
+envd hosting global
 envd gateway install ams2 --host <ip> --user root --password
 ```
 
-`envd hosting shortlist` should rank providers by:
+`envd hosting global` should rank providers by:
 
 - Reachability from the current network.
 - API/website reachability.
@@ -511,7 +511,7 @@ provider-e      fail fail ok ok     recovered
 This lets the user see what changed since the last check instead of redoing
 research manually.
 
-`envd hosting shortlist` should guide the user through creating the next
+`envd hosting global` should guide the user through creating the next
 gateway:
 
 ```text
@@ -675,7 +675,7 @@ Rules:
   change.
 - Mode changes may recreate the dev container while preserving the environment's
   declared storage.
-- `envd inspect <env>` must show the current mode and why.
+- `envd details <env>` must show the current mode and why.
 
 ## Command Model
 
@@ -693,7 +693,7 @@ Every command should perform safe startup:
 6. Continue the original command after unlock.
 
 The user should not accidentally create a forgotten master password from an
-ordinary command like `envd list`.
+ordinary command like `envd status`.
 
 ### Lazy Reconciliation UX
 
@@ -785,8 +785,8 @@ envd lock
 envd doctor
 envd doctor --deep
 envd status
-envd events
-envd why books
+envd doctor history
+envd doctor why books
 envd lock
 ```
 
@@ -806,7 +806,7 @@ envd init
 envd gateway install ams1 --host 1.2.3.4 --user root --password
 envd gateway use ams1
 envd start books
-envd list
+envd status
 ```
 
 The normal user should not need separate `inspect`, `plan`, and `apply`
@@ -825,7 +825,7 @@ envd init
 envd gateway install <name> --host <ip> --user root --password
 envd gateway use <name>
 envd start <env>
-envd list
+envd status
 envd shell <env>
 envd stop <env>
 envd start <env>
@@ -837,9 +837,9 @@ Visibility/debug commands:
 ```bash
 envd doctor --deep
 envd doctor --identity <env>
-envd why <env>
-envd events
-envd inspect <env>
+envd doctor why <env>
+envd doctor history
+envd details <env>
 envd gateway status
 envd gateway doctor
 envd gateway egress
@@ -855,7 +855,7 @@ envd pkg promote <env> --to <profile>
 envd migrate <env> --profile <profile>
 ```
 
-Support/repair actions should usually be suggested by `envd doctor`, `envd why`,
+Support/repair actions should usually be suggested by `envd doctor`, `envd doctor why`,
 or the command that failed. They should not be commands the user memorizes for
 normal operation.
 
@@ -994,7 +994,7 @@ environments:
 
 During propagation, sealed environments must remain fail-closed. If the active
 gateway changed but a sidecar cannot be updated, the sidecar should keep default
-drop policy and `envd list` should show the issue:
+drop policy and `envd status` should show the issue:
 
 ```text
 NAME   STATE    NET     VPN      PROFILE  ISSUE
@@ -1068,15 +1068,13 @@ kill-switch default drop.
 ### Users
 
 ```bash
-envd user add phone
-envd user rm phone
-envd user uri phone
-envd user list
-envd user disable phone
-envd user enable phone
+envd gateway share ams1 phone
+envd gateway revoke ams1 phone
+envd gateway view ams1 phone
+envd gateway shares ams1
 ```
 
-`user uri <user>` prints a provider-specific import URI suitable for apps.
+`gateway view <gateway> <share>` prints a provider-specific import URI suitable for apps.
 
 ### Identities
 
@@ -1111,11 +1109,11 @@ Remote egress: x.x.x.x
 ### Internet And Hosting Intelligence
 
 ```bash
-envd internet status
-envd internet report
+envd doctor network
+envd doctor network history
 envd hosting check
 envd hosting list
-envd hosting shortlist
+envd hosting global
 envd gateway risk ams1
 ```
 
@@ -1184,12 +1182,12 @@ envd stop dev1
 envd start dev1
 envd restart dev1
 envd rm dev1
-envd list
-envd inspect dev1
+envd status
+envd details dev1
 envd network set dev1 sealed
 ```
 
-`envd list` should expose operational state, not just container names:
+`envd status` should expose operational state, not just container names:
 
 ```text
 NAME      STATE    NET      VPN     STORAGE    EGRESS     IDENTITY  PROFILE  ISSUE
@@ -1205,7 +1203,7 @@ last verified gateway egress identity when available. The `STORAGE` column is
 also required so plain storage is never confused with encrypted protected
 storage.
 
-`envd list` must not show anonymous image IDs as the primary identity. If Docker
+`envd status` must not show anonymous image IDs as the primary identity. If Docker
 only has an image ID, that is a recovery signal, not a normal state. The source
 of truth should be the envd environment spec:
 
@@ -1271,7 +1269,7 @@ When auto-stop happens:
 - Close protected storage if the environment uses it.
 - Keep envd state, recovery points, and profile images intact.
 - Record the reason in events.
-- Show the stop reason in `envd list` and `envd why <env>`.
+- Show the stop reason in `envd status` and `envd doctor why <env>`.
 
 Expected status:
 
@@ -1287,7 +1285,7 @@ Configuration should stay simple:
 ```bash
 envd start books --idle-stop 3h
 envd start db --keep-running
-envd inspect books
+envd details books
 ```
 
 Project manifests may declare non-secret idle intent:
@@ -1373,11 +1371,11 @@ Useful commands:
 
 ```bash
 envd start books .
-envd inspect books
+envd details books
 ssh books
 ```
 
-`envd inspect books` should show:
+`envd details books` should show:
 
 ```text
 Workspace: /Users/c/repo/books -> /workspace/books
@@ -1392,7 +1390,7 @@ Workspace sync rules:
 - Default creation bind-mounts or otherwise exposes the remembered project path as
   plain workspace storage.
 - Git remotes and identity operations go through envd-managed policy.
-- `envd inspect` shows the remembered host source path, mount path, and storage
+- `envd details` shows the remembered host source path, mount path, and storage
   mode.
 - Protected storage is explicit, for example `envd start books --storage protected`.
 - envd must never label a raw host workspace or normal Docker volume as protected
@@ -1450,7 +1448,7 @@ Rules:
 - `envd rm <env>` is the explicit removal action. After confirmation, it should
   remove the environment, envd-managed storage, env-owned recovery points, and
   env state together.
-- `envd list`, `envd inspect`, and `envd why` may mention that an automatic
+- `envd status`, `envd details`, and `envd doctor why` may mention that an automatic
   recovery point exists when it is relevant, but users should not manage recovery
   points during normal use.
 
@@ -1482,7 +1480,7 @@ Rules:
   longer needed.
 - Remove all env-owned recovery points when `envd rm <env>` removes that
   environment.
-- If recovery point storage grows unexpectedly, `envd doctor` and `envd inspect`
+- If recovery point storage grows unexpectedly, `envd doctor` and `envd details`
   should explain why envd is keeping them.
 
 ### Services And Ports
@@ -1562,7 +1560,7 @@ books  sealed  host-socket  ok    protected  host Docker outside sealed guarante
 Useful commands:
 
 ```bash
-envd inspect books
+envd details books
 envd doctor --deep
 ```
 
@@ -1754,7 +1752,7 @@ Docker network name      envd-n-4b109bd0
 Docker volume/mount id   envd-s-91b2d7aa
 ```
 
-`envd list` maps opaque IDs back to human names only after encrypted state is
+`envd status` maps opaque IDs back to human names only after encrypted state is
 available. When locked, envd may show a minimal locked status, but it should not
 print encrypted names or paths without unlock.
 
@@ -1993,7 +1991,7 @@ What the user can trust:
 - When an environment is running, tools see a normal filesystem.
 - `envd lock` stops envd-managed environments, revokes secrets/identity grants,
   and closes protected storage when present.
-- `envd list` and `envd inspect` show storage state plainly.
+- `envd status` and `envd details` show storage state plainly.
 
 Visible storage states:
 
@@ -2114,7 +2112,7 @@ Performance and reliability:
   rather than on every file operation while the environment is running.
 - Large database workloads, many-small-file workloads, and FUSE-style encrypted
   filesystems may have noticeable overhead.
-- `envd inspect` and `envd doctor --deep` should show backend type, mount state,
+- `envd details` and `envd doctor --deep` should show backend type, mount state,
   and last verification.
 - `envd doctor --deep` should verify protected storage mount/unmount behavior.
 - If the selected backend is slow or less reliable on the current platform, envd
@@ -2128,7 +2126,7 @@ Rules:
 
 - Do not pretend normal Docker volumes are encrypted.
 - Persistent unencrypted environment storage is the default normal mode.
-- `envd list` and `envd inspect` must show storage mode.
+- `envd status` and `envd details` must show storage mode.
 - Protected storage is explicit.
 - Identity policies may require protected storage.
 - If protected storage is requested and cannot be mounted safely, environment
@@ -2200,7 +2198,7 @@ Rules:
 - A chain must never silently degrade to only the entry hop.
 - A chain must never silently bypass the chain and use direct networking.
 - Chain egress policy is evaluated at the final exit, not at the entry hop.
-- `envd list` must show when a chain is active.
+- `envd status` must show when a chain is active.
 - Identity policy should bind to final egress policy and chain health.
 - Chain topology is local envd state and should not be exposed to dev
   containers.
@@ -2350,10 +2348,10 @@ Events to record:
 Commands:
 
 ```bash
-envd events
-envd events books
-envd events gateway ams1
-envd why books
+envd doctor history
+envd doctor history books
+envd doctor history gateway ams1
+envd doctor why books
 ```
 
 Example:
@@ -2365,7 +2363,7 @@ Example:
 2026-06-05 10:14 auto-repair books network ok
 ```
 
-`envd why <env>` should summarize the current state and the recent events that
+`envd doctor why <env>` should summarize the current state and the recent events that
 explain it:
 
 ```text
@@ -2514,16 +2512,16 @@ User management:
 
 - Each named user gets a UUID.
 - Users can be enabled/disabled independently.
-- `envd user uri <name>` emits a provider-specific import URI.
+- `envd gateway view <gateway> <share>` emits a provider-specific import URI.
 - Server config can be updated atomically.
 - Previous config is retained for rollback.
 
 Example:
 
 ```bash
-envd user add phone --gateway ams1
-envd user uri phone --gateway ams1
-envd user disable phone --gateway ams1
+envd gateway share ams1 phone
+envd gateway view ams1 phone
+envd gateway revoke ams1 phone
 ```
 
 The URI format is provider-specific. For Xray Reality this is a VLESS Reality
@@ -2720,7 +2718,7 @@ Behavior:
 - On `envd start`, if required secrets are missing, envd asks for them, stores
   them encrypted, and continues.
 - Secrets are injected only into the environment that requested them.
-- Secret names can appear in `envd inspect`; values must never appear in normal
+- Secret names can appear in `envd details`; values must never appear in normal
   output or logs.
 - Secrets are not baked into profile images.
 
@@ -2998,7 +2996,7 @@ Rules:
 - `envd pkg suggest <env>` can inspect apt history, dpkg state, global npm
   packages, pipx/pip globals, and common tool paths, but suggestions are
   best-effort and must be confirmed.
-- `envd inspect <env>` should show runtime drift from the declared profile.
+- `envd details <env>` should show runtime drift from the declared profile.
 
 ### Image Storage And Cleanup
 
@@ -3014,7 +3012,7 @@ Storage rules:
 - Older generations should be kept only while environments reference them.
 - Unreferenced envd-owned images should be garbage-collected automatically after
   envd verifies no environment references them.
-- `envd inspect`, `envd status`, and `envd doctor --deep` should explain which
+- `envd details`, `envd status`, and `envd doctor --deep` should explain which
   images are active, repairable, cached, or garbage-collectable when relevant.
 
 Example:
@@ -3241,7 +3239,7 @@ Required checks:
 - Broker denies access when sealed route is unhealthy.
 - Broker denies access when egress policy fails.
 - Broker grants are revoked after gateway switch until revalidation succeeds.
-- `envd list` shows identity status.
+- `envd status` shows identity status.
 - `envd doctor --identity` runs negative tests to confirm unsafe access is
   blocked.
 
@@ -3468,7 +3466,7 @@ Diagnostics gate:
   encrypted storage, or provider/catalog state.
 - `envd doctor --deep` must perform real traffic tests, including sealed
   container traffic, not only process checks.
-- `envd why <env>` must explain the last state transition or blocking reason.
+- `envd doctor why <env>` must explain the last state transition or blocking reason.
 
 Cross-platform gate:
 
@@ -3520,7 +3518,7 @@ v1 baseline:
 1. Create source-built `install.sh` bootstrap.
 2. Create Go CLI skeleton.
 3. Implement encrypted config/state model and explicit `envd init`.
-4. Implement environment specs and `envd list` from envd state plus Docker state.
+4. Implement environment specs and `envd status` from envd state plus Docker state.
 5. Implement image identity, profile tags, drift detection, and automatic image
    deletion recovery.
 6. Implement runtime asset manager with pinned assets and automatic restore.
@@ -3536,14 +3534,14 @@ v1 baseline:
     inspect/plan/apply/verify phases.
 13. Implement atomic `envd gateway use <name>` switching, rollback, and internal
     reconciliation for affected sealed environments.
-14. Implement `envd events` and `envd why`.
+14. Implement `envd doctor history` and `envd doctor why`.
 15. Remove Bash dependency from normal operations.
 
 v1 success criteria:
 
 - A user can install envd from source with `./install.sh`.
 - A user can create one sealed environment and see exact network/storage/image
-  state in `envd list`.
+  state in `envd status`.
 - A broken gateway, broken DNS, broken sidecar, missing image, or wrong proxy port
   is diagnosed by layer without manual curl/ping debugging.
 - Docker image deletion is repaired for envd-owned images.
@@ -3577,7 +3575,7 @@ Post-v1 resilience/censorship milestone:
 
 - Signed hosting catalog schema and conservative built-in catalog.
 - Catalog updates and local reachability history.
-- `envd internet status`, `envd hosting shortlist`, and gateway risk scoring.
+- `envd doctor network`, `envd hosting global`, and gateway risk scoring.
 - User URI generation.
 - Gateway chains.
 

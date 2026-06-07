@@ -73,6 +73,10 @@ const (
 	gatewayNet         = "vpn-gateway_inside"
 	remoteXrayVersion  = "26.2.6"
 	containerAssetsDir = "internal/assets/containers"
+	defaultIdleTimeout = 2 * time.Hour
+	minIdleTimeout     = 30 * time.Minute
+	idleLeaseStale     = 2 * time.Minute
+	idleStopGrace      = 5 * time.Second
 )
 
 type assetSpec struct {
@@ -226,6 +230,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "__idle-tick" {
+		if err := runRuntimeIdleTick(defaultIdleTimeout); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %s\n", redactSensitive(err.Error()))
+			os.Exit(1)
+		}
+		return
+	}
 
 	root, err := findRepoRoot()
 	if err != nil {
@@ -284,16 +295,6 @@ func (a app) run(args []string) error {
 			return a.runGateway(args[1:], nil)
 		}
 		return a.withState(func(st *envdState) error { return a.runGateway(args[1:], st) })
-	case "user":
-		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
-			return a.printCommandHelp([]string{"user"})
-		}
-		return a.withState(func(st *envdState) error { return a.runUser(args[1:], st) })
-	case "internet":
-		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
-			return a.printCommandHelp([]string{"internet"})
-		}
-		return a.withState(func(st *envdState) error { return a.runInternet(args[1:], st) })
 	case "hosting":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"hosting"})
@@ -310,13 +311,11 @@ func (a app) run(args []string) error {
 			return a.printCommandHelp([]string{"identity"})
 		}
 		return a.withState(func(st *envdState) error { return a.runIdentity(args[1:], st) })
-	case "list":
-		return a.withState(func(st *envdState) error { return a.listEnvs(args[1:], st) })
-	case "inspect":
+	case "details":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
-			return a.printCommandHelp([]string{"inspect"})
+			return a.printCommandHelp([]string{"details"})
 		}
-		return a.withState(func(st *envdState) error { return a.runInspect(args[1:], st) })
+		return a.withState(func(st *envdState) error { return a.runDetails(args[1:], st) })
 	case "start":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"start"})
@@ -354,19 +353,12 @@ func (a app) run(args []string) error {
 		}
 		return a.withState(func(st *envdState) error { return a.runPkg(args[1:], st) })
 	case "supervisor":
-		return a.runSupervisor(args[1:])
+		return fmt.Errorf("unknown command %q\n\nRun envd help for available commands.", args[0])
 	case "migrate":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"migrate"})
 		}
 		return a.withStatePasswordSaveOnError(func(st *envdState, password []byte) error { return a.runMigrate(args[1:], st, password) })
-	case "events":
-		return a.withState(func(st *envdState) error { return a.runEvents(args[1:], st) })
-	case "why":
-		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
-			return a.printCommandHelp([]string{"why"})
-		}
-		return a.withState(func(st *envdState) error { return a.runWhy(args[1:], st) })
 	default:
 		return fmt.Errorf("unknown command %q\n\nRun envd help for available commands.", args[0])
 	}
@@ -437,12 +429,61 @@ func (a app) runUnlock(args []string) error {
 
 func (a app) runStatus(args []string) error {
 	if len(args) > 0 && isHelpArg(args[0]) {
-		fmt.Fprint(a.stdout, "Usage: envd status\n\nShows non-secret runtime access state without opening encrypted state.\n")
+		fmt.Fprint(a.stdout, "Usage: envd status\n\nShows access, gateway, and environments. Use envd doctor for deep checks and repairs.\n")
 		return nil
 	}
 	if len(args) != 0 {
 		return fmt.Errorf("usage: envd status")
 	}
+	_ = ensureRuntimeIdleScheduler()
+	if _, ok := cachedMasterPassword(); !ok && os.Getenv("ENVD_MASTER_PASSWORD") == "" {
+		return a.printRuntimeStatus(true)
+	}
+	store, err := newStateStore()
+	if err == nil {
+		if statusErr := store.withStateReadOnly(a.stderr, func(st *envdState) error {
+			st.ensureDefaults()
+			access, err := loadRuntimeAccess()
+			if err != nil {
+				return err
+			}
+			containerStates, err := dockerContainerStates()
+			if err != nil {
+				return err
+			}
+			a.printStatusSummary(st, access, containerStates["vpn-gateway-xray-1"])
+			return a.printEnvStatusTable(st, access, containerStates)
+		}); statusErr == nil {
+			return nil
+		}
+	}
+	return a.printRuntimeStatus(true)
+}
+
+func (a app) printStatusSummary(st *envdState, access runtimeAccessState, gatewayState string) {
+	accessState := "locked"
+	if !access.Locked {
+		accessState = "unlocked"
+	}
+	if gatewayState == "" {
+		if st.ActiveGateway == "" {
+			gatewayState = "none"
+		} else {
+			gatewayState = "missing"
+		}
+	}
+	envCount := len(st.Environments)
+	fmt.Fprintf(a.stdout, "Access:  %s\n", accessState)
+	fmt.Fprintf(a.stdout, "Gateway: %s", gatewayState)
+	if st.ActiveGateway != "" {
+		fmt.Fprintf(a.stdout, " (%s)", st.ActiveGateway)
+	}
+	fmt.Fprintln(a.stdout)
+	fmt.Fprintf(a.stdout, "Idle:    on, stops after %s disconnected\n", defaultIdleTimeout)
+	fmt.Fprintf(a.stdout, "Envs:    %d\n\n", envCount)
+}
+
+func (a app) printRuntimeStatus(showRouteNames bool) error {
 	access, err := loadRuntimeAccess()
 	if err != nil {
 		return err
@@ -464,7 +505,8 @@ func (a app) runStatus(args []string) error {
 		fmt.Fprintf(a.stdout, "Identity:     %s\n", agentState)
 	}
 	fmt.Fprintf(a.stdout, "Gateway:      %s\n", gatewayState)
-	if len(access.Routes) > 0 {
+	fmt.Fprintf(a.stdout, "Idle:         on, stops after %s disconnected\n", defaultIdleTimeout)
+	if showRouteNames && len(access.Routes) > 0 {
 		names := make([]string, 0, len(access.Routes))
 		for name := range access.Routes {
 			names = append(names, name)
@@ -475,11 +517,129 @@ func (a app) runStatus(args []string) error {
 	return nil
 }
 
+type envStatusRow struct {
+	Name    string
+	State   string
+	Network string
+	Storage string
+	Egress  string
+	Issue   string
+}
+
+func (a app) printEnvStatusTable(st *envdState, access runtimeAccessState, containerStates map[string]string) error {
+	rows := envStatusRows(st, access, containerStates)
+	if len(rows) == 0 {
+		fmt.Fprintln(a.stdout, "No environments.")
+		return nil
+	}
+	widths := []int{4, 5, 3, 7, 6}
+	for _, row := range rows {
+		widths[0] = maxInt(widths[0], len(row.Name))
+		widths[1] = maxInt(widths[1], len(row.State))
+		widths[2] = maxInt(widths[2], len(row.Network))
+		widths[3] = maxInt(widths[3], len(row.Storage))
+		widths[4] = maxInt(widths[4], len(row.Egress))
+	}
+	format := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%-%ds  %%-%ds  %%s\n", widths[0], widths[1], widths[2], widths[3], widths[4])
+	fmt.Fprintf(a.stdout, format, "NAME", "STATE", "NET", "STORAGE", "EGRESS", "ISSUE")
+	for _, row := range rows {
+		fmt.Fprintf(a.stdout, format, row.Name, row.State, row.Network, row.Storage, row.Egress, row.Issue)
+	}
+	return nil
+}
+
+func envStatusRows(st *envdState, access runtimeAccessState, containerStates map[string]string) []envStatusRow {
+	names := sortedEnvNames(st)
+	rows := make([]envStatusRow, 0, len(names))
+	for _, name := range names {
+		rec := st.Environments[name]
+		ref, err := resolveEnvRef(st, name)
+		if err != nil {
+			continue
+		}
+		state := containerStates[ref.DevName]
+		if state == "" {
+			state = "missing"
+		}
+		if access.Locked {
+			state = "locked"
+		}
+		network := networkOrSealed(rec.Network)
+		issue := envStatusIssue(st, access, name, rec, state)
+		rows = append(rows, envStatusRow{
+			Name:    name,
+			State:   state,
+			Network: network,
+			Storage: storageOrPlain(rec.Storage),
+			Egress:  envStatusEgress(st, network),
+			Issue:   issue,
+		})
+	}
+	return rows
+}
+
+func dockerContainerStates() (map[string]string, error) {
+	out, err := exec.Command("docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}").Output()
+	if err != nil {
+		return nil, fmt.Errorf("docker ps failed: %w", err)
+	}
+	states := map[string]string{}
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		name, state, ok := strings.Cut(scanner.Text(), "\t")
+		if !ok {
+			continue
+		}
+		states[strings.TrimSpace(name)] = strings.TrimSpace(state)
+	}
+	return states, scanner.Err()
+}
+
+func envStatusEgress(st *envdState, network string) string {
+	switch network {
+	case "sealed":
+		if rec, ok := st.Gateways[st.ActiveGateway]; ok && rec.ServerIP != "" {
+			return rec.ServerIP
+		}
+		return "-"
+	case "direct":
+		return "direct"
+	case "offline":
+		return "-"
+	default:
+		return "-"
+	}
+}
+
+func envStatusIssue(st *envdState, access runtimeAccessState, name string, rec envRecord, state string) string {
+	if access.Locked {
+		return "locked"
+	}
+	if rec.BlockedReason != "" {
+		return "blocked: " + rec.BlockedReason
+	}
+	if networkOrSealed(rec.Network) == "sealed" && rec.GatewayGeneration != st.GatewayGeneration {
+		return "stale gateway"
+	}
+	if state == "missing" {
+		return "run envd start " + name
+	}
+	return ""
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func identityAgentRuntimeStatus(access runtimeAccessState) string {
 	if len(access.Routes) == 0 {
 		return ""
 	}
 	stale := []string{}
+	missing := []string{}
 	live := 0
 	for name := range access.Routes {
 		socketPath, err := identityAgentSocketPath(name)
@@ -487,6 +647,7 @@ func identityAgentRuntimeStatus(access runtimeAccessState) string {
 			continue
 		}
 		if _, err := os.Stat(socketPath); errors.Is(err, os.ErrNotExist) {
+			missing = append(missing, name)
 			continue
 		}
 		if unixSocketAccepts(socketPath) {
@@ -498,6 +659,10 @@ func identityAgentRuntimeStatus(access runtimeAccessState) string {
 	if len(stale) > 0 {
 		sort.Strings(stale)
 		return "stale for " + strings.Join(stale, ", ") + "; run envd unlock"
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return "missing for " + strings.Join(missing, ", ") + "; run envd unlock"
 	}
 	if live > 0 {
 		return fmt.Sprintf("%d live", live)
@@ -711,7 +876,7 @@ Start:
 
 Setup:
   init                 create encrypted state
-  status               show lock/access/cache state
+  status               show access, gateway, and environments
   lock                 stop envd-managed workloads
   unlock               restore access after lock
   password             change master password
@@ -720,8 +885,7 @@ Setup:
 Environment:
   start                create or start an environment
   shell                open a shell or run a command
-  list                 list environments
-  inspect              show environment details
+  details              show environment details
   stop                 stop an environment
   rm                   remove an environment
   vscode-extensions    lock/unlock remote VS Code extensions
@@ -729,21 +893,16 @@ Environment:
 Gateway:
   gateway              install/use/list gateways
   proxy                show/test local proxy ports
-  user                 print app import URIs
 
 Diagnostics:
   doctor               diagnose what is broken
-  why                  explain an environment state
-  events               show encrypted event log
-  internet             check direct/gateway reachability
-  hosting              check hosting provider reachability
 
 Advanced:
+  hosting              find reachable VPS providers
   network              change network mode
   pkg                  manage package profiles
   identity             manage encrypted identities
   migrate              adopt legacy envd containers
-  supervisor           stop idle workloads
   version              print version
   help                 show help
 
@@ -763,7 +922,7 @@ func (a app) printCommandHelp(args []string) error {
 	case "unlock":
 		fmt.Fprint(a.stdout, "Usage: envd unlock\n\nRestores envd SSH targets/workloads after lock and caches the master password briefly.\n")
 	case "status":
-		fmt.Fprint(a.stdout, "Usage: envd status\n\nShows non-secret runtime access state without opening encrypted state.\n")
+		fmt.Fprint(a.stdout, "Usage: envd status\n\nShows access, gateway, and environment state. Falls back to runtime-only status when encrypted state is locked.\n")
 	case "password":
 		fmt.Fprint(a.stdout, `Usage: envd password change
 
@@ -796,10 +955,8 @@ Next command: envd init
 		a.printStartHelp()
 	case "shell":
 		fmt.Fprint(a.stdout, "Usage:\n  envd shell ENV\n  envd shell ENV COMMAND [args]\n")
-	case "list":
-		fmt.Fprint(a.stdout, "Usage: envd list\n")
-	case "inspect":
-		fmt.Fprint(a.stdout, "Usage: envd inspect ENV\n")
+	case "details":
+		fmt.Fprint(a.stdout, "Usage: envd details ENV\n")
 	case "stop":
 		fmt.Fprint(a.stdout, "Usage: envd stop ENV\n")
 	case "rm":
@@ -810,12 +967,6 @@ Next command: envd init
 		fmt.Fprint(a.stdout, "Usage: envd lock\n\nStops envd-managed workloads, hides envd SSH targets, and clears cached unlock.\n")
 	case "doctor":
 		a.printDoctorHelp()
-	case "why":
-		fmt.Fprint(a.stdout, "Usage: envd why ENV\n")
-	case "events":
-		fmt.Fprint(a.stdout, "Usage: envd events\n")
-	case "internet":
-		a.printInternetHelp()
 	case "hosting":
 		a.printHostingHelp()
 	case "network":
@@ -830,8 +981,6 @@ Next command: envd init
 		a.printMigrateHelp()
 	case "supervisor":
 		a.printSupervisorHelp()
-	case "user":
-		fmt.Fprint(a.stdout, "Usage: envd user uri GATEWAY\n")
 	case "version":
 		fmt.Fprint(a.stdout, "Usage: envd version\n")
 	case "help":
@@ -911,6 +1060,24 @@ func (a app) runProxyTest(args []string, st *envdState) error {
 }
 
 func (a app) runDoctor(args []string, st *envdState) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "help", "-h", "--help":
+			a.printDoctorHelp()
+			return nil
+		case "why":
+			return a.runDoctorWhy(args[1:], st)
+		case "history":
+			return a.runDoctorHistory(args[1:], st)
+		case "network":
+			return a.runDoctorNetwork(args[1:], st)
+		case "identity":
+			return a.runDoctorIdentity(args[1:], st)
+		}
+		if !strings.HasPrefix(args[0], "-") {
+			return fmt.Errorf("unknown doctor subcommand %q", args[0])
+		}
+	}
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(a.stderr)
 	deep := fs.Bool("deep", false, "run real proxy traffic probes")
@@ -952,26 +1119,101 @@ func (a app) runDoctor(args []string, st *envdState) error {
 		checks = append(checks, probeIdentityRecords(st)...)
 	}
 
-	ok := true
-	currentFailures := map[string]string{}
-	for _, c := range checks {
-		if c.Err != nil {
-			ok = false
-			currentFailures[c.Name] = redactSensitive(c.Err.Error())
-			fmt.Fprintf(a.stdout, "%-22s FAIL %s\n", c.Name, redactSensitive(c.Err.Error()))
-			if next := nextActionForError(c.Err); next != "" {
-				fmt.Fprintf(a.stdout, "%-22s      Next: %s\n", "", next)
-			}
-		} else {
-			fmt.Fprintf(a.stdout, "%-22s OK   %s\n", c.Name, c.Detail)
-		}
-	}
+	ok, currentFailures := a.printProbeResults(checks)
 	recordDoctorEvents(st, currentFailures)
 
 	if !ok {
 		return errors.New("doctor found failures")
 	}
 	return nil
+}
+
+func (a app) runDoctorIdentity(args []string, st *envdState) error {
+	if len(args) != 0 {
+		return fmt.Errorf("usage: envd doctor identity")
+	}
+	ok, _ := a.printProbeResults(probeIdentityRecords(st))
+	if !ok {
+		return errors.New("doctor found failures")
+	}
+	return nil
+}
+
+func (a app) printProbeResults(checks []probeResult) (bool, map[string]string) {
+	width := len("CHECK")
+	for _, c := range checks {
+		width = maxInt(width, len(c.Name))
+	}
+	ok := true
+	currentFailures := map[string]string{}
+	for _, c := range checks {
+		if c.Err != nil {
+			ok = false
+			currentFailures[c.Name] = redactSensitive(c.Err.Error())
+			fmt.Fprintf(a.stdout, "%-*s  FAIL  %s\n", width, c.Name, redactSensitive(c.Err.Error()))
+			if next := nextActionForError(c.Err); next != "" {
+				fmt.Fprintf(a.stdout, "%-*s        Next: %s\n", width, "", next)
+			}
+		} else {
+			fmt.Fprintf(a.stdout, "%-*s  OK    %s\n", width, c.Name, c.Detail)
+		}
+	}
+	return ok, currentFailures
+}
+
+func (a app) runDoctorNetwork(args []string, st *envdState) error {
+	if len(args) > 1 {
+		return fmt.Errorf("usage: envd doctor network [history]")
+	}
+	if len(args) == 1 {
+		if args[0] != "history" {
+			return fmt.Errorf("usage: envd doctor network [history]")
+		}
+		return a.runNetworkReport(nil, st)
+	}
+	checks := []probeResult{}
+	check := a.networkCheck(st)
+	recordNetworkCheck(st, check)
+	checks = append(checks, networkCheckProbeResults(check)...)
+	cfg, source, err := a.activeGatewayConfig(st)
+	if err != nil {
+		checks = append(checks, probeResult{Name: "Gateway config", Err: err})
+	} else {
+		host := hostForClient(cfg.BindIP)
+		socks := net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort))
+		httpProxy := net.JoinHostPort(host, strconv.Itoa(cfg.HTTPHostPort))
+		checks = append(checks,
+			probeTCP("Gateway SOCKS port", socks, 3*time.Second),
+			probeTCP("Gateway HTTP port", httpProxy, 3*time.Second),
+			probeSOCKS("Gateway SOCKS HTTPS", socks, "api.ipify.org:443", 10*time.Second),
+			probeHTTPProxy("Gateway HTTP HTTPS", httpProxy, "api.ipify.org:443", 10*time.Second),
+		)
+		if ip, err := a.gatewayEgressIP(cfg); err != nil {
+			checks = append(checks, probeResult{Name: "Gateway egress IP", Err: layerErr("remote gateway", err)})
+		} else {
+			checks = append(checks, probeResult{Name: "Gateway egress IP", Detail: strings.TrimSpace(ip) + " via " + source})
+		}
+	}
+	checks = append(checks, a.probeSealedEnvTraffic(st))
+	ok, _ := a.printProbeResults(checks)
+	if !ok {
+		return errors.New("doctor found failures")
+	}
+	return nil
+}
+
+func (a app) runDoctorHistory(args []string, st *envdState) error {
+	if len(args) > 2 {
+		return fmt.Errorf("usage: envd doctor history [SUBJECT]")
+	}
+	return a.runEvents(args, st)
+}
+
+func (a app) runDoctorWhy(args []string, st *envdState) error {
+	if len(args) != 1 || isHelpArg(args[0]) {
+		return fmt.Errorf("usage: envd doctor why ENV")
+	}
+	return a.runWhy(args, st)
 }
 
 func recordDoctorEvents(st *envdState, currentFailures map[string]string) {
@@ -1009,8 +1251,8 @@ func (a app) runGateway(args []string, st *envdState) error {
 		return a.runGatewayShare(args[1:], st)
 	case "shares":
 		return a.runGatewayShares(args[1:], st)
-	case "uri":
-		return a.runGatewayURI(args[1:], st)
+	case "view":
+		return a.runGatewayView(args[1:], st)
 	case "revoke":
 		return a.runGatewayRevoke(args[1:], st)
 	case "risk":
@@ -1045,7 +1287,7 @@ Manage:
 
 App Access:
   envd gateway share NAME [LABEL]
-  envd gateway uri NAME SHARE
+  envd gateway view NAME SHARE
   envd gateway shares NAME
   envd gateway revoke NAME SHARE
 
@@ -1098,12 +1340,20 @@ func (a app) printDoctorHelp() {
 	fmt.Fprint(a.stdout, `Usage:
   envd doctor
   envd doctor --deep
+  envd doctor why ENV
+  envd doctor history
+  envd doctor network
 
 Checks:
   host Docker, embedded images, gateway runtime, proxy ports, and env repair
 
 Deep:
   also runs real direct/gateway reachability probes
+
+Other:
+  why ENV     explain the last state change for an env
+  history     show recent envd events
+  network     test direct/gateway reachability, proxy handshakes, sealed HTTPS
 
 `)
 }
@@ -1115,17 +1365,6 @@ func (a app) printVSCodeExtensionsHelp() {
 
 Default:
   extension storage is locked whenever envd creates or starts an env
-
-`)
-}
-
-func (a app) printInternetHelp() {
-	fmt.Fprint(a.stdout, `Usage:
-  envd internet COMMAND
-
-Commands:
-  status       check direct and gateway reachability
-  report       show recent reachability history
 
 `)
 }
@@ -1146,9 +1385,6 @@ Check:
 Lists:
   envd hosting global
   envd hosting russian
-
-Aliases:
-  shortlist    same as global
 
 `)
 }
@@ -1292,15 +1528,12 @@ func (a app) runGatewayList(args []string, st *envdState) error {
 	return nil
 }
 
-func (a app) listEnvs(args []string, st *envdState) error {
-	if len(args) > 0 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
-		fmt.Fprint(a.stdout, "Usage: envd list\n")
-		return nil
-	}
+func (a app) printEnvTable(st *envdState) error {
 	envs, err := listEnvContainers(st)
 	if err != nil {
 		return err
 	}
+	fmt.Fprintln(a.stdout, "Environments:")
 	fmt.Fprintf(a.stdout, "%-18s %-10s %-8s %-8s %-10s %-5s %-18s %-14s %-14s %s\n", "NAME", "STATE", "NET", "VPN", "STORAGE", "GEN", "EGRESS", "IMAGE", "IMAGE_ID", "ISSUE")
 	seen := map[string]bool{}
 	for _, env := range envs {
@@ -1326,45 +1559,65 @@ func (a app) listEnvs(args []string, st *envdState) error {
 	return nil
 }
 
-func (a app) runInspect(args []string, st *envdState) error {
+func (a app) runDetails(args []string, st *envdState) error {
 	if len(args) != 1 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd inspect ENV\n")
+		fmt.Fprint(a.stdout, "Usage: envd details ENV\n")
 		return nil
 	}
 	env, err := inspectEnv(st, args[0])
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(a.stdout, "Name:     %s\n", env.Name)
-	fmt.Fprintf(a.stdout, "State:    %s\n", env.Dev.State.Status)
-	fmt.Fprintf(a.stdout, "Network:  %s\n", env.networkMode())
-	fmt.Fprintf(a.stdout, "VPN:      %s\n", env.netHealth())
-	fmt.Fprintf(a.stdout, "Storage:  %s\n", env.storageMode(st))
+	rows := []detailRow{
+		{"Name", env.Name},
+		{"State", env.Dev.State.Status},
+		{"Network", env.networkMode()},
+		{"VPN", env.netHealth()},
+		{"Storage", env.storageMode(st)},
+	}
 	if env.storageMode(st) == "protected" {
 		if rec, ok := st.Environments[args[0]]; ok {
-			fmt.Fprintf(a.stdout, "Backend:  %s\n", rec.StorageBackend)
+			rows = append(rows, detailRow{"Backend", rec.StorageBackend})
 		}
 	}
-	fmt.Fprintf(a.stdout, "Gateway Generation: %d\n", st.GatewayGeneration)
-	fmt.Fprintf(a.stdout, "Image:    %s\n", env.Dev.Config.Image)
-	fmt.Fprintf(a.stdout, "Image ID: %s\n", env.Dev.Image)
+	rows = append(rows,
+		detailRow{"Gateway generation", strconv.Itoa(st.GatewayGeneration)},
+		detailRow{"Image", env.Dev.Config.Image},
+		detailRow{"Image ID", env.Dev.Image},
+	)
 	if env.BlockedReason != "" {
-		fmt.Fprintf(a.stdout, "Blocked:  %s\n", env.BlockedReason)
+		rows = append(rows, detailRow{"Blocked", env.BlockedReason})
 	}
 	if rec, ok := st.Environments[args[0]]; ok && rec.Profile != "" {
-		fmt.Fprintf(a.stdout, "Profile:  %s generation %d\n", rec.Profile, rec.ProfileGeneration)
+		rows = append(rows, detailRow{"Profile", fmt.Sprintf("%s generation %d", rec.Profile, rec.ProfileGeneration)})
 	}
-	fmt.Fprintf(a.stdout, "Egress:   %s\n", env.egressSummary())
+	rows = append(rows, detailRow{"Egress", env.egressSummary()})
 	if env.Legacy {
-		fmt.Fprintf(a.stdout, "Legacy:   true\n")
+		rows = append(rows, detailRow{"Legacy", "true"})
 	}
 	if env.Net != nil {
-		fmt.Fprintf(a.stdout, "Sidecar:  %s (%s)\n", env.Net.Name, env.Net.State.Status)
+		rows = append(rows, detailRow{"Sidecar", fmt.Sprintf("%s (%s)", env.Net.Name, env.Net.State.Status)})
 	}
 	if issue := env.issue(st.GatewayGeneration); issue != "" {
-		fmt.Fprintf(a.stdout, "Issue:    %s\n", issue)
+		rows = append(rows, detailRow{"Issue", issue})
 	}
+	printDetailRows(a.stdout, rows)
 	return nil
+}
+
+type detailRow struct {
+	Label string
+	Value string
+}
+
+func printDetailRows(w io.Writer, rows []detailRow) {
+	width := 0
+	for _, row := range rows {
+		width = maxInt(width, len(row.Label))
+	}
+	for _, row := range rows {
+		fmt.Fprintf(w, "%-*s  %s\n", width+1, row.Label+":", row.Value)
+	}
 }
 
 func (a app) runVSCodeExtensions(args []string) error {
@@ -2312,6 +2565,8 @@ func (a app) rmEnv(args []string, st *envdState) error {
 	}
 	removeRecoveryPointsForEnv(st, ref.ID)
 	delete(st.Environments, name)
+	_ = unpublishRuntimeRoute(name)
+	_ = syncEnvSSHConfig(st)
 	_ = pruneProfileImages(st)
 	st.addEvent("env", name, "removed")
 	fmt.Fprintf(a.stdout, "Removed: %s\n", name)
@@ -2383,7 +2638,26 @@ type runtimeSSHRoute struct {
 	DevName   string    `json:"dev_name"`
 	UserName  string    `json:"user_name"`
 	Network   string    `json:"network"`
+	Storage   string    `json:"storage,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type runtimeIdleActivity struct {
+	UpdatedAt time.Time                     `json:"updated_at"`
+	Envs      map[string]runtimeEnvActivity `json:"envs,omitempty"`
+}
+
+type runtimeEnvActivity struct {
+	LastActiveAt time.Time `json:"last_active_at"`
+}
+
+type runtimeSessionLease struct {
+	ID         string    `json:"id"`
+	Env        string    `json:"env"`
+	Kind       string    `json:"kind"`
+	PID        int       `json:"pid"`
+	StartedAt  time.Time `json:"started_at"`
+	LastSeenAt time.Time `json:"last_seen_at"`
 }
 
 func runtimeAccessPath() (string, error) {
@@ -2432,6 +2706,401 @@ func saveRuntimeAccess(access runtimeAccessState) error {
 	return os.WriteFile(path, append(raw, '\n'), 0o600)
 }
 
+func runtimeActivityPath() (string, error) {
+	dir, err := envdDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "runtime", "activity.json"), nil
+}
+
+func loadRuntimeActivity() (runtimeIdleActivity, error) {
+	path, err := runtimeActivityPath()
+	if err != nil {
+		return runtimeIdleActivity{}, err
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return runtimeIdleActivity{Envs: map[string]runtimeEnvActivity{}}, nil
+	}
+	if err != nil {
+		return runtimeIdleActivity{}, err
+	}
+	var activity runtimeIdleActivity
+	if err := json.Unmarshal(raw, &activity); err != nil {
+		return runtimeIdleActivity{}, err
+	}
+	if activity.Envs == nil {
+		activity.Envs = map[string]runtimeEnvActivity{}
+	}
+	return activity, nil
+}
+
+func saveRuntimeActivity(activity runtimeIdleActivity) error {
+	path, err := runtimeActivityPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	activity.UpdatedAt = time.Now().UTC()
+	raw, err := json.MarshalIndent(activity, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o600)
+}
+
+func touchRuntimeActivity(envName string, at time.Time) error {
+	activity, err := loadRuntimeActivity()
+	if err != nil {
+		return err
+	}
+	if activity.Envs == nil {
+		activity.Envs = map[string]runtimeEnvActivity{}
+	}
+	activity.Envs[envName] = runtimeEnvActivity{LastActiveAt: at.UTC()}
+	return saveRuntimeActivity(activity)
+}
+
+func runtimeSessionsDir() (string, error) {
+	dir, err := envdDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "runtime", "sessions"), nil
+}
+
+func runtimeSessionPath(envName, id string) (string, error) {
+	dir, err := runtimeSessionsDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, envName, id+".json"), nil
+}
+
+func newRuntimeSessionID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
+	}
+	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+}
+
+func startRuntimeSession(envName, kind string) (func(), error) {
+	now := time.Now().UTC()
+	id := newRuntimeSessionID()
+	path, err := runtimeSessionPath(envName, id)
+	if err != nil {
+		return func() {}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return func() {}, err
+	}
+	lease := runtimeSessionLease{ID: id, Env: envName, Kind: kind, PID: os.Getpid(), StartedAt: now, LastSeenAt: now}
+	if err := writeRuntimeSessionLease(path, lease); err != nil {
+		return func() {}, err
+	}
+	_ = touchRuntimeActivity(envName, now)
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				lease.LastSeenAt = time.Now().UTC()
+				_ = writeRuntimeSessionLease(path, lease)
+				_ = touchRuntimeActivity(envName, lease.LastSeenAt)
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		_ = os.Remove(path)
+		_ = touchRuntimeActivity(envName, time.Now().UTC())
+	}, nil
+}
+
+func writeRuntimeSessionLease(path string, lease runtimeSessionLease) error {
+	raw, err := json.MarshalIndent(lease, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o600)
+}
+
+func activeRuntimeSessionEnvs(now time.Time) (map[string]bool, error) {
+	dir, err := runtimeSessionsDir()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, envEntry := range entries {
+		if !envEntry.IsDir() {
+			continue
+		}
+		envDir := filepath.Join(dir, envEntry.Name())
+		files, err := os.ReadDir(envDir)
+		if err != nil {
+			continue
+		}
+		for _, file := range files {
+			if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
+				continue
+			}
+			path := filepath.Join(envDir, file.Name())
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			var lease runtimeSessionLease
+			if err := json.Unmarshal(raw, &lease); err != nil {
+				_ = os.Remove(path)
+				continue
+			}
+			if now.Sub(lease.LastSeenAt) <= idleLeaseStale && processLikelyAlive(lease.PID) {
+				out[lease.Env] = true
+				continue
+			}
+			if now.Sub(lease.LastSeenAt) > idleLeaseStale {
+				_ = os.Remove(path)
+			}
+		}
+	}
+	return out, nil
+}
+
+func processLikelyAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if pid == os.Getpid() {
+		return true
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+func runRuntimeIdleTick(idle time.Duration) error {
+	stopped, err := runtimeIdleTick(idle, time.Now().UTC(), dockerRouteIsRunning, stopRuntimeRouteWorkload)
+	if err != nil {
+		return err
+	}
+	if stopped > 0 {
+		fmt.Fprintf(os.Stdout, "Idle: stopped %d envs\n", stopped)
+	}
+	return nil
+}
+
+func runtimeIdleTick(idle time.Duration, now time.Time, running func(runtimeSSHRoute) bool, stop func(runtimeSSHRoute) error) (int, error) {
+	if idle < minIdleTimeout {
+		return 0, fmt.Errorf("idle timeout must be at least %s", minIdleTimeout)
+	}
+	access, err := loadRuntimeAccess()
+	if err != nil {
+		return 0, err
+	}
+	if access.Locked || len(access.Routes) == 0 {
+		return 0, nil
+	}
+	active, err := activeRuntimeSessionEnvs(now)
+	if err != nil {
+		return 0, err
+	}
+	activity, err := loadRuntimeActivity()
+	if err != nil {
+		return 0, err
+	}
+	stopped := 0
+	var failures []string
+	names := make([]string, 0, len(access.Routes))
+	for name := range access.Routes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		route := access.Routes[name]
+		if active[name] {
+			continue
+		}
+		last := activity.Envs[name].LastActiveAt
+		if last.IsZero() {
+			last = route.UpdatedAt
+		}
+		if last.IsZero() || now.Sub(last) < idle {
+			continue
+		}
+		if !running(route) {
+			continue
+		}
+		time.Sleep(idleStopGrace)
+		activeAgain, err := activeRuntimeSessionEnvs(time.Now().UTC())
+		if err != nil {
+			failures = append(failures, name+": "+err.Error())
+			continue
+		}
+		if activeAgain[name] {
+			continue
+		}
+		if err := stop(route); err != nil {
+			failures = append(failures, name+": "+err.Error())
+			continue
+		}
+		stopped++
+		_ = touchRuntimeActivity(name, time.Now().UTC())
+	}
+	if len(failures) > 0 {
+		return stopped, fmt.Errorf("idle tick had %d failures: %s", len(failures), strings.Join(failures, "; "))
+	}
+	return stopped, nil
+}
+
+func dockerRouteIsRunning(route runtimeSSHRoute) bool {
+	return dockerContainerStatus(route.DevName) == "running"
+}
+
+func stopRuntimeRouteWorkload(route runtimeSSHRoute) error {
+	ref := envRef{
+		Name:     route.Name,
+		ID:       route.ID,
+		UserName: route.UserName,
+		DevName:  route.DevName,
+		NetName:  netContainerName(route.ID),
+		Network:  route.Network,
+		Storage:  storageOrPlain(route.Storage),
+	}
+	return stopEnvWorkload(ref)
+}
+
+func ensureRuntimeIdleScheduler() error {
+	if strings.HasSuffix(os.Args[0], ".test") || os.Getenv("ENVD_DISABLE_IDLE_SCHEDULER") == "1" {
+		return nil
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return ensureLaunchdIdleScheduler()
+	case "linux":
+		return ensureSystemdIdleScheduler()
+	default:
+		return nil
+	}
+}
+
+func ensureLaunchdIdleScheduler() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dataDir, err := envdDataDir()
+	if err != nil {
+		return err
+	}
+	agentDir := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(agentDir, 0o700); err != nil {
+		return err
+	}
+	label := "dev.envd.idle"
+	plist := filepath.Join(agentDir, label+".plist")
+	envdPath := currentEnvdExecutable()
+	logPath := filepath.Join(dataDir, "runtime", "idle.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return err
+	}
+	content := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>%s</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>%s</string>
+    <string>__idle-tick</string>
+  </array>
+  <key>StartInterval</key><integer>600</integer>
+  <key>StandardOutPath</key><string>%s</string>
+  <key>StandardErrorPath</key><string>%s</string>
+</dict>
+</plist>
+`, label, envdPath, logPath, logPath)
+	if err := writeFileIfChanged(plist, []byte(content), 0o600); err != nil {
+		return err
+	}
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	_ = exec.Command("launchctl", "bootstrap", domain, plist).Run()
+	_ = exec.Command("launchctl", "enable", domain+"/"+label).Run()
+	return nil
+}
+
+func ensureSystemdIdleScheduler() error {
+	configHome := os.Getenv("XDG_CONFIG_HOME")
+	if configHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		configHome = filepath.Join(home, ".config")
+	}
+	unitDir := filepath.Join(configHome, "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		return err
+	}
+	envdPath := currentEnvdExecutable()
+	servicePath := filepath.Join(unitDir, "envd-idle.service")
+	timerPath := filepath.Join(unitDir, "envd-idle.timer")
+	service := fmt.Sprintf(`[Unit]
+Description=envd idle cleanup
+
+[Service]
+Type=oneshot
+ExecStart=%s __idle-tick
+`, envdPath)
+	timer := `[Unit]
+Description=Run envd idle cleanup
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Unit=envd-idle.service
+
+[Install]
+WantedBy=timers.target
+`
+	if err := writeFileIfChanged(servicePath, []byte(service), 0o600); err != nil {
+		return err
+	}
+	if err := writeFileIfChanged(timerPath, []byte(timer), 0o600); err != nil {
+		return err
+	}
+	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+	_ = exec.Command("systemctl", "--user", "enable", "--now", "envd-idle.timer").Run()
+	return nil
+}
+
+func writeFileIfChanged(path string, content []byte, mode fs.FileMode) error {
+	if raw, err := os.ReadFile(path); err == nil && bytes.Equal(raw, content) {
+		return nil
+	}
+	return os.WriteFile(path, content, mode)
+}
+
 func lockRuntimeAccess() error {
 	_ = removeIdentityAgentSockets()
 	return saveRuntimeAccess(runtimeAccessState{Locked: true, Routes: map[string]runtimeSSHRoute{}})
@@ -2477,8 +3146,26 @@ func publishRuntimeRoute(ref envRef, network string) error {
 		DevName:   ref.DevName,
 		UserName:  userName,
 		Network:   networkOrSealed(network),
+		Storage:   storageOrPlain(ref.Storage),
 		UpdatedAt: time.Now().UTC(),
 	}
+	_ = touchRuntimeActivity(ref.Name, time.Now().UTC())
+	if err := saveRuntimeAccess(access); err != nil {
+		return err
+	}
+	_ = ensureRuntimeIdleScheduler()
+	return nil
+}
+
+func unpublishRuntimeRoute(name string) error {
+	access, err := loadRuntimeAccess()
+	if err != nil {
+		return err
+	}
+	if access.Routes == nil {
+		return nil
+	}
+	delete(access.Routes, name)
 	return saveRuntimeAccess(access)
 }
 
@@ -3065,9 +3752,11 @@ func touchEnvUsed(st *envdState, name string, at time.Time) {
 
 func (a app) runShell(args []string) error {
 	var dockerArgs []string
+	envName := ""
 	if err := a.withState(func(st *envdState) error {
 		if len(args) > 0 {
 			name := args[0]
+			envName = name
 			ref, err := resolveEnvRef(st, name)
 			if err != nil {
 				return err
@@ -3090,6 +3779,11 @@ func (a app) runShell(args []string) error {
 	}); err != nil {
 		return err
 	}
+	stopSession, err := startRuntimeSession(envName, "shell")
+	if err != nil {
+		return err
+	}
+	defer stopSession()
 	cmd := exec.Command("docker", dockerArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = a.stdout
@@ -3139,6 +3833,17 @@ func prepareShellDockerArgs(args []string, st *envdState) ([]string, error) {
 		dockerArgs = append(dockerArgs, "-e", "ENVD_IDENTITY_KEY_B64="+base64.StdEncoding.EncodeToString([]byte(identity.PrivateKey)))
 		command = shellCommandWithEphemeralSSHAgent(command)
 	}
+	gitHTTPSIdentity, err := singleGitHTTPSIdentityForShell(st, name)
+	if err != nil {
+		return nil, err
+	}
+	if gitHTTPSIdentity != nil {
+		dockerArgs = append(dockerArgs,
+			"-e", "ENVD_GIT_HTTPS_USERNAME="+gitHTTPSIdentity.Username,
+			"-e", "ENVD_GIT_HTTPS_PASSWORD_B64="+base64.StdEncoding.EncodeToString([]byte(gitHTTPSIdentity.Password)),
+		)
+		command = shellCommandWithEphemeralGitHTTPSHelper(command)
+	}
 	dockerArgs = append(dockerArgs, "-u", ref.UserName, "-w", "/home/"+ref.UserName+"/repo", ref.DevName)
 	dockerArgs = append(dockerArgs, command...)
 	return dockerArgs, nil
@@ -3159,7 +3864,34 @@ func singleSSHIdentityForShell(st *envdState, envName string) (*identityRecord, 
 		if out != nil {
 			return nil, nil
 		}
-		decision := evaluateIdentityBrokerGrant(st, envName, identityName, "ssh", runtimeIdentityBrokerHealth(st, envName))
+		decision := evaluateIdentityBrokerGrant(st, envName, identityName, "ssh", shellIdentityBrokerHealth(st, envName))
+		if !decision.Allow {
+			return nil, fmt.Errorf("identity %q denied for %s: %s", identityName, envName, decision.Reason)
+		}
+		copy := rec
+		out = &copy
+	}
+	return out, nil
+}
+
+var shellIdentityBrokerHealth = runtimeIdentityBrokerHealth
+
+func singleGitHTTPSIdentityForShell(st *envdState, envName string) (*identityRecord, error) {
+	var out *identityRecord
+	names := make([]string, 0, len(st.Identities))
+	for name := range st.Identities {
+		names = append(names, name)
+	}
+	sortStrings(names)
+	for _, identityName := range names {
+		rec := st.Identities[identityName]
+		if rec.Type != "git-https" || strings.TrimSpace(rec.Username) == "" || strings.TrimSpace(rec.Password) == "" {
+			continue
+		}
+		if out != nil {
+			return nil, nil
+		}
+		decision := evaluateIdentityBrokerGrant(st, envName, identityName, "git-https", shellIdentityBrokerHealth(st, envName))
 		if !decision.Allow {
 			return nil, fmt.Errorf("identity %q denied for %s: %s", identityName, envName, decision.Reason)
 		}
@@ -3273,8 +4005,37 @@ exec ` + strings.Join(quoted, " ")
 	return []string{"sh", "-lc", script}
 }
 
+func shellCommandWithEphemeralGitHTTPSHelper(command []string) []string {
+	quoted := make([]string, 0, len(command))
+	for _, part := range command {
+		quoted = append(quoted, shellQuote(part))
+	}
+	helper := `!f() {
+  case "${1:-get}" in
+    get|fill|"") ;;
+    *) exit 0 ;;
+  esac
+  while IFS= read -r line; do
+    [ -z "$line" ] && break
+  done
+  printf 'username=%s\npassword=%s\n\n' "$ENVD_GIT_HTTPS_USERNAME" "$(printf '%s' "$ENVD_GIT_HTTPS_PASSWORD_B64" | base64 -d)"
+}; f`
+	script := `
+set -eu
+if command -v git >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+  export GIT_TERMINAL_PROMPT=0
+  export GIT_CONFIG_COUNT=1
+  export GIT_CONFIG_KEY_0=credential.helper
+  export GIT_CONFIG_VALUE_0=` + shellQuote(helper) + `
+fi
+exec ` + strings.Join(quoted, " ")
+	return []string{"sh", "-lc", script}
+}
+
 func (a app) runSSHProxy(args []string) error {
+	envName := ""
 	if len(args) == 1 {
+		envName = args[0]
 		stop, err := a.startSSHProxyIdentityAgent(args[0])
 		if err != nil {
 			return err
@@ -3285,6 +4046,11 @@ func (a app) runSSHProxy(args []string) error {
 	if err != nil {
 		return err
 	}
+	stopSession, err := startRuntimeSession(envName, "ssh")
+	if err != nil {
+		return err
+	}
+	defer stopSession()
 	cmd := exec.Command("docker", dockerArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = a.stdout
@@ -3321,13 +4087,10 @@ func (a app) startSSHProxyIdentityAgent(envName string) (func(), error) {
 		identityName = identity.Name
 		return nil
 	}); err != nil {
-		if isSSHProxyUnlockUnavailable(err) {
-			if staleSocket {
-				return func() {}, fmt.Errorf("envd identity agent is stale; run `envd unlock`, then retry SSH")
-			}
-			return func() {}, nil
+		if staleSocket {
+			_ = os.Remove(socketPath)
 		}
-		return func() {}, err
+		return func() {}, nil
 	}
 	if identityName == "" {
 		return func() {}, nil
@@ -3589,6 +4352,7 @@ Host %s
   ProxyCommand %s ssh-proxy %s
   IdentityFile %s
   IdentitiesOnly yes
+  PubkeyAuthentication unbound
   ForwardAgent yes
   IdentityAgent %s
   HostKeyAlias envd-%s
@@ -4892,7 +5656,7 @@ func gatewayRiskReport(name string, rec gatewayRecord, st *envdState) gatewayRis
 		} else {
 			providerReach = "fail"
 			reasons = append(reasons, "hosting provider failed latest reachability check")
-			actions = append(actions, "run envd hosting shortlist and prepare a replacement provider")
+			actions = append(actions, "run envd hosting global and prepare a replacement provider")
 			score += 3
 		}
 	} else {
@@ -5156,37 +5920,6 @@ func (a app) activateGateway(name string, st *envdState, reason string, verify g
 	return nil
 }
 
-func (a app) runUser(args []string, st *envdState) error {
-	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd user uri GATEWAY\n")
-		return nil
-	}
-	switch args[0] {
-	case "uri":
-		return a.runUserURI(args[1:], st)
-	default:
-		return fmt.Errorf("unknown user subcommand %q", args[0])
-	}
-}
-
-func (a app) runUserURI(args []string, st *envdState) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: envd user uri GATEWAY")
-	}
-	name := args[0]
-	rec, ok := st.Gateways[name]
-	if !ok {
-		return fmt.Errorf("gateway %q not found; install it first with: envd gateway install %s --host HOST --user root --password", name, name)
-	}
-	uri, err := gatewayUserURI(name, rec.toConfig())
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(a.stdout, uri)
-	st.addEvent("gateway", name, "generated user import URI")
-	return nil
-}
-
 func (a app) runGatewayShare(args []string, st *envdState) error {
 	if len(args) < 1 || len(args) > 2 {
 		return fmt.Errorf("usage: envd gateway share NAME [LABEL]")
@@ -5248,9 +5981,9 @@ func (a app) runGatewayShares(args []string, st *envdState) error {
 	return nil
 }
 
-func (a app) runGatewayURI(args []string, st *envdState) error {
+func (a app) runGatewayView(args []string, st *envdState) error {
 	if len(args) != 2 {
-		return fmt.Errorf("usage: envd gateway uri NAME SHARE")
+		return fmt.Errorf("usage: envd gateway view NAME SHARE")
 	}
 	gatewayName, shareName := args[0], args[1]
 	uri, err := gatewayShareURI(st, gatewayName, shareName)
@@ -5447,50 +6180,21 @@ func gatewayUserURIForUUID(name string, cfg gatewayConfig, uuid string) (string,
 	return "vless://" + uuid + "@" + net.JoinHostPort(cfg.ServerIP, cfg.ServerPort) + "?" + q.Encode() + "#" + url.QueryEscape(name), nil
 }
 
-func (a app) runInternet(args []string, st *envdState) error {
-	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		a.printInternetHelp()
-		return nil
-	}
-	switch args[0] {
-	case "status":
-		return a.runInternetStatus(args[1:], st)
-	case "report":
-		return a.runInternetReport(args[1:], st)
-	default:
-		return fmt.Errorf("unknown internet subcommand %q", args[0])
-	}
-}
-
-func (a app) runInternetStatus(args []string, st *envdState) error {
+func (a app) runNetworkReport(args []string, st *envdState) error {
 	if len(args) != 0 {
-		return fmt.Errorf("usage: envd internet status")
-	}
-	check := a.internetCheck(st)
-	recordInternetCheck(st, check)
-	printInternetCheck(a.stdout, check)
-	return nil
-}
-
-func (a app) runInternetReport(args []string, st *envdState) error {
-	if len(args) != 0 {
-		return fmt.Errorf("usage: envd internet report")
+		return fmt.Errorf("usage: envd doctor network history")
 	}
 	if len(st.InternetChecks) == 0 {
-		fmt.Fprintln(a.stdout, "No internet checks recorded yet. Run envd internet status.")
+		fmt.Fprintln(a.stdout, "No network checks recorded yet. Run envd doctor network.")
 		return nil
 	}
 	for _, check := range st.InternetChecks {
-		fmt.Fprintf(a.stdout, "%s ok=%d fail=%d skip=%d total=%d\n",
-			check.Time.Format(time.RFC3339), check.Summary.OK, check.Summary.Fail, check.Summary.Skip, check.Summary.Total)
-		for _, r := range check.Results {
-			fmt.Fprintf(a.stdout, "  %-18s %-7s %s\n", r.Name, r.Status, r.Detail)
-		}
+		printNetworkCheck(a.stdout, check)
 	}
 	return nil
 }
 
-func (a app) internetCheck(st *envdState) internetCheckRecord {
+func (a app) networkCheck(st *envdState) internetCheckRecord {
 	results := []internetProbeRecord{
 		probeDirectURL("Direct HTTPS", "direct", "https://api.ipify.org/", 8*time.Second),
 		probeDirectURL("Direct Docker Hub", "direct", "https://registry-1.docker.io/v2/", 8*time.Second),
@@ -5511,21 +6215,39 @@ func (a app) internetCheck(st *envdState) internetCheckRecord {
 	return internetCheckRecord{Time: time.Now().UTC(), Results: results, Summary: summarizeInternetResults(results)}
 }
 
-func printInternetCheck(w io.Writer, check internetCheckRecord) {
-	fmt.Fprintf(w, "Checked: %s\n", check.Time.Format(time.RFC3339))
-	fmt.Fprintf(w, "Summary: ok=%d fail=%d skip=%d total=%d\n", check.Summary.OK, check.Summary.Fail, check.Summary.Skip, check.Summary.Total)
+func printNetworkCheck(w io.Writer, check internetCheckRecord) {
+	fmt.Fprintf(w, "Checked: %s ok=%d fail=%d skip=%d total=%d\n", check.Time.Format(time.RFC3339), check.Summary.OK, check.Summary.Fail, check.Summary.Skip, check.Summary.Total)
+	width := 0
 	for _, r := range check.Results {
-		fmt.Fprintf(w, "%-18s %-7s %-14s %s\n", r.Name, r.Status, r.Path, r.Detail)
+		width = maxInt(width, len(r.Name))
+	}
+	for _, r := range check.Results {
+		fmt.Fprintf(w, "%-*s  %-4s  %s\n", width, r.Name, strings.ToUpper(r.Status), r.Detail)
 	}
 }
 
-func recordInternetCheck(st *envdState, check internetCheckRecord) {
+func networkCheckProbeResults(check internetCheckRecord) []probeResult {
+	results := make([]probeResult, 0, len(check.Results))
+	for _, r := range check.Results {
+		switch r.Status {
+		case "ok":
+			results = append(results, probeResult{Name: r.Name, Detail: r.Detail})
+		case "skip":
+			results = append(results, probeResult{Name: r.Name, Detail: "skipped: " + r.Detail})
+		default:
+			results = append(results, probeResult{Name: r.Name, Err: fmt.Errorf("%s", r.Detail)})
+		}
+	}
+	return results
+}
+
+func recordNetworkCheck(st *envdState, check internetCheckRecord) {
 	st.ensureDefaults()
 	st.InternetChecks = append(st.InternetChecks, check)
 	if len(st.InternetChecks) > 50 {
 		st.InternetChecks = append([]internetCheckRecord{}, st.InternetChecks[len(st.InternetChecks)-50:]...)
 	}
-	st.addEvent("internet", "", fmt.Sprintf("status ok=%d fail=%d skip=%d", check.Summary.OK, check.Summary.Fail, check.Summary.Skip))
+	st.addEvent("network", "", fmt.Sprintf("status ok=%d fail=%d skip=%d", check.Summary.OK, check.Summary.Fail, check.Summary.Skip))
 }
 
 func summarizeInternetResults(results []internetProbeRecord) internetCheckSummary {
@@ -5610,7 +6332,7 @@ func (a app) runHosting(args []string, st *envdState) error {
 	switch args[0] {
 	case "check":
 		return a.runHostingCheck(args[1:], st)
-	case "global", "shortlist":
+	case "global":
 		return a.runHostingShortlist(args[1:], st)
 	case "russian":
 		return a.runHostingRussian(args[1:], st)
@@ -7313,26 +8035,35 @@ func reconcileSealedEnvGenerationsWith(st *envdState, verify reconciliationVerif
 
 func (a app) runEvents(args []string, st *envdState) error {
 	if len(args) > 0 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
-		fmt.Fprint(a.stdout, "Usage: envd events\n")
+		fmt.Fprint(a.stdout, "Usage: envd doctor history [SUBJECT]\n")
 		return nil
 	}
 	if len(st.Events) == 0 {
 		fmt.Fprintln(a.stdout, "No events recorded.")
 		return nil
 	}
+	filter := strings.TrimSpace(strings.Join(args, " "))
+	matched := false
 	for _, ev := range st.Events {
+		if filter != "" && ev.Subject != filter && ev.Kind+" "+ev.Subject != filter {
+			continue
+		}
+		matched = true
 		subject := ev.Subject
 		if subject != "" {
 			subject = " " + subject
 		}
 		fmt.Fprintf(a.stdout, "%s %-12s%s %s\n", ev.Time.Format(time.RFC3339), ev.Kind, subject, ev.Message)
 	}
+	if filter != "" && !matched {
+		fmt.Fprintf(a.stdout, "No events recorded for %s.\n", filter)
+	}
 	return nil
 }
 
 func (a app) runWhy(args []string, st *envdState) error {
 	if len(args) != 1 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		fmt.Fprint(a.stdout, "Usage: envd why ENV\n")
+		fmt.Fprint(a.stdout, "Usage: envd doctor why ENV\n")
 		return nil
 	}
 	name := args[0]
@@ -8334,9 +9065,12 @@ func validateEnvName(name string) error {
 			}
 			continue
 		}
-		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
-			return fmt.Errorf("invalid env name %q: use lowercase letters and digits only", name)
+		if !((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-') {
+			return fmt.Errorf("invalid env name %q: use lowercase letters, digits, and hyphens only", name)
 		}
+	}
+	if strings.HasSuffix(name, "-") {
+		return fmt.Errorf("invalid env name %q: must end with lowercase letter or digit", name)
 	}
 	return nil
 }
@@ -9721,7 +10455,7 @@ func nextActionForError(err error) string {
 	case "remote gateway":
 		return "Run envd gateway egress; if it fails, the remote gateway path is down."
 	case "sealed sidecar":
-		return "Run envd list and recreate or restart the affected sealed environment."
+		return "Run envd status and recreate or restart the affected sealed environment."
 	case "DNS":
 		return "Keep the env blocked; DNS inside the sealed route is not resolving."
 	case "egress policy":

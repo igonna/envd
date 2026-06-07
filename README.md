@@ -59,15 +59,13 @@ Run a sealed environment:
 ```bash
 envd start books
 envd shell books
-envd list
+envd status
 ```
 
 Check what is broken when networking fails:
 
 ```bash
-envd doctor --deep
-envd proxy test
-envd gateway egress
+envd doctor
 ```
 
 Use explicit non-sealed modes only when you mean it:
@@ -84,7 +82,7 @@ envd proxy                         # show host SOCKS/HTTP proxy endpoints
 envd gateway list                  # list configured gateways
 envd gateway status                # show active gateway
 envd gateway rollback              # return to previous verified gateway
-envd user uri ams1                 # print app import URI
+envd gateway view ams1 default     # print app import URI
 envd pkg add web apt:ffmpeg        # add package intent to a profile
 envd pkg add web pip:poetry        # Python CLI packages are profile intent too
 envd start app --profile web         # lazily build/use that profile

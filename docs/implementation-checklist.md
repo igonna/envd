@@ -64,7 +64,7 @@ Docker daemon and is outside the sealed guarantee.
 - [x] Keep an envd-owned asset cache separate from project data.
 - [x] Restore missing envd-owned images automatically when a command needs them.
 - [x] Detect Docker image drift from anonymous image IDs.
-- [x] Show image identity in `envd list` and `envd inspect`.
+- [x] Show image identity in `envd status` and `envd details`.
 - [x] Fail with a layer-specific diagnostic if asset restore cannot complete.
 
 ### Local Gateway And Proxy
@@ -135,13 +135,13 @@ Docker daemon and is outside the sealed guarantee.
 
 - [x] Define environment spec format.
 - [x] Implement `envd start <env>`.
-- [x] Implement `envd list`.
-- [x] Implement `envd inspect <env>`.
+- [x] Implement environment table in `envd status`.
+- [x] Implement `envd details <env>`.
 - [x] Implement `envd shell <env>`.
 - [x] Implement `envd stop <env>`.
 - [x] Implement `envd rm <env>`.
 - [x] Use plain storage by default.
-- [x] Show plain storage clearly in `envd list` and `envd inspect`.
+- [x] Show plain storage clearly in `envd status` and `envd details`.
 - [x] Never describe plain storage as encrypted or protected.
 - [x] Generate sidecar container and dev container pair.
 - [x] Share dev container network namespace with sidecar.
@@ -151,7 +151,7 @@ Docker daemon and is outside the sealed guarantee.
 - [x] Ensure no proxy env vars are required inside sealed dev containers.
 - [x] Verify DNS, TCP, TLS, Docker Hub, and egress IP from inside the sealed env.
 - [x] Mark env healthy only after sealed probes pass.
-- [x] Show network, gateway generation, egress, and issue in `envd list`.
+- [x] Show network, gateway generation, egress, and issue in `envd status`.
 
 ### Network Modes
 
@@ -170,8 +170,8 @@ Docker daemon and is outside the sealed guarantee.
 
 - [x] Implement `envd doctor`.
 - [x] Implement `envd doctor --deep`.
-- [x] Implement `envd why <env>`.
-- [x] Implement `envd events`.
+- [x] Implement `envd doctor why <env>`.
+- [x] Implement `envd doctor history`.
 - [x] Map every failure to a layer: host Docker, asset cache, local gateway,
       remote gateway, sidecar, DNS, egress policy, or state.
 - [x] Run real host proxy traffic tests.
@@ -193,7 +193,7 @@ Docker daemon and is outside the sealed guarantee.
 - [x] Record image restore and image drift.
 - [x] Record doctor failures and recovered failures.
 - [x] Redact secrets and sensitive paths from normal output.
-- [x] Make `envd why <env>` explain current block reason from events/state.
+- [x] Make `envd doctor why <env>` explain current block reason from events/state.
 
 ### v1 Migration From Current System
 
@@ -325,10 +325,10 @@ Docker daemon and is outside the sealed guarantee.
 - [x] Implement signed catalog update verification.
 - [x] Implement local private catalog overlay.
 - [x] Store local reachability history.
-- [x] Implement `envd internet status`.
-- [x] Implement `envd internet report`.
+- [x] Implement `envd doctor network`.
+- [x] Implement `envd doctor network history`.
 - [x] Implement `envd hosting check`.
-- [x] Implement `envd hosting shortlist`.
+- [x] Implement `envd hosting global`.
 - [x] Implement `envd gateway risk <name>`.
 - [x] Implement user URI generation.
 - [x] Implement gateway chain model.
@@ -346,8 +346,8 @@ Docker daemon and is outside the sealed guarantee.
       container.
 - [x] Test that Docker socket passthrough is explicit in container creation
       args and can be disabled with `ENVD_DOCKER_SOCKET=none`.
-- [ ] Report host Docker passthrough as an environment risk in `envd inspect`
-      and `envd list`.
+- [ ] Report host Docker passthrough as an environment risk in `envd details`
+      and `envd status`.
 
 ## Confirmed Non-Goals Unless Reopened
 
