@@ -2762,11 +2762,19 @@ func (a app) printPkgHelp() {
 	fmt.Fprint(a.stdout, `Usage:
   envd pkg COMMAND [args]
 
+Profiles:
+  envd pkg list
+  envd pkg show PROFILE
+  envd pkg rm PROFILE --yes
+
 Add:
   envd pkg add PROFILE apt:PACKAGE
   envd pkg add PROFILE npm:PACKAGE
   envd pkg add PROFILE pip:PACKAGE
   envd pkg add PROFILE tool:NAME
+
+Apply:
+  envd start ENV --profile PROFILE
 
 Common tools:
   tool:codex      installs Node/npm and @openai/codex
@@ -2774,10 +2782,6 @@ Common tools:
   tool:rg         installs ripgrep
   tool:go         installs Go
   tool:python     installs Python/pip/venv
-
-Promote:
-  envd pkg suggest ENV
-  envd pkg promote ENV --to PROFILE
 
 `)
 }
@@ -3391,10 +3395,23 @@ func (a app) startOrCreateEnv(args []string, st *envdState) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: envd start ENV [--network sealed|direct|offline] [--storage plain|protected] [--profile PROFILE]")
 	}
-	name := args[0]
+	opts, err := parseRunArgs(args)
+	if err != nil {
+		return err
+	}
+	name := opts.Name
+	if name == "" {
+		return fmt.Errorf("usage: envd start ENV [--network sealed|direct|offline] [--storage plain|protected] [--profile PROFILE]")
+	}
 	if _, ok := st.Environments[name]; ok {
+		if opts.ProfileExplicit {
+			if opts.NetworkExplicit || opts.StorageExplicit {
+				return fmt.Errorf("environment %q already exists; only --profile can be changed with start", name)
+			}
+			return a.applyProfileToEnv(st, name, opts.Profile)
+		}
 		if len(args) != 1 {
-			return fmt.Errorf("environment %q already exists; usage: envd start %s", name, name)
+			return fmt.Errorf("environment %q already exists; usage: envd start %s [--profile PROFILE]", name, name)
 		}
 		return a.startEnv(args, st)
 	}
@@ -3758,15 +3775,76 @@ func (a app) runPkg(args []string, st *envdState) error {
 		return nil
 	}
 	switch args[0] {
+	case "list":
+		return a.runPkgList(args[1:], st)
+	case "show":
+		return a.runPkgShow(args[1:], st)
 	case "add":
 		return a.runPkgAdd(args[1:], st)
-	case "suggest":
-		return a.runPkgSuggest(args[1:], st)
-	case "promote":
-		return a.runPkgPromote(args[1:], st)
+	case "rm":
+		return a.runPkgRemove(args[1:], st)
 	default:
 		return fmt.Errorf("unknown pkg subcommand %q", args[0])
 	}
+}
+
+func (a app) runPkgList(args []string, st *envdState) error {
+	if len(args) != 0 {
+		return fmt.Errorf("usage: envd pkg list")
+	}
+	names := sortedProfileNames(st)
+	if len(names) == 0 {
+		fmt.Fprintln(a.stdout, "No package profiles.")
+		return nil
+	}
+	widths := []int{7, 3, 10, 5}
+	rows := make([]profileRecord, 0, len(names))
+	for _, name := range names {
+		profile := st.Profiles[name]
+		rows = append(rows, profile)
+		widths[0] = maxInt(widths[0], len(name))
+		widths[1] = maxInt(widths[1], len(strconv.Itoa(len(profile.Packages))))
+		widths[2] = maxInt(widths[2], len(profilePackageSummary(profile.Packages)))
+		widths[3] = maxInt(widths[3], len(profile.Image))
+	}
+	format := fmt.Sprintf("%%-%ds  %%-%ds  %%-%ds  %%-%ds  %%s\n", widths[0], widths[1], widths[2], widths[3])
+	fmt.Fprintf(a.stdout, format, "PROFILE", "PKG", "PACKAGES", "GEN", "IMAGE")
+	for _, profile := range rows {
+		image := "-"
+		if profile.Image != "" {
+			image = profile.Image
+		}
+		fmt.Fprintf(a.stdout, format, profile.Name, strconv.Itoa(len(profile.Packages)), profilePackageSummary(profile.Packages), strconv.Itoa(profile.Generation), image)
+	}
+	return nil
+}
+
+func (a app) runPkgShow(args []string, st *envdState) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: envd pkg show PROFILE")
+	}
+	name := args[0]
+	if err := validateProfileName(name); err != nil {
+		return err
+	}
+	profile, ok := st.Profiles[name]
+	if !ok {
+		return fmt.Errorf("profile %q not found", name)
+	}
+	fmt.Fprintf(a.stdout, "Profile:    %s\n", profile.Name)
+	fmt.Fprintf(a.stdout, "Generation: %d\n", profile.Generation)
+	if profile.Image != "" {
+		fmt.Fprintf(a.stdout, "Image:      %s\n", profile.Image)
+	}
+	if len(profile.Packages) == 0 {
+		fmt.Fprintln(a.stdout, "Packages:   none")
+		return nil
+	}
+	fmt.Fprintln(a.stdout, "Packages:")
+	for _, pkg := range sortedProfilePackages(profile.Packages) {
+		fmt.Fprintf(a.stdout, "  %s:%s\n", pkg.Source, pkg.Name)
+	}
+	return nil
 }
 
 func (a app) runPkgAdd(args []string, st *envdState) error {
@@ -3797,55 +3875,121 @@ func (a app) runPkgAdd(args []string, st *envdState) error {
 	return nil
 }
 
-func (a app) runPkgSuggest(args []string, st *envdState) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: envd pkg suggest ENV")
+func (a app) runPkgRemove(args []string, st *envdState) error {
+	if len(args) != 2 || args[1] != "--yes" {
+		return fmt.Errorf("usage: envd pkg rm PROFILE --yes")
 	}
-	pkgs, err := a.suggestEnvPackages(st, args[0])
-	if err != nil {
+	name := args[0]
+	if err := validateProfileName(name); err != nil {
 		return err
 	}
-	if len(pkgs) == 0 {
-		fmt.Fprintln(a.stdout, "No package suggestions found.")
-		return nil
+	profile, ok := st.Profiles[name]
+	if !ok {
+		return fmt.Errorf("profile %q not found", name)
 	}
-	for _, pkg := range pkgs {
-		fmt.Fprintf(a.stdout, "%s:%s\n", pkg.Source, pkg.Name)
+	var users []string
+	for envName, rec := range st.Environments {
+		if rec.Profile == name {
+			users = append(users, envName)
+		}
 	}
+	sort.Strings(users)
+	if len(users) > 0 {
+		return fmt.Errorf("profile %q is used by env: %s", name, strings.Join(users, ", "))
+	}
+	delete(st.Profiles, name)
+	st.addEvent("profile", name, "removed package profile")
+	_ = dockerRun("rmi", profileImageName(profile.ID, profile.Generation))
+	if profile.Image != "" {
+		_ = dockerRun("rmi", profile.Image)
+	}
+	_ = pruneProfileImages(st)
+	fmt.Fprintf(a.stdout, "Removed profile: %s\n", name)
 	return nil
 }
 
-func (a app) runPkgPromote(args []string, st *envdState) error {
-	envName, profileName, err := parsePkgPromoteArgs(args)
+func (a app) applyProfileToEnv(st *envdState, envName, profileName string) error {
+	if err := validateEnvName(envName); err != nil {
+		return err
+	}
+	if err := validateProfileName(profileName); err != nil {
+		return err
+	}
+	ref, err := resolveEnvRef(st, envName)
 	if err != nil {
 		return err
 	}
-	pkgs, err := a.suggestEnvPackages(st, envName)
+	rec, ok := st.Environments[envName]
+	if !ok {
+		return fmt.Errorf("environment %q not found", envName)
+	}
+	if rec.BlockedReason != "" {
+		return fmt.Errorf("environment %q is blocked fail-closed: %s", envName, rec.BlockedReason)
+	}
+	image, generation, err := a.ensureProfileImage(st, profileName)
 	if err != nil {
 		return err
 	}
-	added := 0
-	var profile profileRecord
-	for _, pkg := range pkgs {
-		var changed bool
-		profile, changed, err = addPackageToProfile(st, profileName, pkg)
-		if err != nil {
+	if rec.Profile == profileName && rec.ProfileGeneration == generation && rec.Image == image && containerExists(ref.DevName) {
+		fmt.Fprintf(a.stdout, "Profile already active: %s generation %d on %s\n", profileName, generation, envName)
+		return nil
+	}
+	networkMode := networkOrSealed(rec.Network)
+	if ref.Storage == "protected" {
+		if err := restoreProtectedVolumes(ref); err != nil {
 			return err
 		}
-		if changed {
-			added++
+	}
+	if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[0]); err != nil {
+		return err
+	}
+	if networkMode == "sealed" {
+		if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[1]); err != nil {
+			return err
+		}
+		if err := a.ensureActiveGatewayRuntime(st); err != nil {
+			return err
+		}
+		if err := ensureDockerNetwork(gatewayNet); err != nil {
+			return err
+		}
+		if !containerExists(ref.NetName) {
+			if err := createSidecar(envName, ref.ID, ref.NetName); err != nil {
+				return err
+			}
+		} else if err := dockerRun("start", ref.NetName); err != nil {
+			return err
+		}
+		if err := waitForHealthy(ref.NetName, 60*time.Second); err != nil {
+			return err
 		}
 	}
-	if added > 0 {
-		_ = pruneProfileImages(st)
+	_ = dockerRun("stop", ref.DevName)
+	_ = dockerRun("rm", "-f", ref.DevName)
+	if err := a.createDevContainer(envName, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, networkMode, image); err != nil {
+		return err
 	}
-	st.addEvent("profile", profileName, fmt.Sprintf("promoted %d package suggestions from %s", added, envName))
-	fmt.Fprintf(a.stdout, "Profile:    %s\n", profileName)
-	fmt.Fprintf(a.stdout, "Promoted:   %d packages\n", added)
-	if profile.Generation > 0 {
-		fmt.Fprintf(a.stdout, "Generation: %d\n", profile.Generation)
+	if networkMode == "sealed" {
+		if err := verifySealedEnv(ref.DevName); err != nil {
+			return err
+		}
 	}
-	fmt.Fprintln(a.stdout, "Build:      deferred until first use")
+	rec.Image = image
+	rec.Profile = profileName
+	rec.ProfileGeneration = generation
+	rec.BlockedReason = ""
+	rec.UpdatedAt = time.Now().UTC()
+	rec.LastUsedAt = rec.UpdatedAt
+	st.Environments[envName] = rec
+	if err := repairEnvSSHAccessForRef(ref); err != nil {
+		return err
+	}
+	if err := setVSCodeExtensionsLocked(ref, true); err != nil {
+		return err
+	}
+	st.addEvent("env", envName, fmt.Sprintf("applied profile %s generation %d", profileName, generation))
+	fmt.Fprintf(a.stdout, "Profile applied: %s -> %s generation %d\n", envName, profileName, generation)
+	fmt.Fprintf(a.stdout, "SSH:             ssh %s\n", envName)
 	return nil
 }
 
@@ -3880,6 +4024,45 @@ func addPackageToProfile(st *envdState, profileName string, pkg profilePackage) 
 	st.Profiles[profileName] = profile
 	st.addEvent("profile", profileName, fmt.Sprintf("added %s:%s generation %d", pkg.Source, pkg.Name, profile.Generation))
 	return profile, true, nil
+}
+
+func sortedProfileNames(st *envdState) []string {
+	names := make([]string, 0, len(st.Profiles))
+	for name := range st.Profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedProfilePackages(pkgs []profilePackage) []profilePackage {
+	out := append([]profilePackage(nil), pkgs...)
+	sort.Slice(out, func(i, j int) bool {
+		left := out[i].Source + ":" + out[i].Name
+		right := out[j].Source + ":" + out[j].Name
+		return left < right
+	})
+	return out
+}
+
+func profilePackageSummary(pkgs []profilePackage) string {
+	if len(pkgs) == 0 {
+		return "-"
+	}
+	counts := map[string]int{}
+	for _, pkg := range pkgs {
+		counts[pkg.Source]++
+	}
+	var sources []string
+	for source := range counts {
+		sources = append(sources, source)
+	}
+	sort.Strings(sources)
+	parts := make([]string, 0, len(sources))
+	for _, source := range sources {
+		parts = append(parts, source+":"+strconv.Itoa(counts[source]))
+	}
+	return strings.Join(parts, ",")
 }
 
 func (a app) ensureProfileImage(st *envdState, profileName string) (string, int, error) {
@@ -3917,21 +4100,6 @@ func (a app) ensureProfileImage(st *envdState, profileName string) (string, int,
 	st.addEvent("profile", profileName, fmt.Sprintf("built image %s", image))
 	_ = pruneProfileImages(st)
 	return image, profile.Generation, nil
-}
-
-func (a app) suggestEnvPackages(st *envdState, envName string) ([]profilePackage, error) {
-	ref, err := resolveEnvRef(st, envName)
-	if err != nil {
-		return nil, err
-	}
-	aptOut, _ := exec.Command("docker", "exec", ref.DevName, "sh", "-lc", "grep -hE '^(Start-Date|Install):' /var/log/apt/history.log /var/log/apt/history.log.* 2>/dev/null || true").Output()
-	npmOut, _ := exec.Command("docker", "exec", ref.DevName, "sh", "-lc", "npm list -g --depth=0 --parseable 2>/dev/null | tail -n +2 || true").Output()
-	since := time.Time{}
-	if rec, ok := st.Environments[envName]; ok {
-		since = rec.CreatedAt.Add(-2 * time.Minute)
-	}
-	pkgs := append(parseAptHistoryPackagesSince(string(aptOut), since), parseNpmGlobalPackages(string(npmOut))...)
-	return uniqueProfilePackages(pkgs), nil
 }
 
 func createSidecar(envName, id, netName string) error {
@@ -11352,106 +11520,6 @@ func parseProfilePackage(spec string) (profilePackage, error) {
 		return profilePackage{}, err
 	}
 	return profilePackage{Source: source, Name: name}, nil
-}
-
-func parsePkgPromoteArgs(args []string) (envName, profileName string, err error) {
-	if len(args) != 3 || args[1] != "--to" {
-		return "", "", fmt.Errorf("usage: envd pkg promote ENV --to PROFILE")
-	}
-	if err := validateEnvName(args[0]); err != nil {
-		return "", "", err
-	}
-	if err := validateProfileName(args[2]); err != nil {
-		return "", "", err
-	}
-	return args[0], args[2], nil
-}
-
-func parseAptHistoryPackages(raw string) []profilePackage {
-	return parseAptHistoryPackagesSince(raw, time.Time{})
-}
-
-func parseAptHistoryPackagesSince(raw string, since time.Time) []profilePackage {
-	var pkgs []profilePackage
-	includeBlock := true
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Start-Date:") {
-			includeBlock = true
-			if !since.IsZero() {
-				started, err := parseAptHistoryTime(strings.TrimSpace(strings.TrimPrefix(line, "Start-Date:")))
-				includeBlock = err == nil && !started.Before(since)
-			}
-			continue
-		}
-		if !strings.HasPrefix(line, "Install:") {
-			continue
-		}
-		if !includeBlock {
-			continue
-		}
-		line = strings.TrimSpace(strings.TrimPrefix(line, "Install:"))
-		for _, item := range strings.Split(line, "),") {
-			item = strings.TrimSpace(strings.TrimSuffix(item, ")"))
-			if item == "" {
-				continue
-			}
-			if strings.Contains(item, ", automatic") {
-				continue
-			}
-			name := strings.Fields(item)
-			if len(name) == 0 {
-				continue
-			}
-			pkg := name[0]
-			if idx := strings.Index(pkg, ":"); idx > 0 {
-				pkg = pkg[:idx]
-			}
-			if err := validatePackageName(pkg); err == nil {
-				pkgs = append(pkgs, profilePackage{Source: "apt", Name: pkg})
-			}
-		}
-	}
-	return pkgs
-}
-
-func parseAptHistoryTime(value string) (time.Time, error) {
-	return time.ParseInLocation("2006-01-02  15:04:05", value, time.UTC)
-}
-
-func parseNpmGlobalPackages(raw string) []profilePackage {
-	var pkgs []profilePackage
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		name := filepath.Base(line)
-		parent := filepath.Base(filepath.Dir(line))
-		if strings.HasPrefix(parent, "@") {
-			name = parent + "/" + name
-		}
-		if name == "node_modules" || name == "lib" {
-			continue
-		}
-		if err := validatePackageName(name); err == nil {
-			pkgs = append(pkgs, profilePackage{Source: "npm", Name: name})
-		}
-	}
-	return pkgs
-}
-
-func uniqueProfilePackages(pkgs []profilePackage) []profilePackage {
-	seen := map[profilePackage]bool{}
-	out := make([]profilePackage, 0, len(pkgs))
-	for _, pkg := range pkgs {
-		if seen[pkg] {
-			continue
-		}
-		seen[pkg] = true
-		out = append(out, pkg)
-	}
-	return out
 }
 
 func validatePackageName(name string) error {

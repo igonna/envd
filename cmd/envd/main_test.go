@@ -1386,44 +1386,69 @@ func TestRunPkgAddCreatesProfileGeneration(t *testing.T) {
 	}
 }
 
-func TestParsePkgPromoteArgs(t *testing.T) {
-	envName, profileName, err := parsePkgPromoteArgs([]string{"books", "--to", "web"})
-	if err != nil {
-		t.Fatalf("parsePkgPromoteArgs failed: %v", err)
+func TestRunPkgListShowAndRemove(t *testing.T) {
+	st := envdState{Profiles: map[string]profileRecord{}}
+	a := app{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	if err := a.runPkgAdd([]string{"web", "apt:ffmpeg"}, &st); err != nil {
+		t.Fatal(err)
 	}
-	if envName != "books" || profileName != "web" {
-		t.Fatalf("unexpected promote args: %q %q", envName, profileName)
+	if err := a.runPkgAdd([]string{"web", "npm:pnpm"}, &st); err != nil {
+		t.Fatal(err)
 	}
-	if _, _, err := parsePkgPromoteArgs([]string{"books", "web"}); err == nil {
-		t.Fatal("invalid promote args accepted")
+	var out bytes.Buffer
+	a.stdout = &out
+	if err := a.runPkgList(nil, &st); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "PROFILE") || !strings.Contains(out.String(), "web") || !strings.Contains(out.String(), "apt:1,npm:1") {
+		t.Fatalf("unexpected list output: %q", out.String())
+	}
+	out.Reset()
+	if err := a.runPkgShow([]string{"web"}, &st); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "apt:ffmpeg") || !strings.Contains(out.String(), "npm:pnpm") {
+		t.Fatalf("unexpected show output: %q", out.String())
+	}
+	out.Reset()
+	if err := a.runPkgRemove([]string{"web", "--yes"}, &st); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.Profiles["web"]; ok {
+		t.Fatalf("profile was not removed: %+v", st.Profiles)
+	}
+	if !strings.Contains(out.String(), "Removed profile: web") {
+		t.Fatalf("unexpected remove output: %q", out.String())
 	}
 }
 
-func TestPackageSuggestionParsers(t *testing.T) {
-	aptRaw := "Install: sl:arm64 (5.02-1+b1), libncurses6:arm64 (6.4, automatic), ffmpeg:arm64 (7:6.1.1-1)\n"
-	apt := parseAptHistoryPackages(aptRaw)
-	if len(apt) != 2 || apt[0] != (profilePackage{Source: "apt", Name: "sl"}) || apt[1].Name != "ffmpeg" {
-		t.Fatalf("unexpected apt suggestions: %+v", apt)
+func TestPkgHelpShowsSingleApplyPath(t *testing.T) {
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	a.printPkgHelp()
+	if !strings.Contains(out.String(), "envd start ENV --profile PROFILE") {
+		t.Fatalf("pkg help should show start --profile apply flow: %q", out.String())
 	}
-	history := strings.Join([]string{
-		"Start-Date: 2026-06-05  10:00:00",
-		"Install: base:arm64 (1)",
-		"End-Date: 2026-06-05  10:00:01",
-		"Start-Date: 2026-06-05  11:00:00",
-		"Install: sl:arm64 (5.02-1+b1)",
-		"End-Date: 2026-06-05  11:00:01",
-	}, "\n")
-	since, err := time.ParseInLocation("2006-01-02  15:04:05", "2026-06-05  10:30:00", time.Local)
-	if err != nil {
-		t.Fatal(err)
+	for _, forbidden := range []string{"envd pkg use", "envd pkg suggest", "envd pkg promote", "best-effort"} {
+		if strings.Contains(out.String(), forbidden) {
+			t.Fatalf("pkg help should not show redundant command %q: %q", forbidden, out.String())
+		}
 	}
-	filtered := parseAptHistoryPackagesSince(history, since)
-	if len(filtered) != 1 || filtered[0].Name != "sl" {
-		t.Fatalf("unexpected filtered apt suggestions: %+v", filtered)
+}
+
+func TestRunPkgRemoveRefusesProfileInUse(t *testing.T) {
+	st := envdState{
+		Profiles:     map[string]profileRecord{"web": {Name: "web", ID: "abc123", Generation: 1}},
+		Environments: map[string]envRecord{"books": {Profile: "web"}},
 	}
-	npm := parseNpmGlobalPackages("/usr/local/lib/node_modules/pnpm\n/usr/local/lib/node_modules/@scope/pkg\n")
-	if len(npm) != 2 || npm[0] != (profilePackage{Source: "npm", Name: "pnpm"}) || npm[1].Name != "@scope/pkg" {
-		t.Fatalf("unexpected npm suggestions: %+v", npm)
+	var out bytes.Buffer
+	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	err := a.runPkgRemove([]string{"web", "--yes"}, &st)
+	if err == nil || !strings.Contains(err.Error(), "used by env: books") {
+		t.Fatalf("expected in-use error, got %v", err)
+	}
+	if _, ok := st.Profiles["web"]; !ok {
+		t.Fatal("profile should not be removed while in use")
 	}
 }
 
