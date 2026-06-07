@@ -1,0 +1,251 @@
+# name	domain	tier	regions	notes
+Amazon Web Services EC2	aws.amazon.com	VPB	Global	Hyperscale cloud VMs
+Amazon Lightsail	lightsail.aws.amazon.com	VPB	Global	Simple VPS-like cloud
+Microsoft Azure	azure.microsoft.com	VPB	Global	Hyperscale cloud VMs
+Google Compute Engine	cloud.google.com	VPB	Global	Hyperscale cloud VMs
+Oracle Cloud Infrastructure	oracle.com/cloud	VPB	Global	Hyperscale cloud VMs
+Alibaba Cloud	alibabacloud.com	VPB	Global / China-heavy	Hyperscale cloud VMs
+IBM Cloud	ibm.com/cloud	VPB	Global	Cloud virtual servers
+DigitalOcean	digitalocean.com	VPT / VPB	Global	Global VPS/cloud
+Linode / Akamai Connected Cloud	linode.com	VPB	Global	Global VPS/cloud
+Vultr	vultr.com	VPT / VPB	Global	Global VPS/cloud
+OVHcloud	ovhcloud.com	VPB	Global	VPS/public cloud
+OVHcloud US	us.ovhcloud.com	VPB	US	VPS/public cloud
+Hetzner	hetzner.com	VPB	Europe / US	Cloud servers / VPS
+Scaleway	scaleway.com	VPB	Europe	European cloud servers
+Contabo	contabo.com	VPB	Global	Budget VPS/cloud
+IONOS	ionos.com	VPB	Europe / US	VPS/cloud hosting
+Leaseweb	leaseweb.com	VPB	Global	VPS/cloud/dedicated
+Hostinger	hostinger.com	VPB	Global	VPS hosting
+Bluehost	bluehost.com	VPB	US	VPS hosting
+InMotion Hosting	inmotionhosting.com	VPB	US	VPS hosting
+ScalaHosting	scalahosting.com	VPB	US / EU	Managed cloud VPS
+Kamatera	kamatera.com	VPB	Global	Global cloud servers
+Atlantic.Net	atlantic.net	VPB	US / EU / Asia	Cloud VPS
+UpCloud	upcloud.com	VPB	Global	Cloud servers
+Hivelocity	hivelocity.net	VPB	Global	VPS/cloud/dedicated
+Servers.com	servers.com	VPB	Global	Cloud/dedicated
+netcup	netcup.eu	VPB	Germany / EU	German VPS/root servers
+Aruba Cloud	arubacloud.com	VPB	Europe	European cloud VPS
+Cherry Servers	cherryservers.com	VPB	Lithuania / EU	Cloud servers/bare metal
+BuyVM	buyvm.net	VPB	US / Luxembourg	Budget VPS
+BlueVPS	bluevps.com	VPT / VPB	Global	Multi-location VPS
+Clouding.io	clouding.io	VPT / VPB	Spain / EU	Spain cloud VPS
+Fasthosts	fasthosts.co.uk	VPB	UK	UK VPS/cloud
+dogado	dogado.de	VPB	Germany / EU	German VPS/cloud
+Alwyzon	alwyzon.com	VPB	Austria / EU	Austria VPS
+Bacloud	bacloud.com	VPB	Lithuania / EU	Lithuania VPS/dedicated
+Database Mart	databasemart.com	VPB	US	Windows/Linux VPS
+Evolution Host	evolution-host.com	VPT / VPB	US / EU	VPS hosting
+Evoxt	evoxt.com	VPB	US / EU / Asia	VPS hosting
+HostArmada	hostarmada.com	VPB	Global	Cloud VPS / hosting
+HostHatch	hosthatch.com	VPT / VPB	Global	Multi-location VPS
+MonoVM	monovm.com	VPB	Global	VPS hosting
+RAKsmart	raksmart.com	VPB	Global	Cloud/dedicated/VPS
+ServerCheap	servercheap.net	VPB	US	Budget VPS
+VPSServer.com	vpsserver.com	VPB	Global	Cloud VPS
+Rad Web Hosting	radwebhosting.com	VPB	US	VPS/cloud
+Togglebox	togglebox.com	VPB	US	Cloud VPS
+Unihost	unihost.com	VPB / VPT	Global	VPS/dedicated
+Melbicom	melbicom.net	VPB	Global	VPS/dedicated/CDN
+LayerStack	layerstack.com	VPB	Asia / Global	Cloud servers
+Genesis Public Cloud	genesiscloud.com	VPB	Global	Cloud compute
+Genesis VMs	genesiscloud.com	VPB	Global	Cloud VMs
+Godlike.host	godlike.host	VPB	Global	VPS/game/cloud
+Hostman	hostman.com	VPB	Global	Cloud/app/VPS-like
+HostUp	hostup.se	VPB	Sweden / EU	VPS/dedicated
+Nobull Networks	nobullnetworks.com	VPB	Unknown	VPS provider
+QuantVPS	quantvps.com	VPB	Unknown	VPS provider
+RackGenius	rackgenius.com	VPB	Unknown	VPS provider
+Server Optima	serveroptima.com	VPB	Unknown	VPS provider
+VPSLab	vpslab.cloud	VPB	Unknown	VPS provider
+TakeHost.Biz	takehost.biz	VPB	Unknown	VPS provider
+0ping.eu	0ping.eu	VPB	Europe	VPS provider
+1Gbits	1gbits.com	VPB	Global	VPS/dedicated
+ARPHost	arphost.com	VPB	Unknown	VPS provider
+Alpenhost	alpenhost.at	VPB	Austria / EU	VPS provider
+BlastVPS	blastvps.com	VPB	Unknown	VPS provider
+Hexabyte	hexabyte.cloud	VPB	Unknown	VPS/cloud
+Hosta Blanca	hostablanca.com	VPB	Unknown	VPS provider
+GS WEBSERVICES	gswebservices.com	VPB	Unknown	VPS/cloud
+Linkdata.com	linkdata.com	VPB	Unknown	VPS/cloud
+OnetSolutions	onetsolutions.com	VPB	Unknown	VPS provider
+Raff	raffcloud.com	VPB	Unknown	VPS/cloud
+ServerMania	servermania.com	Known global	US / Canada / EU	VPS/dedicated
+ReliableSite	reliablesite.net	Known global	US	VPS/dedicated
+Psychz Networks	psychz.net	Known global	US / EU / Asia	VPS/dedicated/DDoS
+PhoenixNAP	phoenixnap.com	Known global	Global	Cloud/bare metal
+Gcore Cloud	gcore.com	Known global	Global	Cloud VMs
+CloudSigma	cloudsigma.com	Known global	Global	Cloud servers
+Civo	civo.com	Known global	US / EU	Cloud/Kubernetes VMs
+Exoscale	exoscale.com	Known global	Europe	European cloud VMs
+OneProvider	oneprovider.com	Known global	Global	VPS/dedicated
+HOSTKEY	hostkey.com	RU / RBC / OFF	Europe / USA / Turkey	VPS/dedicated
+PQ.Hosting	pq.hosting	RBC / VPT	Global / EU	Multi-country VPS
+is*hosting	ishosting.com	VPT / RU	Global	40+ country VPS
+Aeza	aeza.net	VPT / RU	EU / CIS	VPS/dedicated
+AlexHost	alexhost.com	VPT	Moldova / EU	VPS/dedicated
+AlphaVPS	alphavps.com	VPT	Bulgaria / EU	Budget VPS
+Advin	advinservers.com	VPT	Unknown	VPS
+Akile	akile.io	VPT	Asia	Asia VPS
+AllHost	allhost.io	VPT	Unknown	VPS
+Aluy	aluy.net	VPT	Unknown	VPS
+Aquatis	aquatis.host	VPT	Unknown	VPS
+Atomic Networks	atomicnetworks.co	VPT	Unknown	VPS
+AvaHost	avahost.net	VPT	Unknown	VPS
+AvenaCloud	avenacloud.com	VPT	Unknown	VPS
+Avoro	avoro.eu	VPT	Europe	VPS
+BageVM	bagevm.com	VPT	Unknown	VPS
+BulkVM	bulkvm.com	VPT	Unknown	VPS
+Bullethost	bullethost.net	VPT	Unknown	VPS
+C-Servers	c-servers.co.uk	VPT	UK	VPS
+Chunkserve	chunkserve.com	VPT	Unknown	VPS
+cloud.mu	cloud.mu	VPT	Mauritius	Mauritius VPS
+CloudBlast	cloudblast.io	VPT	Unknown	VPS
+Cloudnium	cloudnium.net	VPT	Unknown	VPS
+ColoCrossing	colocrossing.com	VPT	US	VPS/dedicated
+DartNode	dartnode.com	VPT	Unknown	VPS
+Dasabo	dasabo.de	VPT	Germany	VPS
+DediRock	dedirock.com	VPT	Unknown	VPS
+DeinServerHost	deinserverhost.de	VPT	Germany	VPS
+DigiRDP	digirdp.com	VPT	Unknown	VPS/RDP
+EthernetServers	ethernetservers.com	VPT	US / UK	VPS
+EvolusHost	evolushost.com	VPT	Unknown	VPS
+ExtraVM	extravm.com	VPT	US / EU	VPS/game
+Ferenz	ferenz.com	VPT	Brazil	Brazil VPS
+Fiberstate	fiberstate.com	VPT	Unknown	VPS
+FlowVPS	flowvps.com.au	VPT	Australia	Australia VPS
+Fourplex	fourplex.net	VPT	Unknown	VPS
+George DC	georgedc.com	VPT	Unknown	VPS
+GreenCloudVPS	greencloudvps.com	VPT	Global	Budget VPS
+GTHost	gthost.com	VPT	Global	VPS/dedicated
+Gullo's Hosting	gulloshosting.com	VPT	Unknown	Budget VPS
+HostBrr	hostbrr.com	VPT	EU	VPS
+HostDare	hostdare.com	VPT	Unknown	VPS
+HostEons	hosteons.com	VPT	Unknown	VPS
+Hosteroid	hosteroid.com	VPT	Unknown	VPS
+Hostiko	hostiko.com	VPT	Unknown	VPS
+Hosting International	hosting.international	VPT	Unknown	VPS
+HostNamaste	hostnamaste.com	VPT	India / Global	VPS
+HostSailor	hostsailor.com	VPT	Netherlands / Romania	VPS/dedicated
+HostSlick	hostslick.com	VPT	Unknown	VPS
+iHostArt	ihostart.com	VPT	Unknown	VPS
+Info Fractal	infofractal.cl	VPT	Chile	Chile VPS
+InterServer	interserver.net	VPT	US	VPS hosting
+KhanWebHost	khanwebhost.com	VPT	Unknown	VPS
+Kuroit	kuroit.com	VPT	Unknown	VPS
+Layer.ae	layer.ae	VPT	UAE	VPS
+Layer7	layer7.net	VPT	Germany	VPS
+LeapSwitch	leapswitch.com	VPT	Unknown	VPS
+Linveo	linveo.com	VPT	Unknown	VPS
+LiteServer	liteserver.nl	VPT	Netherlands	VPS
+LittleCreek	littlecreekhosting.com	VPT	Unknown	VPS
+LowHosting	lowhosting.org	VPT	Unknown	VPS
+Luxvps	luxvps.net	VPT	Unknown	VPS
+massiveGRID	massivegrid.com	VPT	Global	Cloud VPS
+Millenial Host	millenialhost.com	VPT	Unknown	VPS
+mivoCloud	mivocloud.com	VPT	Moldova / EU	VPS
+Mondoze	mondoze.com	VPT	Malaysia	Malaysia VPS
+NATVPS	natvps.net	VPT	Unknown	NAT/full VPS
+NolimitHost	nolimithost.com	VPT	Unknown	VPS
+Onidel	onidel.com	VPT	Unknown	VPS
+OrangeVPS	orangevps.com	VPT	Unknown	VPS
+PhotonVPS	photonvps.com	VPT	Unknown	VPS
+QDE	qde.nl	VPT	Netherlands	VPS
+Rabisu	rabisu.com	VPT	Unknown	VPS
+RackNerd	racknerd.com	VPT	US / EU	Budget VPS
+RareCloud	rarecloud.io	VPT	Unknown	VPS
+ReadyDedis	readydedis.com	VPT	US	VPS/dedicated
+SchnellNode	schnellnode.net	VPT	Unknown	VPS
+ServaRica	servarica.com	VPT	Canada	VPS/storage VPS
+ServeTheWorld	servetheworld.net	VPT	Norway	Norway VPS
+ShockHosting	shockhosting.net	VPT	Unknown	VPS
+Skhron	skhron.com	VPT	Unknown	VPS
+SmartHost	smarthost.net	VPT	Unknown	VPS
+SoftShellWeb	softshellweb.com	VPT	Unknown	VPS
+SolidVPS	solidvps.com	VPT	Unknown	VPS
+SpeedyPage	speedypage.com	VPT	US / EU	VPS
+Strike	strikehosting.com	VPT	Unknown	VPS
+SwedenDedi	swedendedi.com	VPT	Sweden	VPS
+Terabix	terabix.com	VPT	Malaysia	Malaysia VPS
+Tietokettu	tietokettu.net	VPT	Finland	Finland VPS
+TNAHosting	tnahosting.net	VPT	Unknown	VPS
+Tothost	tothost.vn	VPT	Vietnam	Vietnam VPS
+UltaHost	ultahost.com	VPT	Global	VPS hosting
+up-network	up-network.ch	VPT	Switzerland	Switzerland VPS
+VeloxMedia	veloxmedia.com	VPT	Unknown	VPS
+Virtono	virtono.com	VPT	Global	VPS/cloud
+Virtury	virtury.com	VPT	Unknown	VPS
+VPS Panda	vpspanda.com	VPT	Unknown	VPS
+vps1	vps1.com	VPT	Unknown	VPS
+VPSDime	vpsdime.com	VPT	US	VPS
+WebHorizon	webhorizon.in	VPT	Asia / EU / US	Budget VPS
+WorldBus	worldbus.ge	VPT	Georgia	VPS
+xHosts	xhosts.uk	VPT	UK	VPS
+Zade Servers	zadeservers.com	VPT	Unknown	VPS
+Zappie	zappiehost.com	VPT	US / EU / Asia	VPS
+Hostwinds	hostwinds.com	Known global	US / EU	VPS hosting
+Namecheap	namecheap.com	Known global	US / EU	VPS hosting
+DreamHost	dreamhost.com	Known global	US	VPS hosting
+HostGator	hostgator.com	Known global	US	VPS hosting
+GoDaddy	godaddy.com	Known global	Global	VPS hosting
+A2 Hosting	a2hosting.com	Known global	US / EU / Asia	VPS hosting
+Liquid Web	liquidweb.com	Known global	US / EU	Managed VPS
+GreenGeeks	greengeeks.com	Known global	US / Canada / EU	Managed VPS
+FastComet	fastcomet.com	Known global	Global	Cloud VPS
+Nexcess	nexcess.net	Known global	US / EU	Managed cloud/VPS-like
+Time4VPS	time4vps.com	Known global	Lithuania / EU	Lithuania VPS
+TransIP	transip.eu	Known global	Netherlands / EU	Netherlands VPS
+Tilaa	tilaa.com	Known global	Netherlands	Netherlands VPS
+Cloud86	cloud86.io	Known global	Netherlands / EU	Netherlands hosting/VPS
+Combell	combell.com	Known global	Belgium / EU	Belgium cloud/VPS
+Infomaniak	infomaniak.com	Known global	Switzerland	Swiss cloud
+cloudscale.ch	cloudscale.ch	Known global	Switzerland	Swiss cloud servers
+STACKIT	stackit.de	Known global	Germany / EU	German cloud
+PlusServer	plusserver.com	Known global	Germany / EU	German managed cloud
+Worldstream	worldstream.com	Known global	Netherlands	VPS/dedicated
+HOSTERION	hosterion.com	Known global	Romania / EU	Romania VPS
+Serverion	serverion.com	Known global	Netherlands	Netherlands VPS
+Webdock	webdock.io	Known global	Europe	VPS
+MiroHost	mirohost.net	Known global	Ukraine	Ukraine VPS
+HyperHost	hyperhost.ua	Known global	Ukraine / EU	Ukraine/EU VPS
+Hostpro	hostpro.com	Known global	Ukraine / EU	Ukraine VPS
+Fornex	fornex.com	RBC / RU	Europe / CIS	Europe/US VPS
+RUVDS	ruvds.com	RU	Russia / Europe	RU/global VPS
+Serverspace	serverspace.io	RBC / RU	Global	Cloud servers
+CloudCone	cloudcone.com	Known global	US	Cloud VPS
+NodeSpace	nodespace.com	Known global	US	VPS hosting
+BinaryLane	binarylane.com.au	Known global	Australia	Australia VPS
+SSD Nodes	ssdnodes.com	Known global	Global	Budget VPS
+RamNode	ramnode.com	Known global	US / EU	VPS hosting
+HostUS	hostus.us	Known global	US / EU / Asia	VPS hosting
+AnyNode	anynode.net	Known global	US	VPS hosting
+BudgetVM	budgetvm.com	Known global	US	VPS/dedicated
+Cloudzy	cloudzy.com	Known global	Global	VPS hosting
+OperaVPS	operavps.com	Known global	Global	VPS hosting
+Utho	utho.com	Known global	India / Global	India cloud VPS
+MilesWeb	milesweb.com	Known global	India / Global	VPS hosting
+BigRock	bigrock.in	Known global	India	India VPS
+ResellerClub	resellerclub.com	Known global	India / Global	VPS/reseller hosting
+CrazyDomains	crazydomains.com	Known global	Australia / Asia	VPS hosting
+VentraIP	ventraip.com.au	Known global	Australia	Australia VPS
+Servers Australia	serversaustralia.com.au	Known global	Australia	Cloud/dedicated
+LightNode	lightnode.com	Known global	Global / Asia-heavy	Hourly VPS
+Sakura Internet	sakura.ad.jp	Known global	Japan	Japan VPS/cloud
+ConoHa VPS	conoha.jp	Known global	Japan	Japan VPS
+GMO Cloud	gmo.jp	Known global	Japan	Japan cloud/VPS
+IDCF Cloud	idcf.jp	Known global	Japan	Japan cloud
+NHN Cloud	nhncloud.com	Known global	Korea	Korea cloud
+Naver Cloud	ncloud.com	Known global	Korea	Korea cloud
+KT Cloud	ktcloud.com	Known global	Korea	Korea cloud
+IDCloudHost	idcloudhost.com	Known global	Indonesia	Indonesia cloud/VPS
+Niagahoster	niagahoster.co.id	Known global	Indonesia	Indonesia VPS
+Exabytes	exabytes.com	Known global	SE Asia	VPS
+Vodien	vodien.com	Known global	Singapore	Singapore VPS
+Shinjiru	shinjiru.com	Known global	Malaysia	Malaysia/offshore VPS
+HostAfrica	hostafrica.com	Known global	South Africa / Africa	Africa VPS/cloud
+Afrihost	afrihost.com	Known global	South Africa	South Africa VPS/cloud
+Truehost	truehost.cloud	Known global	Africa / Global	Africa VPS/cloud
+KingHost	king.host	Known global	Brazil	Brazil VPS/cloud
+Locaweb	locaweb.com.br	Known global	Brazil	Brazil VPS/cloud
+DonWeb	donweb.com	Known global	Latin America	Latin America VPS

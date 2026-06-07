@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -29,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +41,12 @@ import (
 
 	envdassets "github.com/envd/envd/internal/assets"
 )
+
+//go:embed hosting_providers.tsv
+var builtInHostingProvidersTSV string
+
+//go:embed hosting_ru_payments.tsv
+var builtInRussianPaymentProvidersTSV string
 
 const version = "0.1.0-dev"
 
@@ -1128,11 +1136,19 @@ func (a app) printHostingHelp() {
 
 Commands:
   check        test provider reachability from this machine
-  shortlist    show reachable/diverse provider candidates
-  update       install a signed provider catalog update
+  global       show global provider candidates
+  russian      show Russian-card/ruble-friendly provider candidates
 
-Update:
-  envd hosting update --url PROVIDERS_JSON --sig SIG --key PUBKEY
+Check:
+  envd hosting check
+  envd hosting check --verbose
+
+Lists:
+  envd hosting global
+  envd hosting russian
+
+Aliases:
+  shortlist    same as global
 
 `)
 }
@@ -5548,7 +5564,17 @@ func probeHTTPProxyURL(name, path, proxyAddr, target string, timeout time.Durati
 }
 
 func fetchURL(proxy *url.URL, target string, timeout time.Duration) (int, string, error) {
-	transport := &http.Transport{Proxy: http.ProxyURL(proxy)}
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxy),
+		DialContext: (&net.Dialer{
+			Timeout:   timeout,
+			KeepAlive: 15 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: time.Second,
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
+	}
 	if proxy == nil {
 		transport.Proxy = nil
 	}
@@ -5584,38 +5610,73 @@ func (a app) runHosting(args []string, st *envdState) error {
 	switch args[0] {
 	case "check":
 		return a.runHostingCheck(args[1:], st)
-	case "shortlist":
+	case "global", "shortlist":
 		return a.runHostingShortlist(args[1:], st)
-	case "update":
-		return a.runHostingUpdate(args[1:], st)
+	case "russian":
+		return a.runHostingRussian(args[1:], st)
 	default:
 		return fmt.Errorf("unknown hosting subcommand %q", args[0])
 	}
 }
 
 func (a app) runHostingCheck(args []string, st *envdState) error {
-	if len(args) != 0 {
-		return fmt.Errorf("usage: envd hosting check")
+	verbose := false
+	for _, arg := range args {
+		switch arg {
+		case "--verbose":
+			verbose = true
+		default:
+			return fmt.Errorf("usage: envd hosting check [--verbose]")
+		}
 	}
 	catalog, err := a.loadHostingCatalog()
 	if err != nil {
 		return err
 	}
+	russian, err := parseRussianPaymentHostingProvidersTSV(builtInRussianPaymentProvidersTSV)
+	if err != nil {
+		return err
+	}
+	catalog = mergeHostingCatalogs(catalog, russian)
+	fmt.Fprintf(a.stdout, "Checking: %d providers, parallel=%d, timeout=%s\n", len(catalog.Providers), hostingCheckConcurrency, hostingCheckTimeout)
 	checks := checkHostingProviders(catalog.Providers)
 	recordHostingChecks(st, checks)
-	printHostingCheck(a.stdout, checks)
+	printHostingCheck(a.stdout, checks, verbose)
+	if !verbose {
+		freshChecks := hostingChecksByProvider(checks)
+		global, err := a.loadHostingCatalog()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(a.stdout, "\nGlobal:")
+		printHostingList(a.stdout, global.Providers, freshChecks, hostingGlobalNote)
+		fmt.Fprintln(a.stdout, "\nRussian payment:")
+		printHostingList(a.stdout, russian.Providers, freshChecks, hostingRussianNote)
+	}
 	return nil
 }
 
 func (a app) runHostingShortlist(args []string, st *envdState) error {
 	if len(args) != 0 {
-		return fmt.Errorf("usage: envd hosting shortlist")
+		return fmt.Errorf("usage: envd hosting global")
 	}
 	catalog, err := a.loadHostingCatalog()
 	if err != nil {
 		return err
 	}
-	printHostingShortlist(a.stdout, catalog.Providers, latestHostingChecks(st))
+	printHostingList(a.stdout, catalog.Providers, latestHostingChecks(st), hostingGlobalNote)
+	return nil
+}
+
+func (a app) runHostingRussian(args []string, st *envdState) error {
+	if len(args) != 0 {
+		return fmt.Errorf("usage: envd hosting russian")
+	}
+	catalog, err := parseRussianPaymentHostingProvidersTSV(builtInRussianPaymentProvidersTSV)
+	if err != nil {
+		return err
+	}
+	printHostingList(a.stdout, catalog.Providers, latestHostingChecks(st), hostingRussianNote)
 	return nil
 }
 
@@ -6491,77 +6552,6 @@ func identityPolicyAllowsSealedOnly(policy identityPolicy) bool {
 	return policy.RequireHealthySealed && policy.RequireGatewayCurrent
 }
 
-func (a app) runHostingUpdate(args []string, st *envdState) error {
-	urlValue := ""
-	sigValue := ""
-	keyValue := ""
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--url":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("missing value for --url")
-			}
-			urlValue = args[i]
-		case "--sig":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("missing value for --sig")
-			}
-			sigValue = args[i]
-		case "--key":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("missing value for --key")
-			}
-			keyValue = args[i]
-		default:
-			return fmt.Errorf("usage: envd hosting update --url <url-or-file> --sig <signature-url-file-or-base64> --key <ed25519-public-key-file-hex-or-base64>")
-		}
-	}
-	if urlValue == "" || sigValue == "" || keyValue == "" {
-		return fmt.Errorf("usage: envd hosting update --url <url-or-file> --sig <signature-url-file-or-base64> --key <ed25519-public-key-file-hex-or-base64>")
-	}
-	raw, err := readSourceBytes(urlValue)
-	if err != nil {
-		return err
-	}
-	sigRaw, err := readSourceOrLiteral(sigValue)
-	if err != nil {
-		return err
-	}
-	sig, err := decodeBinaryPayload(sigRaw, ed25519.SignatureSize)
-	if err != nil {
-		return fmt.Errorf("invalid hosting catalog signature: %w", err)
-	}
-	keyRaw, err := readSourceOrLiteral(keyValue)
-	if err != nil {
-		return err
-	}
-	key, err := decodeBinaryPayload(keyRaw, ed25519.PublicKeySize)
-	if err != nil {
-		return fmt.Errorf("invalid hosting catalog public key: %w", err)
-	}
-	catalog, err := verifySignedHostingCatalog(raw, sig, ed25519.PublicKey(key))
-	if err != nil {
-		return err
-	}
-	path, err := signedHostingCatalogPath()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return err
-	}
-	st.addEvent("hosting", "", fmt.Sprintf("updated signed catalog with %d providers", len(catalog.Providers)))
-	fmt.Fprintf(a.stdout, "Updated: %s\n", path)
-	fmt.Fprintf(a.stdout, "Providers: %d\n", len(catalog.Providers))
-	return nil
-}
-
 func (a app) loadHostingCatalog() (hostingCatalog, error) {
 	raw, err := loadBaseHostingCatalogRaw(a.root)
 	if err != nil {
@@ -6571,6 +6561,11 @@ func (a app) loadHostingCatalog() (hostingCatalog, error) {
 	if err != nil {
 		return hostingCatalog{}, err
 	}
+	community, err := parseBuiltInHostingProvidersTSV(builtInHostingProvidersTSV)
+	if err != nil {
+		return hostingCatalog{}, err
+	}
+	catalog = mergeHostingCatalogs(community, catalog)
 	overlay, ok, err := loadHostingOverlay()
 	if err != nil {
 		return hostingCatalog{}, err
@@ -6582,96 +6577,246 @@ func (a app) loadHostingCatalog() (hostingCatalog, error) {
 }
 
 func loadBaseHostingCatalogRaw(root string) ([]byte, error) {
-	if path, err := signedHostingCatalogPath(); err == nil {
-		if raw, readErr := os.ReadFile(path); readErr == nil {
-			return raw, nil
-		}
-	}
 	return os.ReadFile(filepath.Join(root, "data", "hosting", "providers.json"))
 }
 
-func verifySignedHostingCatalog(raw, sig []byte, key ed25519.PublicKey) (hostingCatalog, error) {
-	if len(key) != ed25519.PublicKeySize {
-		return hostingCatalog{}, fmt.Errorf("invalid hosting catalog public key length %d", len(key))
+func parseBuiltInHostingProvidersTSV(raw string) (hostingCatalog, error) {
+	catalog := hostingCatalog{Version: 1}
+	scanner := bufio.NewScanner(strings.NewReader(raw))
+	lineNo := 0
+	seenIDs := map[string]int{}
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 5 {
+			return hostingCatalog{}, fmt.Errorf("hosting provider table line %d: expected 5 tab-separated fields", lineNo)
+		}
+		name := strings.TrimSpace(fields[0])
+		domain := strings.TrimSpace(fields[1])
+		tier := strings.TrimSpace(fields[2])
+		regions := strings.TrimSpace(fields[3])
+		notes := strings.TrimSpace(fields[4])
+		id := providerIDFromNameDomain(name, domain)
+		if n := seenIDs[id]; n > 0 {
+			seenIDs[id] = n + 1
+			id = fmt.Sprintf("%s-%d", id, n+1)
+		} else {
+			seenIDs[id] = 1
+		}
+		provider := hostingProvider{
+			ID:                id,
+			Name:              name,
+			Homepage:          "https://" + strings.TrimRight(domain, "/"),
+			SignupURL:         "https://" + strings.TrimRight(domain, "/"),
+			APIURL:            nil,
+			CountriesSoldFrom: countriesFromRegionText(regions),
+			Regions:           regionsFromRegionText(regions),
+			Payments:          []string{"unknown"},
+			MinPlan:           hostingMinPlan{CPU: 1, RAMMB: 1024, DiskGB: 10},
+			Notes:             []string{"community dataset", tier, regions, notes},
+			Confidence:        "community",
+		}
+		if strings.Contains(strings.ToLower(tier), "verify") || strings.Contains(strings.ToLower(notes), "verify") {
+			provider.Confidence = "unknown"
+		}
+		catalog.Providers = append(catalog.Providers, provider)
 	}
-	if len(sig) != ed25519.SignatureSize {
-		return hostingCatalog{}, fmt.Errorf("invalid hosting catalog signature length %d", len(sig))
+	if err := scanner.Err(); err != nil {
+		return hostingCatalog{}, err
 	}
-	if !ed25519.Verify(key, raw, sig) {
-		return hostingCatalog{}, fmt.Errorf("hosting catalog signature verification failed")
-	}
-	catalog, err := parseHostingCatalog(raw)
+	rawJSON, err := json.Marshal(catalog)
 	if err != nil {
 		return hostingCatalog{}, err
 	}
-	return catalog, nil
+	return parseHostingCatalog(rawJSON)
 }
 
-func readSourceBytes(source string) ([]byte, error) {
-	source = strings.TrimSpace(source)
-	if source == "" {
-		return nil, fmt.Errorf("empty source")
-	}
-	if strings.HasPrefix(source, "https://") || strings.HasPrefix(source, "http://") {
-		client := &http.Client{Timeout: 20 * time.Second}
-		resp, err := client.Get(source)
-		if err != nil {
-			return nil, err
+func parseRussianPaymentHostingProvidersTSV(raw string) (hostingCatalog, error) {
+	catalog := hostingCatalog{Version: 1}
+	scanner := bufio.NewScanner(strings.NewReader(raw))
+	lineNo := 0
+	seenIDs := map[string]int{}
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
-		defer resp.Body.Close()
-		raw, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
-		if err != nil {
-			return nil, err
+		fields := strings.Split(line, "\t")
+		if len(fields) != 7 {
+			return hostingCatalog{}, fmt.Errorf("Russian-payment provider table line %d: expected 7 tab-separated fields", lineNo)
 		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, source)
+		name := strings.TrimSpace(fields[0])
+		domain := strings.TrimSpace(fields[1])
+		locations := strings.TrimSpace(fields[2])
+		payments := splitProviderList(fields[3])
+		strength := strings.TrimSpace(fields[4])
+		evidence := strings.TrimSpace(fields[5])
+		notes := strings.TrimSpace(fields[6])
+		id := providerIDFromNameDomain(name, domain)
+		if n := seenIDs[id]; n > 0 {
+			seenIDs[id] = n + 1
+			id = fmt.Sprintf("%s-%d", id, n+1)
+		} else {
+			seenIDs[id] = 1
 		}
-		return raw, nil
+		provider := hostingProvider{
+			ID:                id,
+			Name:              name,
+			Homepage:          "https://" + strings.TrimRight(domain, "/"),
+			SignupURL:         "https://" + strings.TrimRight(domain, "/"),
+			APIURL:            nil,
+			CountriesSoldFrom: []string{"RU"},
+			Regions:           regionsFromRegionText(locations),
+			Payments:          payments,
+			MinPlan:           hostingMinPlan{CPU: 1, RAMMB: 1024, DiskGB: 10},
+			Notes:             []string{"ru-payment", locations, strength, evidence, notes},
+			Confidence:        russianPaymentConfidence(strength),
+		}
+		catalog.Providers = append(catalog.Providers, provider)
 	}
-	return os.ReadFile(source)
-}
-
-func readSourceOrLiteral(source string) ([]byte, error) {
-	source = strings.TrimSpace(source)
-	if raw, err := readSourceBytes(source); err == nil {
-		return raw, nil
-	} else if strings.HasPrefix(source, "https://") || strings.HasPrefix(source, "http://") {
-		return nil, err
+	if err := scanner.Err(); err != nil {
+		return hostingCatalog{}, err
 	}
-	return []byte(source), nil
-}
-
-func decodeBinaryPayload(raw []byte, want int) ([]byte, error) {
-	raw = bytesTrimSpace(raw)
-	if len(raw) == want {
-		return raw, nil
-	}
-	text := strings.TrimSpace(string(raw))
-	if decoded, err := base64.StdEncoding.DecodeString(text); err == nil && len(decoded) == want {
-		return decoded, nil
-	}
-	if decoded, err := base64.RawStdEncoding.DecodeString(text); err == nil && len(decoded) == want {
-		return decoded, nil
-	}
-	if decoded, err := base64.RawURLEncoding.DecodeString(text); err == nil && len(decoded) == want {
-		return decoded, nil
-	}
-	if decoded, err := hex.DecodeString(text); err == nil && len(decoded) == want {
-		return decoded, nil
-	}
-	return nil, fmt.Errorf("expected %d bytes, got %d bytes", want, len(raw))
-}
-
-func bytesTrimSpace(raw []byte) []byte {
-	return []byte(strings.TrimSpace(string(raw)))
-}
-
-func signedHostingCatalogPath() (string, error) {
-	dir, err := envdDataDir()
+	rawJSON, err := json.Marshal(catalog)
 	if err != nil {
-		return "", err
+		return hostingCatalog{}, err
 	}
-	return filepath.Join(dir, "hosting", "catalog.json"), nil
+	return parseHostingCatalog(rawJSON)
+}
+
+func splitProviderList(raw string) []string {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '/'
+	})
+	out := []string{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"unknown"}
+	}
+	return out
+}
+
+func russianPaymentConfidence(strength string) string {
+	strength = strings.ToLower(strength)
+	if strings.Contains(strength, "direct") || strings.Contains(strength, "off") {
+		return "verified"
+	}
+	if strings.Contains(strength, "strong") {
+		return "community"
+	}
+	return "unknown"
+}
+
+func providerIDFromNameDomain(name, domain string) string {
+	base := strings.ToLower(strings.TrimSpace(domain))
+	base = strings.TrimPrefix(base, "www.")
+	base = strings.Split(base, "/")[0]
+	for _, suffix := range []string{".com", ".net", ".org", ".io", ".eu", ".ru", ".su", ".cloud", ".hosting", ".digital", ".de", ".in", ".jp", ".ua", ".at", ".is", ".ch", ".au", ".br", ".co", ".uk"} {
+		base = strings.TrimSuffix(base, suffix)
+	}
+	if len(base) < 3 {
+		base = strings.ToLower(name)
+	}
+	id := regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(base, "-")
+	id = strings.Trim(id, "-")
+	id = readableNumericProviderID(id)
+	if id == "" || id[0] < 'a' || id[0] > 'z' {
+		id = "provider-" + id
+	}
+	if len(id) > 64 {
+		id = strings.Trim(id[:64], "-")
+	}
+	return id
+}
+
+func readableNumericProviderID(id string) string {
+	if id == "" || id[0] < '0' || id[0] > '9' {
+		return id
+	}
+	words := map[string]string{
+		"0":  "zero",
+		"1":  "one",
+		"2":  "two",
+		"4":  "four",
+		"23": "twenty-three",
+		"62": "sixty-two",
+	}
+	for digits, word := range words {
+		if id == digits {
+			return word
+		}
+		if strings.HasPrefix(id, digits) {
+			rest := strings.TrimPrefix(id, digits)
+			rest = strings.TrimLeft(rest, "-")
+			if rest == "" {
+				return word
+			}
+			return word + "-" + rest
+		}
+	}
+	return "n" + id
+}
+
+func countriesFromRegionText(text string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, code := range countryCodesFromRegionText(text) {
+		if !seen[code] {
+			seen[code] = true
+			out = append(out, code)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"unknown"}
+	}
+	return out
+}
+
+func regionsFromRegionText(text string) []hostingRegion {
+	codes := countriesFromRegionText(text)
+	regions := make([]hostingRegion, 0, len(codes))
+	for _, code := range codes {
+		regions = append(regions, hostingRegion{Code: strings.ToLower(code), Country: code, City: "", ASN: "unknown"})
+	}
+	return regions
+}
+
+func countryCodesFromRegionText(text string) []string {
+	lower := strings.ToLower(text)
+	codes := []string{}
+	add := func(code string) { codes = append(codes, code) }
+	if strings.Contains(lower, "global") {
+		add("global")
+	}
+	mapping := []struct {
+		needle string
+		code   string
+	}{
+		{"south africa", "ZA"}, {"latin america", "LATAM"}, {"united kingdom", "GB"},
+		{"europe", "EU"}, {"eu", "EU"}, {"germany", "DE"}, {"finland", "FI"}, {"netherlands", "NL"}, {"lithuania", "LT"},
+		{"switzerland", "CH"}, {"austria", "AT"}, {"france", "FR"}, {"poland", "PL"}, {"romania", "RO"}, {"moldova", "MD"},
+		{"bulgaria", "BG"}, {"latvia", "LV"}, {"italy", "IT"}, {"norway", "NO"}, {"sweden", "SE"}, {"iceland", "IS"},
+		{"uk", "GB"}, {"luxembourg", "LU"}, {"belgium", "BE"}, {"spain", "ES"}, {"us", "US"}, {"usa", "US"}, {"canada", "CA"},
+		{"australia", "AU"}, {"india", "IN"}, {"japan", "JP"}, {"korea", "KR"}, {"indonesia", "ID"}, {"singapore", "SG"},
+		{"malaysia", "MY"}, {"china", "CN"}, {"asia", "AS"}, {"africa", "AF"}, {"brazil", "BR"}, {"russia", "RU"},
+		{"cis", "CIS"}, {"ukraine", "UA"}, {"turkey", "TR"},
+	}
+	for _, item := range mapping {
+		if strings.Contains(lower, item.needle) {
+			add(item.code)
+		}
+	}
+	return codes
 }
 
 func parseHostingCatalog(raw []byte) (hostingCatalog, error) {
@@ -6784,24 +6929,53 @@ func mergeHostingCatalogs(base, overlay hostingCatalog) hostingCatalog {
 	return base
 }
 
+const (
+	hostingCheckConcurrency = 32
+	hostingCheckTimeout     = 3 * time.Second
+)
+
 func checkHostingProviders(providers []hostingProvider) []hostingCheckRecord {
-	checks := make([]hostingCheckRecord, 0, len(providers))
+	checks := make([]hostingCheckRecord, len(providers))
 	now := time.Now().UTC()
-	for _, p := range providers {
-		homepage := probeDirectURL(p.ID+" homepage", "hosting", p.Homepage, 8*time.Second)
-		api := internetProbeRecord{Name: p.ID + " api", Path: "hosting", Status: "skip", Detail: "no api_url"}
-		if p.APIURL != nil && *p.APIURL != "" {
-			api = probeDirectURL(p.ID+" api", "hosting", *p.APIURL, 8*time.Second)
-		}
-		checks = append(checks, hostingCheckRecord{
-			Time:      now,
-			Provider:  p.ID,
-			Homepage:  homepage,
-			API:       api,
-			Reachable: homepage.Status == "ok" || api.Status == "ok",
-		})
+	if len(providers) == 0 {
+		return checks
 	}
+	workers := hostingCheckConcurrency
+	if len(providers) < workers {
+		workers = len(providers)
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				checks[idx] = checkHostingProvider(providers[idx], now)
+			}
+		}()
+	}
+	for i := range providers {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
 	return checks
+}
+
+func checkHostingProvider(p hostingProvider, now time.Time) hostingCheckRecord {
+	homepage := probeDirectURL(p.ID+" homepage", "hosting", p.Homepage, hostingCheckTimeout)
+	api := internetProbeRecord{Name: p.ID + " api", Path: "hosting", Status: "skip", Detail: "no api_url"}
+	if p.APIURL != nil && *p.APIURL != "" {
+		api = probeDirectURL(p.ID+" api", "hosting", *p.APIURL, hostingCheckTimeout)
+	}
+	return hostingCheckRecord{
+		Time:      now,
+		Provider:  p.ID,
+		Homepage:  homepage,
+		API:       api,
+		Reachable: homepage.Status == "ok" || api.Status == "ok",
+	}
 }
 
 func recordHostingChecks(st *envdState, checks []hostingCheckRecord) {
@@ -6819,15 +6993,38 @@ func recordHostingChecks(st *envdState, checks []hostingCheckRecord) {
 	st.addEvent("hosting", "", fmt.Sprintf("checked %d providers; reachable %d", len(checks), ok))
 }
 
-func printHostingCheck(w io.Writer, checks []hostingCheckRecord) {
+func printHostingCheck(w io.Writer, checks []hostingCheckRecord, verbose bool) {
 	reachable := 0
+	failed := []hostingCheckRecord{}
 	for _, c := range checks {
 		if c.Reachable {
 			reachable++
+		} else {
+			failed = append(failed, c)
 		}
 	}
 	fmt.Fprintf(w, "Checked: %s\n", time.Now().UTC().Format(time.RFC3339))
-	fmt.Fprintf(w, "Reachable providers: %d/%d\n", reachable, len(checks))
+	fmt.Fprintf(w, "Reachable: %d/%d\n", reachable, len(checks))
+	fmt.Fprintf(w, "Failed or slow: %d/%d\n", len(failed), len(checks))
+	fmt.Fprintf(w, "Meaning: this is current website reachability from this network, not permanent provider quality.\n")
+	if !verbose {
+		if len(failed) > 0 {
+			fmt.Fprintf(w, "\nFailures sample:\n")
+			fmt.Fprintf(w, "%-18s %s\n", "PROVIDER", "DETAIL")
+			limit := 12
+			if len(failed) < limit {
+				limit = len(failed)
+			}
+			for _, c := range failed[:limit] {
+				fmt.Fprintf(w, "%-18s %s\n", c.Provider, compactField(c.Homepage.Detail, 96))
+			}
+			if len(failed) > limit {
+				fmt.Fprintf(w, "... %d more; run `envd hosting check --verbose` for all rows\n", len(failed)-limit)
+			}
+		}
+		return
+	}
+	fmt.Fprintf(w, "\nDetails:\n")
 	fmt.Fprintf(w, "%-18s %-8s %-8s %s\n", "PROVIDER", "WEB", "API", "DETAIL")
 	for _, c := range checks {
 		fmt.Fprintf(w, "%-18s %-8s %-8s %s\n", c.Provider, c.Homepage.Status, c.API.Status, c.Homepage.Detail)
@@ -6842,21 +7039,78 @@ func latestHostingChecks(st *envdState) map[string]hostingCheckRecord {
 	return out
 }
 
-func printHostingShortlist(w io.Writer, providers []hostingProvider, checks map[string]hostingCheckRecord) {
-	sortHostingProviders(providers, checks)
-	fmt.Fprintf(w, "%-18s %-10s %-12s %-9s %-18s %s\n", "PROVIDER", "REACH", "CONFIDENCE", "REGIONS", "PAYMENTS", "NOTES")
-	for _, p := range providers {
-		reach := "unknown"
-		if c, ok := checks[p.ID]; ok {
-			if c.Reachable {
-				reach = "ok"
-			} else {
-				reach = "fail"
-			}
-		}
-		fmt.Fprintf(w, "%-18s %-10s %-12s %-9d %-18s %s\n",
-			p.ID, reach, p.Confidence, len(p.Regions), strings.Join(p.Payments, ","), strings.Join(p.Notes, "; "))
+func hostingChecksByProvider(checks []hostingCheckRecord) map[string]hostingCheckRecord {
+	out := map[string]hostingCheckRecord{}
+	for _, check := range checks {
+		out[check.Provider] = check
 	}
+	return out
+}
+
+func printHostingList(w io.Writer, providers []hostingProvider, checks map[string]hostingCheckRecord, noteFn func(hostingProvider) string) {
+	sortHostingProviders(providers, checks)
+	fmt.Fprintf(w, "%-18s %-8s %-8s %s\n", "PROVIDER", "REACH", "SOURCE", "NOTE")
+	for _, p := range providers {
+		fmt.Fprintf(w, "%-18s %-8s %-8s %s\n", p.ID, hostingReachLabel(p.ID, checks), hostingSourceLabel(p.Confidence), compactField(noteFn(p), 58))
+	}
+}
+
+func hostingReachLabel(id string, checks map[string]hostingCheckRecord) string {
+	c, ok := checks[id]
+	if !ok {
+		return "unknown"
+	}
+	if c.Reachable {
+		return "ok"
+	}
+	return "fail"
+}
+
+func hostingSourceLabel(confidence string) string {
+	switch confidence {
+	case "verified":
+		return "direct"
+	case "community":
+		return "listed"
+	default:
+		return "weak"
+	}
+}
+
+func hostingGlobalNote(p hostingProvider) string {
+	if len(p.Notes) == 0 {
+		return p.Name
+	}
+	last := strings.TrimSpace(p.Notes[len(p.Notes)-1])
+	if last == "" {
+		return p.Name
+	}
+	return last
+}
+
+func hostingRussianNote(p hostingProvider) string {
+	location := ""
+	if len(p.Notes) > 1 {
+		location = strings.TrimSpace(p.Notes[1])
+	}
+	payments := strings.Join(p.Payments, ",")
+	if location == "" {
+		return payments
+	}
+	if payments == "" || payments == "unknown" {
+		return location
+	}
+	return location + "; " + payments
+}
+
+func compactField(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	if limit <= 1 {
+		return s[:limit]
+	}
+	return strings.TrimSpace(s[:limit-3]) + "..."
 }
 
 func sortHostingProviders(providers []hostingProvider, checks map[string]hostingCheckRecord) {

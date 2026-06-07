@@ -5,7 +5,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
-	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -2951,60 +2950,64 @@ func TestParseHostingCatalog(t *testing.T) {
 	}
 }
 
-func TestVerifySignedHostingCatalog(t *testing.T) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+func TestBuiltInHostingProviderTable(t *testing.T) {
+	catalog, err := parseBuiltInHostingProvidersTSV(builtInHostingProvidersTSV)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("built-in hosting provider table invalid: %v", err)
 	}
-	raw := []byte(`{"version":1,"providers":[{"id":"signed","name":"Signed Provider","homepage":"https://provider.example","regions":[{"code":"ams","country":"NL"}],"confidence":"verified"}]}`)
-	sig := ed25519.Sign(priv, raw)
-
-	catalog, err := verifySignedHostingCatalog(raw, sig, pub)
-	if err != nil {
-		t.Fatalf("verify failed: %v", err)
+	if len(catalog.Providers) < 240 {
+		t.Fatalf("provider table too small: %d", len(catalog.Providers))
 	}
-	if len(catalog.Providers) != 1 || catalog.Providers[0].ID != "signed" {
-		t.Fatalf("unexpected catalog: %+v", catalog)
+	ids := map[string]bool{}
+	for _, p := range catalog.Providers {
+		ids[p.ID] = true
 	}
-	raw[10] = '2'
-	if _, err := verifySignedHostingCatalog(raw, sig, pub); err == nil {
-		t.Fatal("tampered catalog passed signature verification")
+	for _, id := range []string{"aws-amazon", "lightsail-aws-amazon", "vultr", "clouding", "racknerd", "donweb"} {
+		if !ids[id] {
+			t.Fatalf("provider table missing %s", id)
+		}
 	}
 }
 
-func TestRunHostingUpdateStoresVerifiedCatalog(t *testing.T) {
-	dataDir := t.TempDir()
-	t.Setenv("ENVD_DATA_DIR", dataDir)
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+func TestRussianPaymentHostingProviderTable(t *testing.T) {
+	catalog, err := parseRussianPaymentHostingProvidersTSV(builtInRussianPaymentProvidersTSV)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Russian-payment hosting provider table invalid: %v", err)
 	}
-	raw := []byte(`{"version":1,"providers":[{"id":"signed","name":"Signed Provider","homepage":"https://provider.example","regions":[{"code":"ams","country":"NL"}],"confidence":"verified"}]}`)
-	catalogPath := filepath.Join(t.TempDir(), "catalog.json")
-	if err := os.WriteFile(catalogPath, raw, 0o600); err != nil {
-		t.Fatal(err)
+	if len(catalog.Providers) < 75 {
+		t.Fatalf("Russian-payment provider table too small: %d", len(catalog.Providers))
 	}
-	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, raw))
-	key := base64.StdEncoding.EncodeToString(pub)
-	st := envdState{}
-	var out bytes.Buffer
-	a := app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}
+	ids := map[string]hostingProvider{}
+	for _, p := range catalog.Providers {
+		ids[p.ID] = p
+	}
+	for _, id := range []string{"timeweb", "hostkey", "ruvds", "vdsina", "litnets", "four-vps", "neironvps", "reg"} {
+		if _, ok := ids[id]; !ok {
+			t.Fatalf("Russian-payment provider table missing %s", id)
+		}
+	}
+	if got := ids["timeweb"].Confidence; got != "verified" {
+		t.Fatalf("timeweb confidence = %q", got)
+	}
+	if got := ids["litnets"].CountriesSoldFrom; len(got) != 1 || got[0] != "RU" {
+		t.Fatalf("litnets countries sold from = %+v", got)
+	}
+}
 
-	if err := a.runHostingUpdate([]string{"--url", catalogPath, "--sig", sig, "--key", key}, &st); err != nil {
-		t.Fatalf("hosting update failed: %v", err)
+func TestPrintHostingCheckConciseAndVerbose(t *testing.T) {
+	checks := []hostingCheckRecord{
+		{Provider: "ok", Homepage: internetProbeRecord{Status: "ok", Detail: "HTTP 200"}, API: internetProbeRecord{Status: "skip", Detail: "no api_url"}, Reachable: true},
+		{Provider: "slow", Homepage: internetProbeRecord{Status: "fail", Detail: "context deadline exceeded"}, API: internetProbeRecord{Status: "skip", Detail: "no api_url"}, Reachable: false},
 	}
-	if !strings.Contains(out.String(), "Providers: 1") {
-		t.Fatalf("unexpected output: %q", out.String())
+	var concise bytes.Buffer
+	printHostingCheck(&concise, checks, false)
+	if got := concise.String(); !strings.Contains(got, "Reachable: 1/2") || !strings.Contains(got, "Failures sample") || strings.Contains(got, "Details:") {
+		t.Fatalf("unexpected concise output: %q", got)
 	}
-	loaded, err := a.loadHostingCatalog()
-	if err != nil {
-		t.Fatalf("load updated catalog failed: %v", err)
-	}
-	if len(loaded.Providers) != 1 || loaded.Providers[0].ID != "signed" {
-		t.Fatalf("updated catalog was not used: %+v", loaded)
-	}
-	if len(st.Events) != 1 || !strings.Contains(st.Events[0].Message, "updated signed catalog") {
-		t.Fatalf("missing update event: %+v", st.Events)
+	var verbose bytes.Buffer
+	printHostingCheck(&verbose, checks, true)
+	if got := verbose.String(); !strings.Contains(got, "Details:") || !strings.Contains(got, "slow") {
+		t.Fatalf("unexpected verbose output: %q", got)
 	}
 }
 

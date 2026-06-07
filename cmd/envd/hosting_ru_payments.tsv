@@ -1,0 +1,82 @@
+# name	domain	non_russian_locations	payments	verification_strength	evidence	notes
+Timeweb Cloud	timeweb.cloud	Europe, Asia, Russia, Poland, Netherlands, Kazakhstan	Russian bank cards, YooMoney, SberPay, cards, SBP	Strong: RBC + OFF	RBC / timeweb.cloud	Strong RU-payment plus foreign VPS location match
+HOSTKEY	hostkey.ru	Europe, USA, Turkey	Mir, rubles, Russian payment systems	Strong: OFF	hostkey.ru	Strong RU-payment plus foreign VPS location match
+RUVDS	ruvds.com	UK, Switzerland, Germany, Netherlands, Kazakhstan, Turkey, Armenia, Belarus	Mir, SBP, Russian payment methods	Strong	RUVDS	Strong RU-payment plus foreign VPS location match
+Fornex	fornex.com	Germany, Netherlands, USA, Switzerland, Spain	Visa, Mastercard, Mir, SBP, PayPal	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+VDSina	vdsina.ru	Netherlands	Visa, Mastercard, Mir, crypto, SBP, YooMoney, SberPay	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+Beget	beget.com	Latvia, Kazakhstan	Bank cards, YooMoney, SBP, bank transfer	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+Webhost1	webhost1.ru	Moldova, Israel, USA, Netherlands, Hong Kong, France, Armenia, Turkey, Germany	Visa, Mastercard, Mir, UnionPay, SBP, SberPay, YooMoney	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+AdminVPS	adminvps.ru	Germany, Netherlands, Belarus, Kazakhstan, Finland	Russian Visa, Mastercard, Maestro, Mir, YooMoney, SBP	Strong: OFF + RBC	AdminVPS / RBC	Strong RU-payment plus foreign VPS location match
+Cloud4box	cloud4box.com	Finland, Netherlands, Germany, Greece, Italy, Czechia, Latvia, Canada, UK, Turkey, Israel, Armenia, France, Hong Kong, USA, Kazakhstan, Japan, Poland, Spain, Switzerland	Visa, Mastercard, Mir, SBP, YooMoney, cards	Strong: RBC + OFF	RBC / Cloud4box	Strong RU-payment plus foreign VPS location match
+PQ.Hosting	pq.hosting	Netherlands, UK, Germany, Hong Kong, Israel, Canada, USA, Turkey, Poland, Finland, Japan, Korea	Visa, Mastercard, Mir, crypto, bank transfer, SBP, mobile payment	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+FirstVDS	firstvds.ru	Netherlands, Amsterdam	Visa, Mastercard, Mir, SberPay, Sberbank Online, SBP, YooMoney	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+SmartApe	smartape.ru	Czechia	Visa, Mastercard, Mir, UnionPay, SBP, bank transfer, YooMoney	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+McHost	mchost.ru	Netherlands, Europe	Visa, Mastercard, Mir, SBP, YooMoney, WebMoney	Strong: RBC	RBC	Also known as Makhost; strong RU-payment plus foreign VPS location match
+Handyhost	handyhost.ru	Finland	Mir, Visa, Mastercard, UnionPay, SBP, WebMoney, bank transfer	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+1cloud	1cloud.ru	Kazakhstan, Belarus	Visa, Mastercard, Maestro, Mir	Strong: RBC	RBC	Strong RU-payment plus non-RU regional VPS location match
+Serverspace	serverspace.io	Netherlands, USA, Kazakhstan, Canada, Turkey, UAE, Brazil	Visa, Mastercard, Mir, SBP, crypto, invoice payment	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+Eurobyte	eurobyte.ru	Netherlands	Mir, Visa, Mastercard, UnionPay, Belkart, YooMoney, SBP, Perfect Money	Strong: RBC	RBC	Also known as Evrobyte; strong RU-payment plus foreign VPS location match
+ProfitServer	profitserver.ru	Netherlands, UK, Poland, Germany, Hong Kong, Singapore, Spain, USA, Bulgaria, Switzerland, Latvia, Czechia, Italy, Canada, Israel, Kazakhstan, Sweden, Turkey	Visa, Mastercard, Mir, WebMoney, SBP	Strong: RBC	RBC	Strong RU-payment plus broad foreign VPS locations
+FirstByte	firstbyte.ru	Finland, Netherlands, Germany, France, Spain, Bulgaria, USA, Singapore	Visa, Mastercard, Mir, UnionPay, electronic money, internet bank	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+King Servers	kingservers.com	Netherlands, USA	Visa, Mastercard, Mir, YooMoney	Strong: RBC	RBC	Strong RU-payment plus foreign VPS location match
+Majordomo	majordomo.ru	Europe	Visa, Mastercard, Mir, SBP, YooMoney, bank transfer	Strong: RBC	RBC	Strong RU-payment plus Europe VPS location match
+IHC	ihc.ru	Europe	Mir	Strong: OFF	ihc.ru	Internet Hosting Center; official Mir payment evidence
+RuWeb	ruweb.net	Europe, foreign VPS	Ruble payment, bank cards, SBP, WebMoney	Strong direct/secondary	RuWeb	RU-payment plus foreign VPS candidate
+Litnets	litnets.com	Netherlands, Spain, Madrid	Mir, SBP, YooMoney, Visa, crypto, ruble payment	Strong direct/secondary	Litnets	RU-payment plus foreign VPS candidate
+4VPS	4vps.su	Australia, Austria, Belgium, Brazil, UK, Ireland, Spain, Canada, Netherlands, Portugal, USA, Croatia, Korea, Japan	Mir, SBP, crypto	Strong directory	PoiskVPS / DTF / VC	Directory-backed RU-payment plus broad foreign VPS locations
+Aeza	aeza.net	USA, Austria, Finland, France, Germany, Netherlands, Russia, Sweden, UK	SBP, Mir, Russian payment methods	Medium-strong: VPT/RU	VPT / RU rankings	Verify exact checkout before relying on it
+ISHosting	ishosting.com	40+ countries worldwide	SBP, crypto, Mir	Medium-strong: VPT/RU	VPT / RU rankings	Also known as is*hosting; verify exact checkout before relying on it
+UFO Hosting	ufo.hosting	Armenia, UK, Germany, Hong Kong, India, Kazakhstan, Netherlands, Serbia, USA, Turkey, Finland, France, Korea	Mir, ruble payment	Medium-strong: RU-DIR	PoiskVPS	Directory-backed RU-payment plus foreign VPS locations
+eServer	eserver.ru	Hong Kong, Serbia, Montenegro	Mir	Medium-strong: RU-DIR	PoiskVPS / VPS.today	Directory-backed RU-payment candidate
+Neiron VPS	neironvps.com	Germany, USA, Switzerland	Mir	Medium-strong: RU-DIR	PoiskVPS	Directory-backed RU-payment plus foreign VPS locations
+IT-garage	it-garage.ru	Germany	Mir	Medium: RU-DIR	VPS.today	Directory-backed RU-payment plus Germany location
+Senko Digital	senko.digital	Germany	Mir	Medium: RU-DIR	VPS.today	Directory-backed RU-payment plus Germany location
+62yun	62yun.com	USA, California	Mir	Medium: RU-DIR	VPS.today	Directory-backed RU-payment plus USA location
+Koara Cloud	koara.cloud	Germany	Mir	Medium: RU-DIR	VPS.today	Directory-backed RU-payment plus Germany location
+HostVDS	hostvds.com	USA, Hong Kong	Mir	Medium: RU-DIR	HostingHub	Directory-backed RU-payment plus foreign VPS locations
+HostingRU	hostingru.net	Germany, USA, Netherlands, UK	Mir	Medium: RU-DIR	HostingHub	Directory-backed RU-payment plus foreign VPS locations
+Datacheap	datacheap.ru	Netherlands, Czechia	Mir	Medium: RU-DIR	HostingHub	Directory-backed RU-payment plus foreign VPS locations
+EuroHoster	eurohoster.org	Bulgaria, Netherlands, USA	Mir	Medium: RU-DIR	PoiskVPS	Directory-backed RU-payment plus foreign VPS locations
+JustHost.ru	justhost.ru	Many foreign locations reported in rankings	Russian cards, ruble-friendly payment	Medium / verify checkout	RU rankings	Verify foreign location and checkout before relying on it
+U1 HOST	u1host.ru	Foreign VPS listed in rankings	Cards RF, SBP, crypto	Medium / verify checkout	RU rankings	Verify foreign location and checkout before relying on it
+VDSka	vdska.ru	Foreign status varies	Mir, Russian payment methods	Medium-low / verify foreign location	RU-DIR	Verify foreign location before relying on it
+SprintHost	sprinthost.ru	Foreign location unclear	Cards, SBP, YooMoney, QIWI, bank transfer, Mir	Medium-low / verify foreign location	RU rankings	Useful RU-payment mapping; foreign VPS unclear
+FastFox	fastfox.pro	Foreign location unclear	Bank cards, e-wallets, bank transfer	Medium-low / verify foreign location	fastfox.pro	Useful RU-payment mapping; foreign VPS unclear
+BAcloud	bacloud.com	Lithuania, Netherlands, USA	Russian-card friendly in older lists	Lower / verify checkout	Older RU-friendly lists	Verify checkout before relying on it
+AlexHost	alexhost.com	Moldova, Netherlands, EU, UK, USA	Russian-language/offshore-oriented payments	Lower-medium	Market evidence	Verify Russian-card checkout before relying on it
+BlueAngelHost	blueangel.host	EU, offshore	Russian-speaking/offshore market payments	Lower-medium	Market evidence	Verify Russian-card checkout before relying on it
+AbeloHost	abelohost.com	Netherlands	Payment must be checked	Lower-medium	Market evidence	Foreign VPS candidate; Russian-card checkout unclear
+FlokiNET	flokinet.is	Iceland, Romania, Finland	Payment must be checked	Lower-medium	Market evidence	Offshore VPS candidate; Russian-card checkout unclear
+OrangeWebsite	orangewebsite.com	Iceland	Payment must be checked	Lower-medium	Market evidence	Offshore VPS candidate; Russian-card checkout unclear
+HayHost	hayhost.am	Armenia, non-RU	Mir listed in prior lookup	Medium	HayHost / prior lookup	VPS product and checkout must be verified
+LandVPS	landvps.ru	Russia / unclear	Mir	Medium-low / Russia-only or unclear	VPS.today / PoiskVPS	RU/MIR payment market mapping; foreign VPS not confirmed
+KVMka	kvmka.ru	Russia / unclear	Mir	Medium-low / Russia-only or unclear	VPS.today / PoiskVPS	RU/MIR payment market mapping; foreign VPS not confirmed
+Macloud	macloud.ru	Russia / unclear	Mir	Medium-low / Russia-only or unclear	VPS.today / PoiskVPS	RU/MIR payment market mapping; foreign VPS not confirmed
+Mnogoweb	mnogoweb.ru	Russia	Mir	Medium-low / Russia-only	VPS.today	RU/MIR payment market mapping; foreign VPS not confirmed
+Ihor	ihor.ru	Russia / older Finland mention	Mir, Russian cards	Medium-low / Russia-only or unclear	VPS.today / PoiskVPS / older sources	RU/MIR payment market mapping; foreign VPS not confirmed
+SIMPLE CLOUD	simplecloud.ru	Russia	Mir	Medium-low / Russia-only	VPS.today	RU/MIR payment market mapping; foreign VPS not confirmed
+ServTech	serv-tech.ru	Russia	Mir	Medium-low / Russia-only	VPS.today	RU/MIR payment market mapping; foreign VPS not confirmed
+RoboVPS	robovps.biz	Russia / older Germany mention	Mir, Russian cards	Medium-low / Russia-only or unclear	VPS.today / older sources	RU/MIR payment market mapping; foreign VPS not confirmed
+MyVPS	myvps.ru	Russia	Mir	Medium-low / Russia-only	VPS.today	RU/MIR payment market mapping; foreign VPS not confirmed
+LITE.HOST	lite.host	Russia	Mir	Medium-low / Russia-only	VPS.today	RU/MIR payment market mapping; foreign VPS not confirmed
+Time-Host	time-host.net	Russia	Mir	Medium-low / Russia-only	PoiskVPS	RU/MIR payment market mapping; foreign VPS not confirmed
+Serv.Host	serv.host	Russia	Mir	Medium-low / Russia-only	PoiskVPS	RU/MIR payment market mapping; foreign VPS not confirmed
+VDS4YOU	vds4you.ru	Russia	Mir	Medium-low / Russia-only	HostingHub	RU/MIR payment market mapping; foreign VPS not confirmed
+PlanetaHost	planetahost.ru	Russia	Mir	Medium-low / Russia-only	HostingHub	RU/MIR payment market mapping; foreign VPS not confirmed
+2domains	2domains.ru	Russia	Mir	Medium-low / Russia-only	HostingHub	RU/MIR payment market mapping; foreign VPS not confirmed
+ConfLead	conflead.com	Unclear	Mir	Medium-low / unclear	HostingHub	RU/MIR payment market mapping; foreign VPS unclear
+Sprintbox	sprintbox.ru	Russia	Mir	Medium-low / Russia-only	HostingHub	RU/MIR payment market mapping; foreign VPS not confirmed
+CloudLITE	cloudlite.ru	Russia	Mir	Medium-low / Russia-only	HostingHub	RU/MIR payment market mapping; foreign VPS not confirmed
+Hoster.ru	hoster.ru	Russia	Mir	Medium-low / Russia-only	HostingHub	RU/MIR payment market mapping; foreign VPS not confirmed
+Inoventica	inoventica.ru	Russia	Mir	Medium-low / Russia-only	HostingHub	RU/MIR payment market mapping; foreign VPS not confirmed
+RocketCloud	rocketcloud.ru	Russia	Mir	Medium-low / Russia-only	HostingHub	RU/MIR payment market mapping; foreign VPS not confirmed
+HOSTORA.RU	hostora.ru	Russia	Mir	Medium-low / Russia-only	HostingHub	RU/MIR payment market mapping; foreign VPS not confirmed
+Cpanelhosting	cpanelhosting.ru	Russia	Mir	Medium-low / Russia-only	HostingHub	RU/MIR payment market mapping; foreign VPS not confirmed
+REG.RU	reg.ru	Russia	Mir, Russian payment methods	Medium-low / Russia-focused	Market evidence	Major Russian host/cloud provider; foreign VPS not confirmed
+Selectel	selectel.ru	Russia	Mir, Russian payment methods	Medium-low / Russia-focused	Market evidence	Major Russian cloud provider; foreign VPS not main focus
+SpaceWeb	sweb.ru	Russia	Mir, Russian payment methods	Medium-low / unclear	Market evidence	Russian hosting/VPS provider; foreign VPS unclear
+NetAngels	netangels.ru	Russia	Mir, Russian payment methods	Medium-low / unclear	Market evidence	Russian hosting/cloud provider; foreign VPS unclear
+HostLand	hostland.ru	Russia	Mir, Russian payment methods	Medium-low / unclear	Market evidence	Russian hosting/VPS provider; foreign VPS unclear
+ISPserver	ispserver.com	Russia / unclear	Mir, Russian payment methods	Medium-low / unclear	Market evidence	Russian hosting/VPS provider; foreign VPS unclear
+Fozzy	fozzy.com	Russia / global unclear	Mir, Russian payment methods	Medium-low / unclear	Market evidence	Russian/hosting market provider; foreign VPS unclear
+Hosting.com.ru	hosting.com.ru	Russia	Mir, Russian payment methods	Medium-low / unclear	Market evidence	RU hosting provider; foreign VPS unclear
