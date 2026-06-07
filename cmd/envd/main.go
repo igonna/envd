@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -359,6 +360,11 @@ func (a app) run(args []string) error {
 			return a.printCommandHelp([]string{"vscode-extensions"})
 		}
 		return a.runVSCodeExtensions(args[1:])
+	case "vscode":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"vscode"})
+		}
+		return a.runVSCode(args[1:])
 	case "network":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"network"})
@@ -953,6 +959,7 @@ Environment:
   details              show environment details
   stop                 stop an environment
   rm                   remove an environment
+  vscode               apply minimal VS Code settings
   vscode-extensions    lock/unlock remote VS Code extensions
 
 Gateway:
@@ -1029,6 +1036,8 @@ Next command: envd init
 		fmt.Fprint(a.stdout, "Usage: envd rm ENV --yes\n")
 	case "vscode-extensions":
 		a.printVSCodeExtensionsHelp()
+	case "vscode":
+		a.printVSCodeHelp()
 	case "lock":
 		fmt.Fprint(a.stdout, "Usage: envd lock\n\nStops envd-managed workloads, hides envd SSH targets, and clears cached unlock.\n")
 	case "doctor":
@@ -2541,6 +2550,19 @@ Default:
 `)
 }
 
+func (a app) printVSCodeHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd vscode setup
+
+Effect:
+  applies minimal VS Code user settings
+  keeps existing unrelated settings
+  writes a .bak backup before changing settings
+  installs Remote SSH when the code CLI is available
+
+`)
+}
+
 func (a app) printHostingHelp() {
 	fmt.Fprint(a.stdout, `Usage:
   envd hosting COMMAND [args]
@@ -2837,6 +2859,213 @@ func (a app) runVSCodeExtensions(args []string) error {
 	default:
 		return fmt.Errorf("usage: envd vscode-extensions lock|unlock ENV")
 	}
+}
+
+func (a app) runVSCode(args []string) error {
+	if len(args) != 1 || args[0] != "setup" {
+		return fmt.Errorf("usage: envd vscode setup")
+	}
+	settingsPath, err := vscodeUserSettingsPath()
+	if err != nil {
+		return err
+	}
+	changed, backup, err := applyMinimalVSCodeSettings(settingsPath)
+	if err != nil {
+		return err
+	}
+	if changed {
+		fmt.Fprintln(a.stdout, "VS Code: minimal settings applied")
+		if backup != "" {
+			fmt.Fprintf(a.stdout, "Backup:  %s\n", backup)
+		}
+	} else {
+		fmt.Fprintln(a.stdout, "VS Code: already minimal")
+	}
+	fmt.Fprintf(a.stdout, "Settings: %s\n", settingsPath)
+	if err := installVSCodeRemoteSSH(); err != nil {
+		fmt.Fprintf(a.stdout, "Remote SSH: skipped (%s)\n", redactSensitive(err.Error()))
+	} else {
+		fmt.Fprintln(a.stdout, "Remote SSH: installed")
+	}
+	return nil
+}
+
+func vscodeUserSettingsPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support", "Code", "User", "settings.json"), nil
+	case "linux":
+		configHome := os.Getenv("XDG_CONFIG_HOME")
+		if configHome == "" {
+			configHome = filepath.Join(home, ".config")
+		}
+		return filepath.Join(configHome, "Code", "User", "settings.json"), nil
+	default:
+		return "", fmt.Errorf("envd vscode setup is not supported on %s", runtime.GOOS)
+	}
+}
+
+func applyMinimalVSCodeSettings(path string) (bool, string, error) {
+	settings := map[string]any{}
+	if raw, err := os.ReadFile(path); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(normalizeJSONC(raw), &settings); err != nil {
+			return false, "", fmt.Errorf("cannot parse VS Code settings: %w", err)
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, "", err
+	}
+	changed := false
+	for key, value := range minimalVSCodeSettings() {
+		if !reflect.DeepEqual(settings[key], value) {
+			settings[key] = value
+			changed = true
+		}
+	}
+	if !changed {
+		return false, "", nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return false, "", err
+	}
+	backup := ""
+	if raw, err := os.ReadFile(path); err == nil {
+		backup = path + ".bak"
+		if _, statErr := os.Stat(backup); errors.Is(statErr, os.ErrNotExist) {
+			if err := os.WriteFile(backup, raw, 0o600); err != nil {
+				return false, "", err
+			}
+		}
+	}
+	raw, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return false, "", err
+	}
+	return true, backup, os.WriteFile(path, append(raw, '\n'), 0o600)
+}
+
+func normalizeJSONC(raw []byte) []byte {
+	withoutComments := stripJSONComments(raw)
+	return stripJSONTrailingCommas(withoutComments)
+}
+
+func stripJSONComments(raw []byte) []byte {
+	out := make([]byte, 0, len(raw))
+	inString := false
+	escaped := false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if inString {
+			out = append(out, c)
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			out = append(out, c)
+			continue
+		}
+		if c == '/' && i+1 < len(raw) && raw[i+1] == '/' {
+			i += 2
+			for i < len(raw) && raw[i] != '\n' && raw[i] != '\r' {
+				i++
+			}
+			if i < len(raw) {
+				out = append(out, raw[i])
+			}
+			continue
+		}
+		if c == '/' && i+1 < len(raw) && raw[i+1] == '*' {
+			i += 2
+			for i+1 < len(raw) && !(raw[i] == '*' && raw[i+1] == '/') {
+				i++
+			}
+			i++
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+func stripJSONTrailingCommas(raw []byte) []byte {
+	out := make([]byte, 0, len(raw))
+	inString := false
+	escaped := false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if inString {
+			out = append(out, c)
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			out = append(out, c)
+			continue
+		}
+		if c == ',' {
+			j := i + 1
+			for j < len(raw) && (raw[j] == ' ' || raw[j] == '\t' || raw[j] == '\n' || raw[j] == '\r') {
+				j++
+			}
+			if j < len(raw) && (raw[j] == '}' || raw[j] == ']') {
+				continue
+			}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+func minimalVSCodeSettings() map[string]any {
+	return map[string]any{
+		"workbench.statusBar.visible":            false,
+		"window.commandCenter":                   false,
+		"workbench.layoutControl.enabled":        false,
+		"workbench.startupEditor":                "none",
+		"workbench.activityBar.location":         "top",
+		"terminal.integrated.initialHint":        false,
+		"editor.minimap.enabled":                 false,
+		"editor.stickyScroll.enabled":            false,
+		"workbench.editor.showTabs":              "none",
+		"workbench.editor.editorActionsLocation": "hidden",
+		"window.title":                           " ",
+		"window.titleSeparator":                  " ",
+		"breadcrumbs.enabled":                    false,
+		"chat.disableAIFeatures":                 true,
+		"extensions.ignoreRecommendations":       true,
+		"workbench.colorTheme":                   "Dark Modern",
+		"update.mode":                            "manual",
+		"git.openRepositoryInParentFolders":      "never",
+	}
+}
+
+func installVSCodeRemoteSSH() error {
+	code, err := exec.LookPath("code")
+	if err != nil {
+		return fmt.Errorf("code CLI not found")
+	}
+	cmd := exec.Command(code, "--install-extension", "ms-vscode-remote.remote-ssh")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func (a app) runEnv(args []string, st *envdState) error {

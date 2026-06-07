@@ -366,6 +366,53 @@ func TestWriteFileIfChangedReportsChanges(t *testing.T) {
 	}
 }
 
+func TestApplyMinimalVSCodeSettingsMergesAndBacksUp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	original := []byte(`{
+	// VS Code user settings are JSONC.
+	"custom.keep": true,
+	"window.title": "old",
+}`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changed, backup, err := applyMinimalVSCodeSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || backup == "" {
+		t.Fatalf("expected changed with backup, changed=%v backup=%q", changed, backup)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings["custom.keep"] != true {
+		t.Fatalf("custom setting was not preserved: %+v", settings)
+	}
+	if settings["window.title"] != " " || settings["workbench.statusBar.visible"] != false {
+		t.Fatalf("minimal settings were not applied: %+v", settings)
+	}
+	backupRaw, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(backupRaw) != string(original) {
+		t.Fatalf("backup mismatch: %q", string(backupRaw))
+	}
+	changed, _, err = applyMinimalVSCodeSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("second apply should be unchanged")
+	}
+}
+
 func TestSeedBrowserProfileDoesNotWriteProtectedSearchPrefs(t *testing.T) {
 	profile := t.TempDir()
 	defaultDir := filepath.Join(profile, "Default")
