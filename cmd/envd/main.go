@@ -1493,6 +1493,7 @@ func (a app) runBrowserInstall(force bool) error {
 		_ = os.RemoveAll(inst.BrowserDir)
 	}
 	_ = os.RemoveAll(filepath.Join(inst.Root, "extensions", "vhrome-new-tab"))
+	_ = os.RemoveAll(filepath.Join(inst.Root, "extensions", "blank-new-tab-page"))
 	if _, err := os.Stat(inst.Executable); errors.Is(err, os.ErrNotExist) {
 		revision, err := installChromiumSnapshot(inst)
 		if err != nil {
@@ -1513,6 +1514,9 @@ func (a app) runBrowserInstall(force bool) error {
 	}
 	if err := installChromiumWebStore(inst); err != nil {
 		fmt.Fprintf(a.stderr, "WARN: Chromium Web Store install failed: %s\n", redactSensitive(err.Error()))
+	}
+	if err := installBrowserNewTabPage(inst); err != nil {
+		return err
 	}
 	if err := installVhromeLauncher(inst); err != nil {
 		return err
@@ -1716,12 +1720,18 @@ func browserLaunchFlags(profileDir, socksProxy string) []string {
 		"--disable-background-networking",
 		"--disable-sync",
 		"--disable-features=OptimizationHints,MediaRouter,TabSearch,AvatarToolbarButton,ExtensionsToolbarMenu,SidePanelPinning",
+		"--force-dark-mode",
 		"--use-mock-keychain",
 		"--no-first-run",
 		"--no-default-browser-check",
+		"--custom-ntp=" + fileURL(browserNewTabPagePath(filepath.Dir(profileDir))),
 	}
 	if extensionDirs := browserExtensionDirsForProfile(profileDir); len(extensionDirs) > 0 {
-		flags = append(flags, "--load-extension="+strings.Join(extensionDirs, ","))
+		extensionList := strings.Join(extensionDirs, ",")
+		flags = append(flags,
+			"--disable-extensions-except="+extensionList,
+			"--load-extension="+extensionList,
+		)
 	}
 	return flags
 }
@@ -1963,6 +1973,59 @@ func installChromiumWebStore(inst browserInstall) error {
 	return nil
 }
 
+func installBrowserNewTabPage(inst browserInstall) error {
+	dir := browserNewTabPageDir(inst.Root)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	html := `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#3c3c3c">
+  <link rel="icon" href="empty.png">
+  <title>New Tab</title>
+  <style>
+    html {
+      color-scheme: light dark;
+      background: #f1f3f4;
+    }
+    @media (prefers-color-scheme: dark) {
+      html {
+        background: #3c3c3c;
+      }
+    }
+    body {
+      margin: 0;
+      min-height: 100%;
+      background: inherit;
+    }
+  </style>
+</head>
+<body></body>
+</html>
+`
+	if err := os.WriteFile(filepath.Join(dir, "newtab.html"), []byte(html), 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "empty.png"), transparentPNG(), 0o600)
+}
+
+func transparentPNG() []byte {
+	return []byte{
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+		0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+		0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+		0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41,
+		0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+		0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+		0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+		0x42, 0x60, 0x82,
+	}
+}
+
 func crxToZip(crxPath, zipPath string) error {
 	raw, err := os.ReadFile(crxPath)
 	if err != nil {
@@ -2025,6 +2088,18 @@ func browserExtensionDirsForProfile(profileDir string) []string {
 
 func chromiumWebStoreExtensionDir(root string) string {
 	return filepath.Join(root, "extensions", "chromium-web-store")
+}
+
+func browserNewTabPageDir(root string) string {
+	return filepath.Join(root, "newtab")
+}
+
+func browserNewTabPagePath(root string) string {
+	return filepath.Join(browserNewTabPageDir(root), "newtab.html")
+}
+
+func fileURL(path string) string {
+	return (&url.URL{Scheme: "file", Path: path}).String()
 }
 
 func downloadFile(path, rawURL string) error {
@@ -2134,6 +2209,7 @@ func seedBrowserLocalState(path string) error {
 	experiments["show-avatar-button@3"] = true
 	experiments["extensions-toolbar-menu@2"] = true
 	experiments["extension-mime-request-handling@2"] = true
+	experiments["custom-ntp"] = true
 	browser["enabled_labs_experiments"] = sortedKeys(experiments)
 	state["browser"] = browser
 	raw, err := json.MarshalIndent(state, "", "  ")
@@ -2156,9 +2232,12 @@ func seedBrowserPreferences(path string) error {
 		ntp = map[string]any{}
 	}
 	ntp["shortcust_visible"] = false
+	ntp["custom_links_visible"] = false
+	ntp["enterprise_shortcuts_visible"] = false
 	ntp["use_most_visited_tiles"] = false
 	ntp["num_personal_suggestions"] = 0
 	ntp["shortcuts_auto_removal_disabled"] = true
+	ntp["shortcuts_type"] = 0
 	prefs["ntp"] = ntp
 	customLinks, _ := prefs["custom_links"].(map[string]any)
 	if customLinks == nil {

@@ -342,12 +342,16 @@ func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
 		"--disable-quic",
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--disable-background-networking",
+		"--force-dark-mode",
 		"--use-mock-keychain",
 		"TabSearch",
 		"AvatarToolbarButton",
 		"ExtensionsToolbarMenu",
 		"ublock-origin-lite",
 		"chromium-web-store",
+		"--custom-ntp=" + fileURL(browserNewTabPagePath(filepath.Dir(profile))),
+		"--disable-extensions-except=",
+		"--load-extension=",
 	} {
 		if !strings.Contains(flags, want) {
 			t.Fatalf("browser flags missing %q:\n%s", want, flags)
@@ -355,6 +359,40 @@ func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
 	}
 	if strings.Contains(flags, "--host-resolver-rules") {
 		t.Fatalf("browser flags should not trigger Chromium unsupported flag warning:\n%s", flags)
+	}
+	if strings.Contains(flags, "chrome-extension://") {
+		t.Fatalf("browser flags should not directly open extension URLs:\n%s", flags)
+	}
+	if strings.Contains(flags, "vhrome-new-tab") || strings.Contains(flags, "blank-new-tab-page") {
+		t.Fatalf("browser flags should not allow stale Vhrome extensions:\n%s", flags)
+	}
+}
+
+func TestInstallBrowserNewTabPageIsLocalAndBlank(t *testing.T) {
+	root := t.TempDir()
+	inst := browserInstall{Root: root}
+	if err := installBrowserNewTabPage(inst); err != nil {
+		t.Fatal(err)
+	}
+	html, err := os.ReadFile(browserNewTabPagePath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(html), "#f1f3f4") || !strings.Contains(string(html), "#3c3c3c") {
+		t.Fatalf("blank new tab should use Chromium chrome-like colors:\n%s", html)
+	}
+	if !strings.Contains(string(html), `<meta name="theme-color" content="#3c3c3c">`) {
+		t.Fatalf("blank new tab should declare dark first-paint theme color:\n%s", html)
+	}
+	if !strings.Contains(string(html), `<link rel="icon" href="empty.png">`) {
+		t.Fatalf("blank new tab should use transparent favicon:\n%s", html)
+	}
+	icon, err := os.ReadFile(filepath.Join(browserNewTabPageDir(root), "empty.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(icon, []byte{0x89, 0x50, 0x4e, 0x47}) {
+		t.Fatalf("transparent icon should be a PNG, got %x", icon[:min(len(icon), 8)])
 	}
 }
 
@@ -457,6 +495,9 @@ func TestSeedBrowserProfileDoesNotWriteProtectedSearchPrefs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(profile, "Local State"), []byte(`{"browser":{"enabled_labs_experiments":["custom-ntp"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := seedBrowserProfile(profile); err != nil {
 		t.Fatal(err)
 	}
@@ -488,6 +529,9 @@ func TestSeedBrowserProfileDoesNotWriteProtectedSearchPrefs(t *testing.T) {
 	if !containsAnyString(experiments, "extension-mime-request-handling@2") {
 		t.Fatalf("missing extension MIME flag: %+v", experiments)
 	}
+	if !containsAnyString(experiments, "custom-ntp") {
+		t.Fatalf("missing custom NTP flag: %+v", experiments)
+	}
 	prefsRaw, err := os.ReadFile(filepath.Join(profile, "Default", "Preferences"))
 	if err != nil {
 		t.Fatal(err)
@@ -497,7 +541,7 @@ func TestSeedBrowserProfileDoesNotWriteProtectedSearchPrefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	ntp := prefs["ntp"].(map[string]any)
-	if ntp["shortcust_visible"] != false || ntp["use_most_visited_tiles"] != false || ntp["num_personal_suggestions"] != float64(0) {
+	if ntp["shortcust_visible"] != false || ntp["custom_links_visible"] != false || ntp["enterprise_shortcuts_visible"] != false || ntp["use_most_visited_tiles"] != false || ntp["num_personal_suggestions"] != float64(0) || ntp["shortcuts_type"] != float64(0) {
 		t.Fatalf("unexpected ntp prefs: %+v", ntp)
 	}
 	if prefs["default_search_provider_data"] != nil {
