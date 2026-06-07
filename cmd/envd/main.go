@@ -1425,6 +1425,7 @@ const (
 	vhromeName           = "Vhrome"
 	ublockOriginLiteID   = "ddkjiahejlhfcafbddmgiahcphecmpfh"
 	chromeWebStoreUpdate = "https://clients2.google.com/service/update2/crx"
+	chromiumWebStoreCRX  = "https://github.com/NeverDecaf/chromium-web-store/raw/master/Chromium%20Web%20Store.crx"
 	chromiumSnapshots    = "https://storage.googleapis.com/chromium-browser-snapshots"
 )
 
@@ -1509,6 +1510,9 @@ func (a app) runBrowserInstall(force bool) error {
 	}
 	if err := installUBlockLite(inst); err != nil {
 		fmt.Fprintf(a.stderr, "WARN: uBlock Origin Lite install failed: %s\n", redactSensitive(err.Error()))
+	}
+	if err := installChromiumWebStore(inst); err != nil {
+		fmt.Fprintf(a.stderr, "WARN: Chromium Web Store install failed: %s\n", redactSensitive(err.Error()))
 	}
 	if err := installVhromeLauncher(inst); err != nil {
 		return err
@@ -1716,8 +1720,8 @@ func browserLaunchFlags(profileDir, socksProxy string) []string {
 		"--no-first-run",
 		"--no-default-browser-check",
 	}
-	if extensionDir := browserExtensionDirForProfile(profileDir); dirHasManifest(extensionDir) {
-		flags = append(flags, "--load-extension="+extensionDir)
+	if extensionDirs := browserExtensionDirsForProfile(profileDir); len(extensionDirs) > 0 {
+		flags = append(flags, "--load-extension="+strings.Join(extensionDirs, ","))
 	}
 	return flags
 }
@@ -1934,6 +1938,31 @@ func installUBlockLite(inst browserInstall) error {
 	return nil
 }
 
+func installChromiumWebStore(inst browserInstall) error {
+	dir := chromiumWebStoreExtensionDir(inst.Root)
+	if dirHasManifest(dir) {
+		return nil
+	}
+	crxPath := filepath.Join(inst.Root, "chromium-web-store.crx")
+	if err := downloadFile(crxPath, chromiumWebStoreCRX); err != nil {
+		return err
+	}
+	defer os.Remove(crxPath)
+	zipPath := filepath.Join(inst.Root, "chromium-web-store.zip")
+	if err := crxToZip(crxPath, zipPath); err != nil {
+		return err
+	}
+	defer os.Remove(zipPath)
+	_ = os.RemoveAll(dir)
+	if err := unzipFile(zipPath, dir); err != nil {
+		return err
+	}
+	if !dirHasManifest(dir) {
+		return fmt.Errorf("Chromium Web Store unpacked without manifest")
+	}
+	return nil
+}
+
 func crxToZip(crxPath, zipPath string) error {
 	raw, err := os.ReadFile(crxPath)
 	if err != nil {
@@ -1977,6 +2006,25 @@ func dirHasManifest(dir string) bool {
 
 func browserExtensionDirForProfile(profileDir string) string {
 	return filepath.Join(filepath.Dir(profileDir), "extensions", "ublock-origin-lite")
+}
+
+func browserExtensionDirsForProfile(profileDir string) []string {
+	root := filepath.Dir(profileDir)
+	candidates := []string{
+		browserExtensionDirForProfile(profileDir),
+		chromiumWebStoreExtensionDir(root),
+	}
+	dirs := make([]string, 0, len(candidates))
+	for _, dir := range candidates {
+		if dirHasManifest(dir) {
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
+}
+
+func chromiumWebStoreExtensionDir(root string) string {
+	return filepath.Join(root, "extensions", "chromium-web-store")
 }
 
 func downloadFile(path, rawURL string) error {
@@ -2085,6 +2133,7 @@ func seedBrowserLocalState(path string) error {
 	experiments["remove-tabsearch-button"] = true
 	experiments["show-avatar-button@3"] = true
 	experiments["extensions-toolbar-menu@2"] = true
+	experiments["extension-mime-request-handling@2"] = true
 	browser["enabled_labs_experiments"] = sortedKeys(experiments)
 	state["browser"] = browser
 	raw, err := json.MarshalIndent(state, "", "  ")

@@ -328,6 +328,13 @@ func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(extensionDir, "manifest.json"), []byte(`{"manifest_version":3}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	webStoreDir := chromiumWebStoreExtensionDir(filepath.Dir(profile))
+	if err := os.MkdirAll(webStoreDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(webStoreDir, "manifest.json"), []byte(`{"manifest_version":3}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	flags := strings.Join(browserLaunchFlags(profile, "127.0.0.1:11080"), " ")
 	for _, want := range []string{
 		"--user-data-dir=" + profile,
@@ -340,6 +347,7 @@ func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
 		"AvatarToolbarButton",
 		"ExtensionsToolbarMenu",
 		"ublock-origin-lite",
+		"chromium-web-store",
 	} {
 		if !strings.Contains(flags, want) {
 			t.Fatalf("browser flags missing %q:\n%s", want, flags)
@@ -476,6 +484,9 @@ func TestSeedBrowserProfileDoesNotWriteProtectedSearchPrefs(t *testing.T) {
 	}
 	if !containsAnyString(experiments, "extensions-toolbar-menu@2") {
 		t.Fatalf("missing extensions toolbar flag: %+v", experiments)
+	}
+	if !containsAnyString(experiments, "extension-mime-request-handling@2") {
+		t.Fatalf("missing extension MIME flag: %+v", experiments)
 	}
 	prefsRaw, err := os.ReadFile(filepath.Join(profile, "Default", "Preferences"))
 	if err != nil {
