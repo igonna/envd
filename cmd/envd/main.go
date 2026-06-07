@@ -4230,8 +4230,12 @@ func ensureLaunchdIdleScheduler() error {
 </dict>
 </plist>
 `, label, envdPath, logPath, logPath)
-	if err := writeFileIfChanged(plist, []byte(content), 0o600); err != nil {
+	changed, err := writeFileIfChanged(plist, []byte(content), 0o600)
+	if err != nil {
 		return err
+	}
+	if !changed && launchdServiceLoaded(label) {
+		return nil
 	}
 	domain := fmt.Sprintf("gui/%d", os.Getuid())
 	_ = exec.Command("launchctl", "bootstrap", domain, plist).Run()
@@ -4274,22 +4278,31 @@ Unit=envd-idle.service
 [Install]
 WantedBy=timers.target
 `
-	if err := writeFileIfChanged(servicePath, []byte(service), 0o600); err != nil {
+	serviceChanged, err := writeFileIfChanged(servicePath, []byte(service), 0o600)
+	if err != nil {
 		return err
 	}
-	if err := writeFileIfChanged(timerPath, []byte(timer), 0o600); err != nil {
+	timerChanged, err := writeFileIfChanged(timerPath, []byte(timer), 0o600)
+	if err != nil {
 		return err
 	}
-	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
-	_ = exec.Command("systemctl", "--user", "enable", "--now", "envd-idle.timer").Run()
+	if serviceChanged || timerChanged {
+		_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+		_ = exec.Command("systemctl", "--user", "enable", "--now", "envd-idle.timer").Run()
+	}
 	return nil
 }
 
-func writeFileIfChanged(path string, content []byte, mode fs.FileMode) error {
+func writeFileIfChanged(path string, content []byte, mode fs.FileMode) (bool, error) {
 	if raw, err := os.ReadFile(path); err == nil && bytes.Equal(raw, content) {
-		return nil
+		return false, nil
 	}
-	return os.WriteFile(path, content, mode)
+	return true, os.WriteFile(path, content, mode)
+}
+
+func launchdServiceLoaded(label string) bool {
+	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	return exec.Command("launchctl", "print", domain+"/"+label).Run() == nil
 }
 
 func lockRuntimeAccess() error {

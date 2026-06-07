@@ -350,6 +350,22 @@ func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
 	}
 }
 
+func TestWriteFileIfChangedReportsChanges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "file")
+	changed, err := writeFileIfChanged(path, []byte("one"), 0o600)
+	if err != nil || !changed {
+		t.Fatalf("first write changed=%v err=%v", changed, err)
+	}
+	changed, err = writeFileIfChanged(path, []byte("one"), 0o600)
+	if err != nil || changed {
+		t.Fatalf("same write changed=%v err=%v", changed, err)
+	}
+	changed, err = writeFileIfChanged(path, []byte("two"), 0o600)
+	if err != nil || !changed {
+		t.Fatalf("different write changed=%v err=%v", changed, err)
+	}
+}
+
 func TestSeedBrowserProfileDoesNotWriteProtectedSearchPrefs(t *testing.T) {
 	profile := t.TempDir()
 	defaultDir := filepath.Join(profile, "Default")
