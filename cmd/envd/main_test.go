@@ -3705,6 +3705,19 @@ func TestGatewayRecoveryNeededOnlyForGatewayFailures(t *testing.T) {
 	}
 }
 
+func TestGatewayQuorumSuppressesSingleSourceFailures(t *testing.T) {
+	checks := []probeResult{
+		{Name: "Gateway HTTP HTTPS", Err: errors.New("ipify timeout")},
+		{Name: "Gateway web quorum", Detail: "4/4 ok"},
+	}
+	if gatewayRecoveryNeeded(checks) {
+		t.Fatalf("healthy gateway quorum should not trigger recovery for single-source failure")
+	}
+	if latestProbeFailures(checks) {
+		t.Fatalf("healthy gateway quorum should suppress single-source failure")
+	}
+}
+
 func TestLatestProbeFailuresUsesRecoveredProbeState(t *testing.T) {
 	checks := []probeResult{
 		{Name: "Gateway HTTPS", Err: errors.New("timeout")},

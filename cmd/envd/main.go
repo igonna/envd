@@ -1399,8 +1399,20 @@ func (a app) runDoctorNetwork(args []string, st *envdState) error {
 }
 
 func gatewayRecoveryNeeded(checks []probeResult) bool {
+	latest := map[string]error{}
 	for _, check := range checks {
-		if check.Err != nil && gatewayRecoverableProbe(check) {
+		latest[check.Name] = check.Err
+	}
+	if err, ok := latest["Gateway web quorum"]; ok && err == nil {
+		for _, name := range gatewaySingleSourceProbeNames() {
+			delete(latest, name)
+		}
+	}
+	for _, check := range checks {
+		if _, ok := latest[check.Name]; !ok {
+			continue
+		}
+		if latest[check.Name] != nil && gatewayRecoverableProbe(check) {
 			return true
 		}
 	}
@@ -1424,12 +1436,27 @@ func latestProbeFailures(checks []probeResult) bool {
 	for _, check := range checks {
 		latest[check.Name] = check.Err
 	}
+	if err, ok := latest["Gateway web quorum"]; ok && err == nil {
+		for _, name := range gatewaySingleSourceProbeNames() {
+			delete(latest, name)
+		}
+	}
 	for _, err := range latest {
 		if err != nil {
 			return true
 		}
 	}
 	return false
+}
+
+func gatewaySingleSourceProbeNames() []string {
+	return []string{
+		"Gateway SOCKS HTTPS",
+		"Gateway HTTP HTTPS",
+		"Gateway egress IP",
+		"Gateway HTTPS",
+		"Gateway Docker Hub",
+	}
 }
 
 func (a app) probeGatewayRecovery(st *envdState) probeResult {
@@ -10723,6 +10750,9 @@ func (a app) probeSealedEnvTraffic(st *envdState) probeResult {
 			if err != nil {
 				return probeResult{Name: "Sealed HTTPS", Err: layerErr("sealed sidecar", fmt.Errorf("%s: %w", env.Name, err))}
 			}
+			if strings.TrimSpace(egress) == "" {
+				return probeResult{Name: "Sealed HTTPS", Detail: env.Name + " DNS/TCP/TLS/DockerHub OK; egress unknown"}
+			}
 			return probeResult{Name: "Sealed HTTPS", Detail: env.Name + " DNS/TCP/TLS/DockerHub OK egress " + egress}
 		}
 	}
@@ -11397,21 +11427,64 @@ func verifySealedEnvAgainstGateway(name, gatewayEgress string) (string, error) {
 	if _, err := dockerExecOutput(name, 8*time.Second, "getent", "hosts", "example.com"); err != nil {
 		return "", layerErr("DNS", err)
 	}
-	if _, err := dockerExecOutput(name, 12*time.Second, "curl", "-fsSI", "--max-time", "12", "https://example.com"); err != nil {
-		return "", layerErr("sealed sidecar", fmt.Errorf("HTTPS probe failed: %w", err))
+	if out, err := dockerExecOutputQuiet(name, 12*time.Second, "sealed HTTPS quorum", "sh", "-lc", sealedWebQuorumScript()); err != nil {
+		return "", layerErr("sealed sidecar", fmt.Errorf("HTTPS quorum failed: %w", err))
+	} else if strings.TrimSpace(out) != "" && !strings.Contains(out, "ok=") {
+		return "", layerErr("sealed sidecar", fmt.Errorf("HTTPS quorum returned unexpected output: %s", strings.TrimSpace(out)))
 	}
-	if _, err := dockerExecOutput(name, 12*time.Second, "curl", "-sSI", "--max-time", "12", "https://registry-1.docker.io/v2/"); err != nil {
-		return "", layerErr("DNS", fmt.Errorf("Docker Hub probe failed: %w", err))
+	egress := ""
+	if got, err := dockerExecOutput(name, 8*time.Second, "sh", "-lc", sealedEgressScript()); err == nil {
+		egress = strings.TrimSpace(got)
 	}
-	egress, err := dockerExecOutput(name, 12*time.Second, "curl", "-fsS", "--max-time", "12", "https://api.ipify.org")
-	if err != nil {
-		return "", layerErr("egress policy", err)
-	}
-	egress = strings.TrimSpace(egress)
-	if gatewayEgress != "" && egress != strings.TrimSpace(gatewayEgress) {
+	if gatewayEgress != "" && egress != "" && egress != strings.TrimSpace(gatewayEgress) {
 		return egress, layerErr("egress policy", fmt.Errorf("sealed egress %s differs from gateway egress %s", egress, strings.TrimSpace(gatewayEgress)))
 	}
 	return egress, nil
+}
+
+func sealedWebQuorumScript() string {
+	return `
+set +e
+targets='https://www.google.com/generate_204 https://www.cloudflare.com/cdn-cgi/trace https://github.com/ https://registry-1.docker.io/v2/'
+ok=0
+pids=''
+tmp="${TMPDIR:-/tmp}/envd-quorum.$$"
+mkdir -p "$tmp"
+i=0
+for target in $targets; do
+  i=$((i + 1))
+  (
+    code="$(curl -sSIL -o /dev/null -w '%{http_code}' --max-time 8 "$target" 2>/dev/null)"
+    case "$code" in
+      [1-4][0-9][0-9]) exit 0 ;;
+      *) exit 1 ;;
+    esac
+  ) &
+  pids="$pids $!"
+done
+for pid in $pids; do
+  if wait "$pid"; then
+    ok=$((ok + 1))
+  fi
+done
+rm -rf "$tmp"
+printf 'ok=%s total=4\n' "$ok"
+test "$ok" -ge 3
+`
+}
+
+func sealedEgressScript() string {
+	return `
+set +e
+for target in https://api.ipify.org https://icanhazip.com https://ifconfig.me/ip; do
+  ip="$(curl -fsS --max-time 4 "$target" 2>/dev/null | tr -d '\r' | awk 'NF {print; exit}')"
+  if [ -n "$ip" ]; then
+    printf '%s\n' "$ip"
+    exit 0
+  fi
+done
+exit 1
+`
 }
 
 func dockerExecOutput(container string, timeout time.Duration, args ...string) (string, error) {
@@ -11427,6 +11500,33 @@ func dockerExecOutput(container string, timeout time.Duration, args ...string) (
 		return "", fmt.Errorf("docker %s failed: %w\n%s", strings.Join(dockerArgs, " "), err, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil
+}
+
+func dockerExecOutputQuiet(container string, timeout time.Duration, label string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	dockerArgs := append([]string{"exec", container}, args...)
+	cmd := exec.CommandContext(ctx, "docker", dockerArgs...)
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("%s timed out after %s", label, timeout)
+	}
+	if err != nil {
+		if text != "" {
+			return "", fmt.Errorf("%s failed: %w: %s", label, err, firstLine(text))
+		}
+		return "", fmt.Errorf("%s failed: %w", label, err)
+	}
+	return string(out), nil
+}
+
+func firstLine(text string) string {
+	text = strings.TrimSpace(text)
+	if i := strings.IndexByte(text, '\n'); i >= 0 {
+		return strings.TrimSpace(text[:i])
+	}
+	return text
 }
 
 func validateEnvName(name string) error {
