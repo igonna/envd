@@ -3602,16 +3602,39 @@ func (a app) runVSCodeOpen(envName string) error {
 	if err := preseedVSCodeServer(ref); err != nil {
 		return err
 	}
+	if err := a.ensureVSCodeEnvRunning(envName, &ref); err != nil {
+		return err
+	}
 	code, err := exec.LookPath("code")
 	if err != nil {
 		return fmt.Errorf("code CLI not found")
 	}
-	cmd := exec.Command(code, "--remote", "ssh-remote+"+envName, "/home/dev/repo")
+	cmd := exec.Command(code, "--new-window", "--remote", "ssh-remote+"+envName, "/home/dev/repo")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("code remote launch failed: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
 	fmt.Fprintf(a.stdout, "VS Code: ssh %s\n", envName)
 	return nil
+}
+
+func (a app) ensureVSCodeEnvRunning(envName string, ref *envRef) error {
+	if dockerContainerStatus(ref.DevName) == "running" {
+		return nil
+	}
+	route := runtimeSSHRoute{Name: ref.Name, ID: ref.ID, DevName: ref.DevName, UserName: ref.UserName, Network: ref.Network, Storage: ref.Storage}
+	if err := startRuntimeRouteContainers(route); err == nil && dockerContainerStatus(ref.DevName) == "running" {
+		return nil
+	}
+	return a.withState(func(st *envdState) error {
+		if err := a.startEnv([]string{envName}, st); err != nil {
+			return err
+		}
+		next, err := resolveEnvRef(st, envName)
+		if err == nil {
+			*ref = next
+		}
+		return err
+	})
 }
 
 func vscodeEnvRef(envName string) (envRef, error) {
@@ -3845,22 +3868,25 @@ func preseedVSCodeServer(ref envRef) error {
 		return err
 	}
 	serverName := "Stable-" + commit
-	serverTopDir := serverArtifact
+	serverTopDir := "vscode-" + serverArtifact
 	serverRoot := filepath.Join(remoteDir, "cli", "servers")
 	serverTarget := filepath.Join(serverRoot, serverName)
+	serverInstall := filepath.Join(serverTarget, "server")
 	serverStaging := filepath.Join(serverRoot, serverName+".staging")
 	script := strings.Join([]string{
 		"set -eu",
 		"mkdir -p " + shellQuote(serverRoot),
-		"if [ ! -f " + shellQuote(filepath.Join(serverTarget, "product.json")) + " ]; then",
+		"if [ ! -x " + shellQuote(filepath.Join(serverInstall, "bin", "code-server")) + " ]; then",
 		"  rm -rf " + shellQuote(serverTarget) + " " + shellQuote(serverStaging),
 		"  mkdir -p " + shellQuote(serverStaging),
 		"  tar -xzf " + shellQuote(remoteServerArchive) + " -C " + shellQuote(serverStaging),
 		"  if [ -d " + shellQuote(filepath.Join(serverStaging, serverTopDir)) + " ]; then",
-		"    mv " + shellQuote(filepath.Join(serverStaging, serverTopDir)) + " " + shellQuote(serverTarget),
+		"    mkdir -p " + shellQuote(serverTarget),
+		"    mv " + shellQuote(filepath.Join(serverStaging, serverTopDir)) + " " + shellQuote(serverInstall),
 		"    rmdir " + shellQuote(serverStaging) + " 2>/dev/null || true",
 		"  else",
-		"    mv " + shellQuote(serverStaging) + " " + shellQuote(serverTarget),
+		"    mkdir -p " + shellQuote(serverTarget),
+		"    mv " + shellQuote(serverStaging) + " " + shellQuote(serverInstall),
 		"  fi",
 		"  chown -R " + shellQuote(user+":"+user) + " " + shellQuote(serverTarget),
 		"fi",
@@ -6701,10 +6727,33 @@ func (a app) ensureSSHProxyEnvRunning(args []string) error {
 	if dockerContainerStatus(route.DevName) == "running" {
 		return nil
 	}
+	if err := startRuntimeRouteContainers(route); err == nil && dockerContainerStatus(route.DevName) == "running" {
+		return nil
+	}
+	if !term.IsTerminal(int(os.Stderr.Fd())) {
+		return fmt.Errorf("environment %q is not running; run envd start %s", name, name)
+	}
 	quiet := app{stdout: io.Discard, stderr: a.stderr, root: a.root}
 	return quiet.withState(func(st *envdState) error {
 		return quiet.startEnv([]string{name}, st)
 	})
+}
+
+func startRuntimeRouteContainers(route runtimeSSHRoute) error {
+	if route.Network == "sealed" {
+		netName := "envd-" + route.ID + "-net"
+		if containerExists(netName) && dockerContainerStatus(netName) != "running" {
+			if err := dockerRun("start", netName); err != nil {
+				return err
+			}
+		}
+	}
+	if containerExists(route.DevName) && dockerContainerStatus(route.DevName) != "running" {
+		if err := dockerRun("start", route.DevName); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func isSSHProxyUnlockUnavailable(err error) bool {
@@ -11028,6 +11077,9 @@ for base in ".vscode-server" ".vscode-server-insiders"; do
   chown -R "${DEV_USER}:${DEV_USER}" "${home_dir}/${base}"
   if [ "${ENVD_VSCODE_EXTENSIONS_MODE}" = "lock" ]; then
     chmod -R a-w "${dir}"
+    touch "${dir}/extensions.json"
+    chown "${DEV_USER}:${DEV_USER}" "${dir}/extensions.json"
+    chmod u+rw "${dir}/extensions.json"
   else
     chmod -R u+w "${dir}"
   fi
