@@ -284,6 +284,8 @@ func (a app) run(args []string) error {
 		return a.runUnlock(args[1:])
 	case "status":
 		return a.runStatus(args[1:])
+	case "completion":
+		return a.runCompletion(args[1:])
 	case "password":
 		return a.runPassword(args[1:])
 	case "reset-state":
@@ -967,6 +969,7 @@ Start:
 Setup:
   init                 create encrypted state
   status               show access, gateway, and environments
+  completion           install or print shell completion
   lock                 stop envd-managed workloads
   unlock               restore access after lock
   password             change master password
@@ -1016,6 +1019,8 @@ func (a app) printCommandHelp(args []string) error {
 		fmt.Fprint(a.stdout, "Usage: envd unlock\n\nRestores envd SSH targets/workloads after lock and caches the master password briefly.\n")
 	case "status":
 		fmt.Fprint(a.stdout, "Usage: envd status\n\nShows access, gateway, and environment state. Falls back to runtime-only status when encrypted state is locked.\n")
+	case "completion":
+		a.printCompletionHelp()
 	case "password":
 		fmt.Fprint(a.stdout, `Usage: envd password change
 
@@ -1088,6 +1093,463 @@ Next command: envd init
 		return fmt.Errorf("unknown help topic %q", args[0])
 	}
 	return nil
+}
+
+func (a app) runCompletion(args []string) error {
+	if len(args) == 0 || isHelpArg(args[0]) {
+		a.printCompletionHelp()
+		return nil
+	}
+	switch args[0] {
+	case "zsh":
+		fmt.Fprint(a.stdout, zshCompletionScript())
+		return nil
+	case "bash":
+		fmt.Fprint(a.stdout, bashCompletionScript())
+		return nil
+	case "install":
+		return a.installCompletion(args[1:])
+	case "envs":
+		for _, name := range completionEnvNames() {
+			fmt.Fprintln(a.stdout, name)
+		}
+		return nil
+	case "commands":
+		for _, name := range topLevelCompletionCommands() {
+			fmt.Fprintln(a.stdout, name)
+		}
+		return nil
+	default:
+		return fmt.Errorf("usage: envd completion install|zsh|bash")
+	}
+}
+
+func (a app) printCompletionHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd completion install
+  envd completion zsh
+  envd completion bash
+
+Install:
+  installs completion for the current shell and adds a small managed profile block
+
+`)
+}
+
+func (a app) installCompletion(args []string) error {
+	quiet := false
+	shellName := ""
+	for _, arg := range args {
+		switch arg {
+		case "--quiet":
+			quiet = true
+		case "zsh", "bash":
+			shellName = arg
+		default:
+			return fmt.Errorf("usage: envd completion install [zsh|bash] [--quiet]")
+		}
+	}
+	if shellName == "" {
+		shellName = detectCompletionShell()
+	}
+	switch shellName {
+	case "zsh":
+		return a.installZshCompletion(quiet)
+	case "bash":
+		return a.installBashCompletion(quiet)
+	default:
+		if !quiet {
+			fmt.Fprintln(a.stdout, "Completion: skipped (unknown shell)")
+		}
+		return nil
+	}
+}
+
+func detectCompletionShell() string {
+	base := filepath.Base(os.Getenv("SHELL"))
+	switch base {
+	case "zsh", "bash":
+		return base
+	}
+	if runtime.GOOS == "darwin" {
+		return "zsh"
+	}
+	if runtime.GOOS == "linux" {
+		return "bash"
+	}
+	return ""
+}
+
+func (a app) installZshCompletion(quiet bool) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(home, ".zsh", "completions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "_envd")
+	if err := os.WriteFile(path, []byte(zshCompletionScript()), 0o644); err != nil {
+		return err
+	}
+	zshrc := filepath.Join(home, ".zshrc")
+	block := `
+# envd zsh completion
+fpath=("$HOME/.zsh/completions" $fpath)
+autoload -Uz compinit
+compinit
+`
+	raw, err := os.ReadFile(zshrc)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if !strings.Contains(string(raw), "# envd zsh completion") {
+		prefix := ""
+		if len(raw) > 0 && !strings.HasSuffix(string(raw), "\n") {
+			prefix = "\n"
+		}
+		if err := os.WriteFile(zshrc, append(raw, []byte(prefix+block)...), 0o644); err != nil {
+			return err
+		}
+		if !quiet {
+			fmt.Fprintln(a.stdout, "Completion: zsh installed")
+			fmt.Fprintf(a.stdout, "Script:     %s\n", path)
+			fmt.Fprintln(a.stdout, "Shell:      restart terminal or run `exec zsh`")
+		}
+		return nil
+	}
+	if !quiet {
+		fmt.Fprintln(a.stdout, "Completion: zsh installed")
+		fmt.Fprintf(a.stdout, "Script:     %s\n", path)
+	}
+	return nil
+}
+
+func (a app) installBashCompletion(quiet bool) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(home, ".local", "share", "bash-completion", "completions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "envd")
+	if err := os.WriteFile(path, []byte(bashCompletionScript()), 0o644); err != nil {
+		return err
+	}
+	bashrc := filepath.Join(home, ".bashrc")
+	block := `
+# envd bash completion
+if [ -f "$HOME/.local/share/bash-completion/completions/envd" ]; then
+  . "$HOME/.local/share/bash-completion/completions/envd"
+fi
+`
+	raw, err := os.ReadFile(bashrc)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if !strings.Contains(string(raw), "# envd bash completion") {
+		prefix := ""
+		if len(raw) > 0 && !strings.HasSuffix(string(raw), "\n") {
+			prefix = "\n"
+		}
+		if err := os.WriteFile(bashrc, append(raw, []byte(prefix+block)...), 0o644); err != nil {
+			return err
+		}
+	}
+	if !quiet {
+		fmt.Fprintln(a.stdout, "Completion: bash installed")
+		fmt.Fprintf(a.stdout, "Script:     %s\n", path)
+		fmt.Fprintln(a.stdout, "Shell:      restart terminal or run `exec bash`")
+	}
+	return nil
+}
+
+func topLevelCompletionCommands() []string {
+	return []string{
+		"init",
+		"status",
+		"completion",
+		"lock",
+		"unlock",
+		"password",
+		"idle",
+		"reset-state",
+		"start",
+		"shell",
+		"details",
+		"stop",
+		"rm",
+		"vscode",
+		"vscode-extensions",
+		"gateway",
+		"proxy",
+		"doctor",
+		"browser",
+		"hosting",
+		"network",
+		"pkg",
+		"identity",
+		"migrate",
+		"version",
+		"help",
+	}
+}
+
+func completionEnvNames() []string {
+	seen := map[string]bool{}
+	if access, err := loadRuntimeAccess(); err == nil && !access.Locked {
+		for name := range access.Routes {
+			if name != "" {
+				seen[name] = true
+			}
+		}
+	}
+	out, err := exec.Command(dockerBinary(), "ps", "-a",
+		"--filter", "label=envd.managed=true",
+		"--filter", "label=envd.role=dev",
+		"--format", "{{.Label \"envd.name\"}}",
+	).Output()
+	if err == nil {
+		for _, name := range strings.Fields(string(out)) {
+			if name != "" {
+				seen[name] = true
+			}
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sortStrings(names)
+	return names
+}
+
+func zshCompletionScript() string {
+	return `#compdef envd
+
+_envd() {
+  local -a commands env_commands gateway_commands doctor_commands browser_commands pkg_commands identity_commands idle_commands network_modes extension_modes completion_commands
+
+  commands=(
+    init:'create encrypted state'
+    status:'show access, gateway, and environments'
+    completion:'install or print shell completion'
+    lock:'stop envd-managed workloads'
+    unlock:'restore access after lock'
+    password:'change master password'
+    idle:'manage idle cleanup'
+    reset-state:'reset forgotten-password state'
+    start:'create or start an environment'
+    shell:'open a shell or run a command'
+    details:'show environment details'
+    stop:'stop an environment'
+    rm:'remove an environment'
+    vscode:'open VS Code for an environment'
+    vscode-extensions:'lock or unlock remote VS Code extensions'
+    gateway:'manage gateways'
+    proxy:'show or test local proxy ports'
+    doctor:'diagnose what is broken'
+    browser:'install or open Vhrome'
+    hosting:'find reachable VPS providers'
+    network:'change network mode'
+    pkg:'manage package profiles'
+    identity:'manage encrypted identities'
+    migrate:'adopt legacy containers'
+    version:'print version'
+    help:'show help'
+  )
+
+  env_commands=(start shell details stop rm vscode ssh-proxy)
+  gateway_commands=(install list use status details render egress share shares view revoke rollback chain)
+  doctor_commands=(network why history identity)
+  browser_commands=(install update status reset open)
+  pkg_commands=(list show add remove apply)
+  identity_commands=(add list status)
+  idle_commands=(status on off)
+  network_modes=(sealed direct offline)
+  extension_modes=(lock unlock)
+  completion_commands=(install zsh bash)
+
+  _envd_envs() {
+    local -a envs
+    envs=("${(@f)$(_call_program envs envd completion envs 2>/dev/null)}")
+    _describe 'environment' envs
+  }
+
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+    return
+  fi
+
+  case "$words[2]" in
+    help)
+      _describe 'command' commands
+      ;;
+    start|shell|details|stop|rm|vscode|ssh-proxy)
+      if (( CURRENT == 3 )); then
+        _envd_envs
+      fi
+      ;;
+    vscode-extensions)
+      if (( CURRENT == 3 )); then
+        _describe 'mode' extension_modes
+      elif (( CURRENT == 4 )); then
+        _envd_envs
+      fi
+      ;;
+    network)
+      if (( CURRENT == 3 )); then
+        compadd set
+      elif (( CURRENT == 4 )); then
+        _envd_envs
+      elif (( CURRENT == 5 )); then
+        _describe 'mode' network_modes
+      fi
+      ;;
+    gateway)
+      if (( CURRENT == 3 )); then
+        _describe 'gateway command' gateway_commands
+      fi
+      ;;
+    doctor)
+      if (( CURRENT == 3 )); then
+        _describe 'doctor command' doctor_commands
+      elif (( CURRENT == 4 && "$words[3]" == "why" )); then
+        _envd_envs
+      fi
+      ;;
+    browser)
+      if (( CURRENT == 3 )); then
+        _describe 'browser command' browser_commands
+      fi
+      ;;
+    pkg)
+      if (( CURRENT == 3 )); then
+        _describe 'pkg command' pkg_commands
+      fi
+      ;;
+    identity)
+      if (( CURRENT == 3 )); then
+        _describe 'identity command' identity_commands
+      fi
+      ;;
+    idle)
+      if (( CURRENT == 3 )); then
+        _describe 'idle command' idle_commands
+      fi
+      ;;
+    completion)
+      if (( CURRENT == 3 )); then
+        _describe 'completion command' completion_commands
+      fi
+      ;;
+  esac
+}
+
+compdef _envd envd
+`
+}
+
+func bashCompletionScript() string {
+	return `# envd bash completion
+
+_envd_completion() {
+  local cur prev command
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  command="${COMP_WORDS[1]}"
+
+  local commands="init status completion lock unlock password idle reset-state start shell details stop rm vscode vscode-extensions gateway proxy doctor browser hosting network pkg identity migrate version help"
+  local gateway_commands="install list use status details render egress share shares view revoke rollback chain"
+  local doctor_commands="network why history identity"
+  local browser_commands="install update status reset open"
+  local pkg_commands="list show add remove apply"
+  local identity_commands="add list status"
+  local idle_commands="status on off"
+  local network_modes="sealed direct offline"
+  local extension_modes="lock unlock"
+  local completion_commands="install zsh bash"
+
+  _envd_envs() {
+    envd completion envs 2>/dev/null
+  }
+
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+    return 0
+  fi
+
+  case "$command" in
+    help)
+      COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+      ;;
+    start|shell|details|stop|rm|vscode|ssh-proxy)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "$(_envd_envs)" -- "$cur") )
+      fi
+      ;;
+    vscode-extensions)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "$extension_modes" -- "$cur") )
+      elif [ "$COMP_CWORD" -eq 3 ]; then
+        COMPREPLY=( $(compgen -W "$(_envd_envs)" -- "$cur") )
+      fi
+      ;;
+    network)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "set" -- "$cur") )
+      elif [ "$COMP_CWORD" -eq 3 ]; then
+        COMPREPLY=( $(compgen -W "$(_envd_envs)" -- "$cur") )
+      elif [ "$COMP_CWORD" -eq 4 ]; then
+        COMPREPLY=( $(compgen -W "$network_modes" -- "$cur") )
+      fi
+      ;;
+    gateway)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "$gateway_commands" -- "$cur") )
+      fi
+      ;;
+    doctor)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "$doctor_commands" -- "$cur") )
+      elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[2]}" = "why" ]; then
+        COMPREPLY=( $(compgen -W "$(_envd_envs)" -- "$cur") )
+      fi
+      ;;
+    browser)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "$browser_commands" -- "$cur") )
+      fi
+      ;;
+    pkg)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "$pkg_commands" -- "$cur") )
+      fi
+      ;;
+    identity)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "$identity_commands" -- "$cur") )
+      fi
+      ;;
+    idle)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "$idle_commands" -- "$cur") )
+      fi
+      ;;
+    completion)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=( $(compgen -W "$completion_commands" -- "$cur") )
+      fi
+      ;;
+  esac
+}
+
+complete -F _envd_completion envd
+`
 }
 
 func (a app) runProxy(args []string, st *envdState) error {

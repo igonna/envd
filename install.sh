@@ -79,6 +79,7 @@ cp "$out" "$tmp_install"
 xattr -c "$tmp_install" 2>/dev/null || true
 chmod 755 "$tmp_install"
 mv "$tmp_install" "$install_dir/envd"
+"$install_dir/envd" completion install --quiet 2>/dev/null || true
 
 duplicates=""
 for candidate in $(find_envd_on_path); do
