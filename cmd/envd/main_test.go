@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -3595,6 +3596,127 @@ func TestNetworkCheckProbeResultsUseDoctorStyle(t *testing.T) {
 	}
 	if results[2].Err != nil || !strings.Contains(results[2].Detail, "skipped: gateway unavailable") {
 		t.Fatalf("unexpected skip result: %+v", results[2])
+	}
+}
+
+func TestProbeDurationFormatting(t *testing.T) {
+	if got := appendDuration("egress 1.2.3.4", 420*time.Millisecond); got != "egress 1.2.3.4 (420ms)" {
+		t.Fatalf("unexpected millisecond duration detail: %q", got)
+	}
+	if got := appendDuration("timeout", 1500*time.Millisecond); got != "timeout (1.5s)" {
+		t.Fatalf("unexpected second duration detail: %q", got)
+	}
+}
+
+func TestProbeWebQuorumStatus(t *testing.T) {
+	targets := []webQuorumTarget{
+		{Label: "one", URL: "ok"},
+		{Label: "two", URL: "ok"},
+		{Label: "three", URL: "ok"},
+		{Label: "four", URL: "fail"},
+	}
+	oldFetchURL := fetchURLFunc
+	defer func() { fetchURLFunc = oldFetchURL }()
+	fetchURLFunc = func(_ *url.URL, target string, _ time.Duration) (int, string, error) {
+		if target == "fail" {
+			return 0, "", errors.New("blocked")
+		}
+		return 204, "", nil
+	}
+	results := probeWebQuorumTargets(nil, targets, time.Millisecond, time.Millisecond)
+	ok := 0
+	for _, result := range results {
+		if result.Err == nil {
+			ok++
+		}
+	}
+	if ok != 3 {
+		t.Fatalf("expected 3 reachable targets, got %+v", results)
+	}
+}
+
+func TestProbeFastQuorumAllowsOneFailedTarget(t *testing.T) {
+	targets := []webQuorumTarget{
+		{Label: "one", URL: "https://one.example/"},
+		{Label: "two", URL: "https://two.example/"},
+		{Label: "three", URL: "https://three.example/"},
+		{Label: "four", URL: "https://four.example/"},
+	}
+	err := probeFastQuorum(targets, 3, time.Second, func(target webQuorumTarget) error {
+		if target.Label == "four" {
+			return errors.New("down")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("one failed target should still pass quorum: %v", err)
+	}
+}
+
+func TestProbeFastQuorumFailsWhenQuorumImpossible(t *testing.T) {
+	targets := []webQuorumTarget{
+		{Label: "one", URL: "https://one.example/"},
+		{Label: "two", URL: "https://two.example/"},
+		{Label: "three", URL: "https://three.example/"},
+		{Label: "four", URL: "https://four.example/"},
+	}
+	err := probeFastQuorum(targets, 3, time.Second, func(target webQuorumTarget) error {
+		if target.Label == "one" {
+			return nil
+		}
+		return errors.New("down")
+	})
+	if err == nil || !strings.Contains(err.Error(), "web quorum failed") {
+		t.Fatalf("expected quorum failure, got %v", err)
+	}
+}
+
+func TestGatewayHealthCacheValidity(t *testing.T) {
+	t.Setenv("ENVD_DATA_DIR", t.TempDir())
+	now := time.Unix(1000, 0).UTC()
+	if gatewayHealthCacheValid("127.0.0.1:11080", "127.0.0.1:11081", now) {
+		t.Fatalf("missing cache should not be valid")
+	}
+	if err := saveGatewayHealthCache("127.0.0.1:11080", "127.0.0.1:11081", now); err != nil {
+		t.Fatalf("save cache failed: %v", err)
+	}
+	if !gatewayHealthCacheValid("127.0.0.1:11080", "127.0.0.1:11081", now.Add(5*time.Second)) {
+		t.Fatalf("fresh matching cache should be valid")
+	}
+	if gatewayHealthCacheValid("127.0.0.1:11082", "127.0.0.1:11081", now.Add(5*time.Second)) {
+		t.Fatalf("endpoint mismatch should invalidate cache")
+	}
+	if gatewayHealthCacheValid("127.0.0.1:11080", "127.0.0.1:11081", now.Add(gatewayHealthCacheTTL+time.Second)) {
+		t.Fatalf("expired cache should not be valid")
+	}
+}
+
+func TestGatewayRecoveryNeededOnlyForGatewayFailures(t *testing.T) {
+	checks := []probeResult{
+		{Name: "Direct HTTPS", Err: errors.New("offline")},
+		{Name: "Gateway SOCKS HTTPS", Detail: "ok"},
+	}
+	if gatewayRecoveryNeeded(checks) {
+		t.Fatalf("direct internet failure should not restart gateway")
+	}
+	checks = append(checks, probeResult{Name: "Gateway egress IP", Err: errors.New("timeout")})
+	if !gatewayRecoveryNeeded(checks) {
+		t.Fatalf("gateway egress failure should restart gateway")
+	}
+}
+
+func TestLatestProbeFailuresUsesRecoveredProbeState(t *testing.T) {
+	checks := []probeResult{
+		{Name: "Gateway HTTPS", Err: errors.New("timeout")},
+		{Name: "Gateway recovery", Detail: "restarted local gateway"},
+		{Name: "Gateway HTTPS", Detail: "egress 1.2.3.4"},
+	}
+	if latestProbeFailures(checks) {
+		t.Fatalf("latest successful gateway probe should clear earlier failure")
+	}
+	checks = append(checks, probeResult{Name: "Direct HTTPS", Err: errors.New("offline")})
+	if !latestProbeFailures(checks) {
+		t.Fatalf("unrecovered direct failure should still fail")
 	}
 }
 

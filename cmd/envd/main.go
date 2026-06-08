@@ -710,6 +710,13 @@ func maxInt(a, b int) int {
 	return b
 }
 
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func identityAgentRuntimeStatus(access runtimeAccessState) string {
 	if len(access.Routes) == 0 {
 		return ""
@@ -1257,34 +1264,226 @@ func (a app) runDoctorNetwork(args []string, st *envdState) error {
 		return a.runNetworkReport(nil, st)
 	}
 	checks := []probeResult{}
-	check := a.networkCheck(st)
-	recordNetworkCheck(st, check)
-	checks = append(checks, networkCheckProbeResults(check)...)
+	width := len("Gateway SOCKS HTTPS")
+	directResults := []internetProbeRecord{
+		timedInternetProbe(func() internetProbeRecord {
+			return probeDirectURL("Direct HTTPS", "direct", "https://api.ipify.org/", 5*time.Second)
+		}),
+		timedInternetProbe(func() internetProbeRecord {
+			return probeDirectURL("Direct Docker Hub", "direct", "https://registry-1.docker.io/v2/", 5*time.Second)
+		}),
+		probeWebQuorum("Direct web quorum", "direct", nil, 5*time.Second, 20*time.Second),
+	}
+	for _, result := range networkCheckProbeResults(internetCheckRecord{Results: directResults}) {
+		checks = append(checks, result)
+		a.printProbeResult(result, width)
+	}
 	cfg, source, err := a.activeGatewayConfig(st)
+	gatewayResults := []internetProbeRecord{}
 	if err != nil {
-		checks = append(checks, probeResult{Name: "Gateway config", Err: err})
+		result := probeResult{Name: "Gateway config", Err: err}
+		checks = append(checks, result)
+		a.printProbeResult(result, width)
+		gatewayResults = append(gatewayResults,
+			internetProbeRecord{Name: "Gateway HTTPS", Path: "gateway", Status: "skip", Detail: redactSensitive(err.Error())},
+			internetProbeRecord{Name: "Gateway Docker Hub", Path: "gateway", Status: "skip", Detail: "gateway config unavailable"},
+		)
 	} else {
 		host := hostForClient(cfg.BindIP)
 		socks := net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort))
 		httpProxy := net.JoinHostPort(host, strconv.Itoa(cfg.HTTPHostPort))
-		checks = append(checks,
-			probeTCP("Gateway SOCKS port", socks, 3*time.Second),
-			probeTCP("Gateway HTTP port", httpProxy, 3*time.Second),
-			probeSOCKS("Gateway SOCKS HTTPS", socks, "api.ipify.org:443", 10*time.Second),
-			probeHTTPProxy("Gateway HTTP HTTPS", httpProxy, "api.ipify.org:443", 10*time.Second),
-		)
+		portAndProxyChecks := []probeResult{
+			timedProbe(func() probeResult { return probeTCP("Gateway SOCKS port", socks, 3*time.Second) }),
+			timedProbe(func() probeResult { return probeTCP("Gateway HTTP port", httpProxy, 3*time.Second) }),
+			timedProbe(func() probeResult {
+				return probeSOCKS("Gateway SOCKS HTTPS", socks, "api.ipify.org:443", 6*time.Second)
+			}),
+			timedProbe(func() probeResult {
+				return probeHTTPProxy("Gateway HTTP HTTPS", httpProxy, "api.ipify.org:443", 6*time.Second)
+			}),
+		}
+		for _, result := range portAndProxyChecks {
+			checks = append(checks, result)
+			a.printProbeResult(result, width)
+		}
+		started := time.Now()
 		if ip, err := a.gatewayEgressIP(cfg); err != nil {
-			checks = append(checks, probeResult{Name: "Gateway egress IP", Err: layerErr("remote gateway", err)})
+			result := probeResult{Name: "Gateway egress IP", Err: layerErr("remote gateway", err)}
+			result = withProbeDuration(result, time.Since(started))
+			checks = append(checks, result)
+			a.printProbeResult(result, width)
 		} else {
-			checks = append(checks, probeResult{Name: "Gateway egress IP", Detail: strings.TrimSpace(ip) + " via " + source})
+			result := probeResult{Name: "Gateway egress IP", Detail: strings.TrimSpace(ip) + " via " + source}
+			result = withProbeDuration(result, time.Since(started))
+			checks = append(checks, result)
+			a.printProbeResult(result, width)
+		}
+		proxy := net.JoinHostPort(hostForClient(cfg.BindIP), strconv.Itoa(cfg.HTTPHostPort))
+		gatewayResults = append(gatewayResults,
+			timedInternetProbe(func() internetProbeRecord {
+				return probeHTTPProxyURL("Gateway HTTPS", "gateway "+source, proxy, "https://api.ipify.org/", 6*time.Second)
+			}),
+			timedInternetProbe(func() internetProbeRecord {
+				return probeHTTPProxyURL("Gateway Docker Hub", "gateway "+source, proxy, "https://registry-1.docker.io/v2/", 6*time.Second)
+			}),
+			probeWebQuorum("Gateway web quorum", "gateway "+source, mustParseURL("http://"+proxy), 6*time.Second, 20*time.Second),
+		)
+	}
+	for _, result := range networkCheckProbeResults(internetCheckRecord{Results: gatewayResults}) {
+		checks = append(checks, result)
+		a.printProbeResult(result, width)
+	}
+	sealed := timedProbe(func() probeResult { return a.probeSealedEnvTraffic(st) })
+	checks = append(checks, sealed)
+	a.printProbeResult(sealed, width)
+	if err == nil && gatewayRecoveryNeeded(checks) {
+		recovery := timedProbe(func() probeResult { return a.probeGatewayRecovery(st) })
+		checks = append(checks, recovery)
+		a.printProbeResult(recovery, width)
+		if recovery.Err == nil {
+			host := hostForClient(cfg.BindIP)
+			socks := net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort))
+			httpProxy := net.JoinHostPort(host, strconv.Itoa(cfg.HTTPHostPort))
+			rechecks := []probeResult{
+				timedProbe(func() probeResult { return probeTCP("Gateway SOCKS port", socks, 3*time.Second) }),
+				timedProbe(func() probeResult { return probeTCP("Gateway HTTP port", httpProxy, 3*time.Second) }),
+				timedProbe(func() probeResult {
+					return probeSOCKS("Gateway SOCKS HTTPS", socks, "api.ipify.org:443", 8*time.Second)
+				}),
+				timedProbe(func() probeResult {
+					return probeHTTPProxy("Gateway HTTP HTTPS", httpProxy, "api.ipify.org:443", 8*time.Second)
+				}),
+			}
+			for _, result := range rechecks {
+				checks = append(checks, result)
+				a.printProbeResult(result, width)
+			}
+			started := time.Now()
+			if ip, err := a.gatewayEgressIP(cfg); err != nil {
+				result := withProbeDuration(probeResult{Name: "Gateway egress IP", Err: layerErr("remote gateway", err)}, time.Since(started))
+				checks = append(checks, result)
+				a.printProbeResult(result, width)
+			} else {
+				result := withProbeDuration(probeResult{Name: "Gateway egress IP", Detail: strings.TrimSpace(ip) + " via " + source}, time.Since(started))
+				checks = append(checks, result)
+				a.printProbeResult(result, width)
+			}
+			recheckedGatewayResults := []internetProbeRecord{
+				timedInternetProbe(func() internetProbeRecord {
+					return probeHTTPProxyURL("Gateway HTTPS", "gateway "+source, httpProxy, "https://api.ipify.org/", 8*time.Second)
+				}),
+				timedInternetProbe(func() internetProbeRecord {
+					return probeHTTPProxyURL("Gateway Docker Hub", "gateway "+source, httpProxy, "https://registry-1.docker.io/v2/", 8*time.Second)
+				}),
+				probeWebQuorum("Gateway web quorum", "gateway "+source, mustParseURL("http://"+httpProxy), 8*time.Second, 20*time.Second),
+			}
+			gatewayResults = append(gatewayResults, recheckedGatewayResults...)
+			for _, result := range networkCheckProbeResults(internetCheckRecord{Results: recheckedGatewayResults}) {
+				checks = append(checks, result)
+				a.printProbeResult(result, width)
+			}
+			sealed = timedProbe(func() probeResult { return a.probeSealedEnvTraffic(st) })
+			checks = append(checks, sealed)
+			a.printProbeResult(sealed, width)
 		}
 	}
-	checks = append(checks, a.probeSealedEnvTraffic(st))
-	ok, _ := a.printProbeResults(checks)
-	if !ok {
+	recordNetworkCheck(st, internetCheckRecord{
+		Time:    time.Now().UTC(),
+		Results: append(directResults, gatewayResults...),
+		Summary: summarizeInternetResults(append(directResults, gatewayResults...)),
+	})
+	if latestProbeFailures(checks) {
 		return errors.New("doctor found failures")
 	}
 	return nil
+}
+
+func gatewayRecoveryNeeded(checks []probeResult) bool {
+	for _, check := range checks {
+		if check.Err != nil && gatewayRecoverableProbe(check) {
+			return true
+		}
+	}
+	return false
+}
+
+func gatewayRecoverableProbe(check probeResult) bool {
+	switch check.Name {
+	case "Gateway SOCKS port", "Gateway HTTP port", "Gateway SOCKS HTTPS", "Gateway HTTP HTTPS",
+		"Gateway egress IP", "Gateway HTTPS", "Gateway Docker Hub", "Gateway web quorum":
+		return true
+	case "Sealed HTTPS":
+		return strings.Contains(check.Err.Error(), "gateway")
+	default:
+		return false
+	}
+}
+
+func latestProbeFailures(checks []probeResult) bool {
+	latest := map[string]error{}
+	for _, check := range checks {
+		latest[check.Name] = check.Err
+	}
+	for _, err := range latest {
+		if err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (a app) probeGatewayRecovery(st *envdState) probeResult {
+	if err := a.restartActiveGatewayRuntime(st); err != nil {
+		return probeResult{Name: "Gateway recovery", Err: err}
+	}
+	return probeResult{Name: "Gateway recovery", Detail: "restarted local gateway"}
+}
+
+func timedProbe(fn func() probeResult) probeResult {
+	started := time.Now()
+	return withProbeDuration(fn(), time.Since(started))
+}
+
+func timedInternetProbe(fn func() internetProbeRecord) internetProbeRecord {
+	started := time.Now()
+	result := fn()
+	result.Detail = appendDuration(result.Detail, time.Since(started))
+	return result
+}
+
+func withProbeDuration(result probeResult, elapsed time.Duration) probeResult {
+	if result.Err != nil {
+		result.Err = fmt.Errorf("%w (%s)", result.Err, formatProbeDuration(elapsed))
+		return result
+	}
+	result.Detail = appendDuration(result.Detail, elapsed)
+	return result
+}
+
+func appendDuration(detail string, elapsed time.Duration) string {
+	if strings.TrimSpace(detail) == "" {
+		return formatProbeDuration(elapsed)
+	}
+	return detail + " (" + formatProbeDuration(elapsed) + ")"
+}
+
+func formatProbeDuration(elapsed time.Duration) string {
+	if elapsed < time.Second {
+		return strconv.FormatInt(elapsed.Milliseconds(), 10) + "ms"
+	}
+	return fmt.Sprintf("%.1fs", elapsed.Seconds())
+}
+
+func (a app) printProbeResult(c probeResult, width int) {
+	width = maxInt(width, len(c.Name))
+	if c.Err != nil {
+		fmt.Fprintf(a.stdout, "%-*s  FAIL  %s\n", width, c.Name, redactSensitive(c.Err.Error()))
+		if next := nextActionForError(c.Err); next != "" {
+			fmt.Fprintf(a.stdout, "%-*s        Next: %s\n", width, "", next)
+		}
+		return
+	}
+	fmt.Fprintf(a.stdout, "%-*s  OK    %s\n", width, c.Name, c.Detail)
 }
 
 func (a app) runDoctorHistory(args []string, st *envdState) error {
@@ -1614,6 +1813,9 @@ func (a app) runBrowserOpen(urls []string, st *envdState) error {
 	if err := seedBrowserProfile(inst.ProfileDir); err != nil {
 		return err
 	}
+	if err := a.ensureActiveGatewayRuntime(st); err != nil {
+		return err
+	}
 	cfg, _, err := a.activeGatewayConfig(st)
 	if err != nil {
 		return err
@@ -1621,17 +1823,8 @@ func (a app) runBrowserOpen(urls []string, st *envdState) error {
 	host := hostForClient(cfg.BindIP)
 	socks := net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort))
 	httpProxy := net.JoinHostPort(host, strconv.Itoa(cfg.HTTPHostPort))
-	if res := probeTCP("Gateway SOCKS port", socks, 3*time.Second); res.Err != nil {
-		return res.Err
-	}
-	if res := probeHTTPProxy("Gateway HTTP HTTPS", httpProxy, "api.ipify.org:443", 10*time.Second); res.Err != nil {
-		return res.Err
-	}
-	if ip, err := a.gatewayEgressIP(cfg); err != nil || strings.TrimSpace(ip) == "" {
-		if err == nil {
-			err = fmt.Errorf("empty gateway egress")
-		}
-		return fmt.Errorf("gateway egress check failed: %w", err)
+	if err := verifyRuntimeGatewayProxy(socks, httpProxy, 10*time.Second); err != nil {
+		return err
 	}
 	flags := browserLaunchFlags(inst.ProfileDir, socks)
 	flags = append(flags, urls...)
@@ -1663,21 +1856,118 @@ func (a app) runBrowserOpenRuntime(urls []string) error {
 	if err != nil {
 		return err
 	}
-	if res := probeTCP("Gateway SOCKS port", socks, 3*time.Second); res.Err != nil {
-		return res.Err
-	}
-	if res := probeHTTPProxy("Gateway HTTP HTTPS", httpProxy, "api.ipify.org:443", 10*time.Second); res.Err != nil {
-		return res.Err
-	}
-	if ip, err := fetchViaHTTPProxy(httpProxy, "https://api.ipify.org/", 10*time.Second); err != nil || strings.TrimSpace(ip) == "" {
-		if err == nil {
-			err = fmt.Errorf("empty gateway egress")
-		}
-		return fmt.Errorf("gateway egress check failed: %w", err)
+	if err := ensureRuntimeGatewayProxy(socks, httpProxy); err != nil {
+		return err
 	}
 	flags := browserLaunchFlags(inst.ProfileDir, socks)
 	flags = append(flags, urls...)
 	return launchVhrome(inst.Executable, flags)
+}
+
+func ensureRuntimeGatewayProxy(socks, httpProxy string) error {
+	if err := verifyGatewayProxyCached(socks, httpProxy, 10*time.Second); err == nil {
+		return nil
+	}
+	runtimeDir, err := gatewayRuntimeDir()
+	if err != nil {
+		return err
+	}
+	if err := restartGatewayRuntime(runtimeDir); err != nil {
+		return layerErr("local gateway", err)
+	}
+	return verifyGatewayProxyCached(socks, httpProxy, 10*time.Second)
+}
+
+func verifyGatewayProxyCached(socks, httpProxy string, timeout time.Duration) error {
+	if gatewayHealthCacheValid(socks, httpProxy, time.Now()) {
+		return nil
+	}
+	if err := verifyRuntimeGatewayProxy(socks, httpProxy, timeout); err != nil {
+		return err
+	}
+	_ = saveGatewayHealthCache(socks, httpProxy, time.Now())
+	return nil
+}
+
+func verifyRuntimeGatewayProxy(socks, httpProxy string, timeout time.Duration) error {
+	if res := probeTCP("Gateway SOCKS port", socks, 3*time.Second); res.Err != nil {
+		return res.Err
+	}
+	if res := probeTCP("Gateway HTTP port", httpProxy, 3*time.Second); res.Err != nil {
+		return res.Err
+	}
+	if err := probeSOCKSWebQuorum(socks, timeout); err != nil {
+		return err
+	}
+	proxyURL, err := url.Parse("http://" + httpProxy)
+	if err != nil {
+		return err
+	}
+	if err := probeHTTPWebQuorum(proxyURL, timeout); err != nil {
+		return err
+	}
+	return nil
+}
+
+const gatewayHealthCacheTTL = 20 * time.Second
+
+type gatewayHealthCache struct {
+	SOCKS     string    `json:"socks"`
+	HTTP      string    `json:"http"`
+	CheckedAt time.Time `json:"checked_at"`
+}
+
+func gatewayHealthCacheValid(socks, httpProxy string, now time.Time) bool {
+	cache, err := loadGatewayHealthCache()
+	if err != nil {
+		return false
+	}
+	if cache.SOCKS != socks || cache.HTTP != httpProxy {
+		return false
+	}
+	if cache.CheckedAt.IsZero() || now.Before(cache.CheckedAt) {
+		return false
+	}
+	return now.Sub(cache.CheckedAt) <= gatewayHealthCacheTTL
+}
+
+func saveGatewayHealthCache(socks, httpProxy string, now time.Time) error {
+	path, err := gatewayHealthCachePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(gatewayHealthCache{SOCKS: socks, HTTP: httpProxy, CheckedAt: now.UTC()})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o600)
+}
+
+func loadGatewayHealthCache() (gatewayHealthCache, error) {
+	path, err := gatewayHealthCachePath()
+	if err != nil {
+		return gatewayHealthCache{}, err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return gatewayHealthCache{}, err
+	}
+	var cache gatewayHealthCache
+	if err := json.Unmarshal(raw, &cache); err != nil {
+		return gatewayHealthCache{}, err
+	}
+	return cache, nil
+}
+
+func gatewayHealthCachePath() (string, error) {
+	dir, err := envdDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "gateway", "health.json"), nil
 }
 
 func stdinIsTerminal() bool {
@@ -5933,6 +6223,9 @@ func (a app) runSSHProxy(args []string) error {
 		}
 		defer stop()
 	}
+	if err := a.ensureSSHProxyEnvRunning(args); err != nil {
+		return err
+	}
 	dockerArgs, err := prepareSSHProxyDockerArgs(args)
 	if err != nil {
 		return err
@@ -5949,6 +6242,27 @@ func (a app) runSSHProxy(args []string) error {
 	err = cmd.Run()
 	_ = runOpportunisticIdleSweep()
 	return err
+}
+
+func (a app) ensureSSHProxyEnvRunning(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: envd ssh-proxy ENV")
+	}
+	name := args[0]
+	route, err := runtimeRoute(name)
+	if err != nil {
+		return err
+	}
+	if route.Network == "offline" {
+		return fmt.Errorf("environment %q is offline; SSH proxy denied", name)
+	}
+	if dockerContainerStatus(route.DevName) == "running" {
+		return nil
+	}
+	quiet := app{stdout: io.Discard, stderr: a.stderr, root: a.root}
+	return quiet.withState(func(st *envdState) error {
+		return quiet.startEnv([]string{name}, st)
+	})
 }
 
 func (a app) startSSHProxyIdentityAgent(envName string) (func(), error) {
@@ -8158,8 +8472,10 @@ func summarizeInternetResults(results []internetProbeRecord) internetCheckSummar
 	return s
 }
 
+var fetchURLFunc = fetchURL
+
 func probeDirectURL(name, path, target string, timeout time.Duration) internetProbeRecord {
-	status, body, err := fetchURL(nil, target, timeout)
+	status, body, err := fetchURLFunc(nil, target, timeout)
 	if err != nil {
 		return internetProbeRecord{Name: name, Path: path, Status: "fail", Detail: redactSensitive(err.Error())}
 	}
@@ -8171,11 +8487,161 @@ func probeHTTPProxyURL(name, path, proxyAddr, target string, timeout time.Durati
 	if err != nil {
 		return internetProbeRecord{Name: name, Path: path, Status: "fail", Detail: err.Error()}
 	}
-	status, body, err := fetchURL(proxyURL, target, timeout)
+	status, body, err := fetchURLFunc(proxyURL, target, timeout)
 	if err != nil {
 		return internetProbeRecord{Name: name, Path: path, Status: "fail", Detail: redactSensitive(err.Error())}
 	}
 	return internetProbeRecord{Name: name, Path: path, Status: "ok", Detail: httpStatusDetail(status, body)}
+}
+
+type webQuorumTarget struct {
+	Label string
+	URL   string
+}
+
+type webQuorumTargetResult struct {
+	Label   string
+	Status  int
+	Elapsed time.Duration
+	Retried bool
+	Err     error
+}
+
+var defaultWebQuorumTargets = []webQuorumTarget{
+	{Label: "google", URL: "https://www.google.com/generate_204"},
+	{Label: "cloudflare", URL: "https://www.cloudflare.com/cdn-cgi/trace"},
+	{Label: "github", URL: "https://github.com/"},
+	{Label: "npm", URL: "https://registry.npmjs.org/"},
+}
+
+func probeWebQuorum(name, path string, proxy *url.URL, fastTimeout, slowTimeout time.Duration) internetProbeRecord {
+	results := probeWebQuorumTargets(proxy, defaultWebQuorumTargets, fastTimeout, slowTimeout)
+	ok := 0
+	parts := make([]string, 0, len(results))
+	for _, result := range results {
+		if result.Err == nil {
+			ok++
+			slow := ""
+			if result.Retried {
+				slow = " slow"
+			}
+			parts = append(parts, fmt.Sprintf("%s HTTP %d %s%s", result.Label, result.Status, formatProbeDuration(result.Elapsed), slow))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s fail %s", result.Label, formatProbeDuration(result.Elapsed)))
+	}
+	detail := fmt.Sprintf("%d/%d %s", ok, len(results), strings.Join(parts, ", "))
+	status := "ok"
+	if ok < minInt(3, len(results)) {
+		status = "fail"
+	}
+	return internetProbeRecord{Name: name, Path: path, Status: status, Detail: detail}
+}
+
+func probeWebQuorumTargets(proxy *url.URL, targets []webQuorumTarget, fastTimeout, slowTimeout time.Duration) []webQuorumTargetResult {
+	type indexedResult struct {
+		Index  int
+		Result webQuorumTargetResult
+	}
+	ch := make(chan indexedResult, len(targets))
+	for i, target := range targets {
+		go func(index int, target webQuorumTarget) {
+			ch <- indexedResult{Index: index, Result: probeWebQuorumTarget(proxy, target, fastTimeout, slowTimeout)}
+		}(i, target)
+	}
+	results := make([]webQuorumTargetResult, len(targets))
+	for range targets {
+		got := <-ch
+		results[got.Index] = got.Result
+	}
+	return results
+}
+
+func probeWebQuorumTarget(proxy *url.URL, target webQuorumTarget, fastTimeout, slowTimeout time.Duration) webQuorumTargetResult {
+	started := time.Now()
+	status, _, err := fetchURLFunc(proxy, target.URL, fastTimeout)
+	if err == nil {
+		return webQuorumTargetResult{Label: target.Label, Status: status, Elapsed: time.Since(started)}
+	}
+	status, _, retryErr := fetchURLFunc(proxy, target.URL, slowTimeout)
+	if retryErr == nil {
+		return webQuorumTargetResult{Label: target.Label, Status: status, Elapsed: time.Since(started), Retried: true}
+	}
+	return webQuorumTargetResult{Label: target.Label, Elapsed: time.Since(started), Retried: true, Err: retryErr}
+}
+
+func probeHTTPWebQuorum(proxy *url.URL, timeout time.Duration) error {
+	return probeFastQuorum(defaultWebQuorumTargets, minInt(3, len(defaultWebQuorumTargets)), timeout, func(target webQuorumTarget) error {
+		_, _, err := fetchURLFunc(proxy, target.URL, timeout)
+		return err
+	})
+}
+
+func probeSOCKSWebQuorum(socks string, timeout time.Duration) error {
+	return probeFastQuorum(defaultWebQuorumTargets, minInt(3, len(defaultWebQuorumTargets)), timeout, func(target webQuorumTarget) error {
+		hostPort, err := webQuorumTargetHostPort(target)
+		if err != nil {
+			return err
+		}
+		return probeSOCKS("Gateway SOCKS HTTPS", socks, hostPort, timeout).Err
+	})
+}
+
+func probeFastQuorum(targets []webQuorumTarget, quorum int, timeout time.Duration, probe func(webQuorumTarget) error) error {
+	if len(targets) == 0 || quorum <= 0 {
+		return fmt.Errorf("web quorum has no targets")
+	}
+	type result struct {
+		label string
+		err   error
+	}
+	ch := make(chan result, len(targets))
+	for _, target := range targets {
+		go func(target webQuorumTarget) {
+			ch <- result{label: target.Label, err: probe(target)}
+		}(target)
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ok := 0
+	fail := 0
+	failures := []string{}
+	for received := 0; received < len(targets); received++ {
+		select {
+		case got := <-ch:
+			if got.err == nil {
+				ok++
+				if ok >= quorum {
+					return nil
+				}
+			} else {
+				fail++
+				failures = append(failures, got.label)
+				if len(targets)-fail < quorum {
+					return fmt.Errorf("web quorum failed: %d/%d reachable; failed: %s", ok, len(targets), strings.Join(failures, ", "))
+				}
+			}
+		case <-timer.C:
+			return fmt.Errorf("web quorum timeout: %d/%d reachable after %s", ok, len(targets), formatProbeDuration(timeout))
+		}
+	}
+	return fmt.Errorf("web quorum failed: %d/%d reachable", ok, len(targets))
+}
+
+func webQuorumTargetHostPort(target webQuorumTarget) (string, error) {
+	u, err := url.Parse(target.URL)
+	if err != nil {
+		return "", err
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("target host missing")
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 func fetchURL(proxy *url.URL, target string, timeout time.Duration) (int, string, error) {
@@ -12009,6 +12475,30 @@ func (a app) ensureActiveGatewayRuntime(st *envdState) error {
 	if err := startGatewayRuntime(runtimeDir); err != nil {
 		return layerErr("local gateway", err)
 	}
+	if err := verifyActiveGatewayRuntime(cfg, 6*time.Second); err == nil {
+		return nil
+	}
+	if err := restartGatewayRuntime(runtimeDir); err != nil {
+		return layerErr("local gateway", err)
+	}
+	if err := verifyActiveGatewayRuntime(cfg, 8*time.Second); err != nil {
+		return layerErr("remote gateway", err)
+	}
+	return nil
+}
+
+func (a app) restartActiveGatewayRuntime(st *envdState) error {
+	cfg, _, err := a.activeGatewayConfig(st)
+	if err != nil {
+		return err
+	}
+	runtimeDir, err := a.materializeGatewayRuntime(cfg)
+	if err != nil {
+		return layerErr("local gateway", err)
+	}
+	if err := restartGatewayRuntime(runtimeDir); err != nil {
+		return layerErr("local gateway", err)
+	}
 	return nil
 }
 
@@ -12022,6 +12512,40 @@ func gatewayRuntimeDir() (string, error) {
 
 func startGatewayRuntime(runtimeDir string) error {
 	return dockerRun("compose", "-f", filepath.Join(runtimeDir, "compose.yml"), "up", "-d")
+}
+
+func verifyActiveGatewayRuntime(cfg gatewayConfig, timeout time.Duration) error {
+	host := hostForClient(cfg.BindIP)
+	socks := net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort))
+	httpProxy := net.JoinHostPort(host, strconv.Itoa(cfg.HTTPHostPort))
+	return verifyGatewayProxyCached(socks, httpProxy, timeout)
+}
+
+func restartGatewayRuntime(runtimeDir string) error {
+	const containerName = "vpn-gateway-xray-1"
+	if dockerContainerStatus(containerName) == "missing" {
+		if err := startGatewayRuntime(runtimeDir); err != nil {
+			return err
+		}
+		return waitForDockerContainerRunning(containerName, 10*time.Second)
+	}
+	if err := dockerRun("restart", "-t", "1", containerName); err != nil {
+		return err
+	}
+	return waitForDockerContainerRunning(containerName, 10*time.Second)
+}
+
+func waitForDockerContainerRunning(name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	last := "missing"
+	for time.Now().Before(deadline) {
+		last = dockerContainerStatus(name)
+		if last == "running" {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("%s is %s after %s", name, last, timeout)
 }
 
 func gatewayComposeYAML(cfg gatewayConfig) string {
