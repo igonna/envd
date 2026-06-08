@@ -1,9 +1,11 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -2417,7 +2419,23 @@ func fileURL(path string) string {
 }
 
 func downloadFile(path, rawURL string) error {
-	resp, err := http.Get(rawURL)
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err := downloadFileOnce(path, rawURL); err != nil {
+			lastErr = err
+			if attempt < 3 {
+				time.Sleep(time.Duration(attempt) * time.Second)
+			}
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func downloadFileOnce(path, rawURL string) error {
+	client := http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Get(rawURL)
 	if err != nil {
 		return err
 	}
@@ -2428,13 +2446,201 @@ func downloadFile(path, rawURL string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func downloadFileWithProgress(path, rawURL, label string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	offset := int64(0)
+	if info, err := os.Stat(tmp); err == nil {
+		offset = info.Size()
+	}
+	client := http.Client{Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		TLSHandshakeTimeout:   45 * time.Second,
+		ResponseHeaderTimeout: 45 * time.Second,
+	}}
+	var lastErr error
+	for attempt := 1; attempt <= 20; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(min(attempt, 10)) * time.Second)
+		}
+		if info, err := os.Stat(tmp); err == nil {
+			offset = info.Size()
+		}
+		err := downloadFileRange(client, tmp, rawURL, label, offset)
+		if err == nil {
+			fmt.Fprintln(os.Stderr)
+			return os.Rename(tmp, path)
+		}
+		lastErr = err
+		fmt.Fprintf(os.Stderr, "\nDownload interrupted: %s; retrying %d/20\n", err, attempt)
+	}
+	return lastErr
+}
+
+func downloadFileRange(client http.Client, tmp, rawURL, label string, offset int64) error {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
+	resp, err := doRequestWithStatus(client, req, label, offset)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	appendMode := offset > 0 && resp.StatusCode == http.StatusPartialContent
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("download returned HTTP %d", resp.StatusCode)
+	}
+	if !appendMode {
+		offset = 0
+	}
+	total := int64(-1)
+	if resp.ContentLength > 0 {
+		total = offset + resp.ContentLength
+	}
+	flags := os.O_CREATE | os.O_WRONLY
+	if appendMode {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
+	}
+	f, err := os.OpenFile(tmp, flags, 0o600)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	progress := downloadProgress{label: label, done: offset, total: total, last: time.Now(), lastPercent: -1}
+	buf := make([]byte, 64*1024)
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, err := f.Write(buf[:n]); err != nil {
+				return err
+			}
+			progress.add(int64(n))
+		}
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			progress.print(true)
+			return nil
+		}
+		return readErr
+	}
+}
+
+func doRequestWithStatus(client http.Client, req *http.Request, label string, offset int64) (*http.Response, error) {
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := client.Do(req)
+		done <- result{resp: resp, err: err}
+	}()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	start := time.Now()
+	printConnectStatus(label, offset, 0)
+	for {
+		select {
+		case res := <-done:
+			return res.resp, res.err
+		case <-ticker.C:
+			printConnectStatus(label, offset, time.Since(start))
+		}
+	}
+}
+
+func printConnectStatus(label string, offset int64, elapsed time.Duration) {
+	resume := ""
+	if offset > 0 {
+		resume = " resume " + formatBytes(offset)
+	}
+	printDownloadStatus(fmt.Sprintf("%s: connecting%s (%s)", label, resume, elapsed.Round(time.Second)), false)
+}
+
+type downloadProgress struct {
+	label       string
+	done        int64
+	total       int64
+	last        time.Time
+	lastPercent int
+}
+
+func (p *downloadProgress) add(n int64) {
+	p.done += n
+	percent := -1
+	if p.total > 0 {
+		percent = int(float64(p.done) * 100 / float64(p.total))
+	}
+	if time.Since(p.last) >= 5*time.Second || (percent >= 0 && percent != p.lastPercent) {
+		p.print(false)
+	}
+}
+
+func (p *downloadProgress) print(final bool) {
+	p.last = time.Now()
+	if p.total > 0 {
+		percent := float64(p.done) * 100 / float64(p.total)
+		p.lastPercent = int(percent)
+		printDownloadStatus(fmt.Sprintf("%s: %s/%s %.1f%%", p.label, formatBytes(p.done), formatBytes(p.total), percent), final)
+	} else {
+		printDownloadStatus(fmt.Sprintf("%s: %s", p.label, formatBytes(p.done)), final)
+	}
+	if final {
+		printDownloadStatus(p.label+": done", true)
+	}
+}
+
+func printDownloadStatus(line string, final bool) {
+	if term.IsTerminal(int(os.Stderr.Fd())) {
+		fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", line)
+		if final {
+			fmt.Fprintln(os.Stderr)
+		}
+		return
+	}
+	fmt.Fprintln(os.Stderr, line)
+}
+
+func formatBytes(n int64) string {
+	units := []string{"B", "KB", "MB", "GB"}
+	value := float64(n)
+	unit := 0
+	for value >= 1024 && unit < len(units)-1 {
+		value /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d%s", n, units[unit])
+	}
+	return fmt.Sprintf("%.1f%s", value, units[unit])
 }
 
 func unzipFile(zipPath, dest string) error {
@@ -3003,12 +3209,14 @@ Default:
 func (a app) printVSCodeHelp() {
 	fmt.Fprint(a.stdout, `Usage:
   envd vscode setup
+  envd vscode ENV
 
 Effect:
   applies minimal VS Code user settings
   keeps existing unrelated settings
   writes a .bak backup before changing settings
   installs Remote SSH when the code CLI is available
+  opens ENV with a preseeded VS Code server
 
 `)
 }
@@ -3330,9 +3538,20 @@ func (a app) runVSCodeExtensions(args []string) error {
 }
 
 func (a app) runVSCode(args []string) error {
-	if len(args) != 1 || args[0] != "setup" {
-		return fmt.Errorf("usage: envd vscode setup")
+	if len(args) == 0 || isHelpArg(args[0]) {
+		a.printVSCodeHelp()
+		return nil
 	}
+	if len(args) == 1 && args[0] == "setup" {
+		return a.runVSCodeSetup()
+	}
+	if len(args) == 1 {
+		return a.runVSCodeOpen(args[0])
+	}
+	return fmt.Errorf("usage: envd vscode setup|ENV")
+}
+
+func (a app) runVSCodeSetup() error {
 	settingsPath, err := vscodeUserSettingsPath()
 	if err != nil {
 		return err
@@ -3356,6 +3575,58 @@ func (a app) runVSCode(args []string) error {
 		fmt.Fprintln(a.stdout, "Remote SSH: installed")
 	}
 	return nil
+}
+
+func (a app) runVSCodeOpen(envName string) error {
+	if err := validateEnvName(envName); err != nil {
+		return err
+	}
+	ref, err := vscodeEnvRef(envName)
+	if err != nil || dockerContainerStatus(ref.DevName) != "running" {
+		if err := a.withState(func(st *envdState) error {
+			if err := a.startEnv([]string{envName}, st); err != nil {
+				return err
+			}
+			ref, err = resolveEnvRef(st, envName)
+			return err
+		}); err != nil {
+			return err
+		}
+	}
+	if dockerContainerStatus(ref.DevName) != "running" {
+		return fmt.Errorf("environment %q is not running", envName)
+	}
+	if err := ensureEnvSSHConfig(envName, currentEnvdExecutable()); err != nil {
+		return err
+	}
+	if err := preseedVSCodeServer(ref); err != nil {
+		return err
+	}
+	code, err := exec.LookPath("code")
+	if err != nil {
+		return fmt.Errorf("code CLI not found")
+	}
+	cmd := exec.Command(code, "--remote", "ssh-remote+"+envName, "/home/dev/repo")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("code remote launch failed: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	fmt.Fprintf(a.stdout, "VS Code: ssh %s\n", envName)
+	return nil
+}
+
+func vscodeEnvRef(envName string) (envRef, error) {
+	route, err := runtimeRoute(envName)
+	if err != nil {
+		return envRef{}, err
+	}
+	return envRef{
+		Name:     route.Name,
+		ID:       route.ID,
+		UserName: route.UserName,
+		DevName:  route.DevName,
+		Network:  route.Network,
+		Storage:  route.Storage,
+	}, nil
 }
 
 func vscodeUserSettingsPath() (string, error) {
@@ -3518,6 +3789,7 @@ func minimalVSCodeSettings() map[string]any {
 		"breadcrumbs.enabled":                    false,
 		"chat.disableAIFeatures":                 true,
 		"extensions.ignoreRecommendations":       true,
+		"security.workspace.trust.enabled":       false,
 		"workbench.colorTheme":                   "Dark Modern",
 		"update.mode":                            "manual",
 		"git.openRepositoryInParentFolders":      "never",
@@ -3534,6 +3806,144 @@ func installVSCodeRemoteSSH() error {
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func preseedVSCodeServer(ref envRef) error {
+	commit, artifact, err := vscodeServerArtifact()
+	if err != nil {
+		return err
+	}
+	cliArchivePath, err := ensureVSCodeArchive(commit, artifact, artifact+".tar.gz")
+	if err != nil {
+		return err
+	}
+	serverArtifact := strings.TrimPrefix(strings.ReplaceAll(artifact, "cli-alpine", "server-linux"), "cli-")
+	serverArchivePath, err := ensureVSCodeArchive(commit, serverArtifact, serverArtifact+".tar.gz")
+	if err != nil {
+		return err
+	}
+	user := ref.UserName
+	if user == "" {
+		user = "dev"
+	}
+	remoteDir := filepath.Join("/home", user, ".vscode-server")
+	remoteArchive := filepath.Join(remoteDir, "vscode-cli-"+commit+".tar.gz")
+	remoteDone := remoteArchive + ".done"
+	if err := dockerRun("exec", "-u", "root", ref.DevName, "sh", "-lc",
+		"mkdir -p "+shellQuote(remoteDir)+" && chown "+shellQuote(user+":"+user)+" "+shellQuote(remoteDir)); err != nil {
+		return err
+	}
+	if err := dockerRun("cp", cliArchivePath, ref.DevName+":"+remoteArchive); err != nil {
+		return err
+	}
+	if err := dockerRun("exec", "-u", "root", ref.DevName, "sh", "-lc",
+		"touch "+shellQuote(remoteDone)+" && chown "+shellQuote(user+":"+user)+" "+shellQuote(remoteArchive)+" "+shellQuote(remoteDone)); err != nil {
+		return err
+	}
+	remoteServerArchive := "/tmp/envd-vscode-server-" + commit + ".tar.gz"
+	if err := dockerRun("cp", serverArchivePath, ref.DevName+":"+remoteServerArchive); err != nil {
+		return err
+	}
+	serverName := "Stable-" + commit
+	serverTopDir := serverArtifact
+	serverRoot := filepath.Join(remoteDir, "cli", "servers")
+	serverTarget := filepath.Join(serverRoot, serverName)
+	serverStaging := filepath.Join(serverRoot, serverName+".staging")
+	script := strings.Join([]string{
+		"set -eu",
+		"mkdir -p " + shellQuote(serverRoot),
+		"if [ ! -f " + shellQuote(filepath.Join(serverTarget, "product.json")) + " ]; then",
+		"  rm -rf " + shellQuote(serverTarget) + " " + shellQuote(serverStaging),
+		"  mkdir -p " + shellQuote(serverStaging),
+		"  tar -xzf " + shellQuote(remoteServerArchive) + " -C " + shellQuote(serverStaging),
+		"  if [ -d " + shellQuote(filepath.Join(serverStaging, serverTopDir)) + " ]; then",
+		"    mv " + shellQuote(filepath.Join(serverStaging, serverTopDir)) + " " + shellQuote(serverTarget),
+		"    rmdir " + shellQuote(serverStaging) + " 2>/dev/null || true",
+		"  else",
+		"    mv " + shellQuote(serverStaging) + " " + shellQuote(serverTarget),
+		"  fi",
+		"  chown -R " + shellQuote(user+":"+user) + " " + shellQuote(serverTarget),
+		"fi",
+		"rm -f " + shellQuote(remoteServerArchive),
+	}, "\n")
+	if err := dockerRun("exec", "-u", "root", ref.DevName, "sh", "-lc", script); err != nil {
+		return err
+	}
+	return nil
+}
+
+func vscodeServerArtifact() (commit string, artifact string, err error) {
+	code, err := exec.LookPath("code")
+	if err != nil {
+		return "", "", fmt.Errorf("code CLI not found")
+	}
+	out, err := exec.Command(code, "--version").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("code --version failed: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 2 || strings.TrimSpace(lines[1]) == "" {
+		return "", "", fmt.Errorf("cannot determine VS Code commit")
+	}
+	commit = strings.TrimSpace(lines[1])
+	switch runtime.GOARCH {
+	case "arm64":
+		artifact = "cli-alpine-arm64"
+	case "amd64":
+		artifact = "cli-alpine-x64"
+	default:
+		return "", "", fmt.Errorf("unsupported VS Code remote architecture %s", runtime.GOARCH)
+	}
+	return commit, artifact, nil
+}
+
+func ensureVSCodeArchive(commit, artifact, filename string) (string, error) {
+	dir, err := envdDataDir()
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "vscode", commit, filename)
+	if fileExists(path) {
+		if validTarGz(path) {
+			return path, nil
+		}
+		_ = os.Rename(path, path+".tmp")
+	}
+	label := "Downloading VS Code archive"
+	if strings.HasPrefix(artifact, "server-linux-") {
+		label = "Downloading VS Code server"
+		fmt.Fprintf(os.Stderr, "%s: %s (cached after first use)\n", label, artifact)
+	}
+	rawURL := fmt.Sprintf("https://update.code.visualstudio.com/commit:%s/%s/stable", commit, artifact)
+	if err := downloadFileWithProgress(path, rawURL, label); err != nil {
+		return "", err
+	}
+	if !validTarGz(path) {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("downloaded VS Code archive is invalid: %s", artifact)
+	}
+	return path, nil
+}
+
+func validTarGz(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return false
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		_, err := tr.Next()
+		if err == nil {
+			continue
+		}
+		return errors.Is(err, io.EOF)
+	}
 }
 
 func (a app) runEnv(args []string, st *envdState) error {
@@ -3693,6 +4103,7 @@ func (a app) runEnv(args []string, st *envdState) error {
 	if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 		return err
 	}
+	a.refreshUnlockedIdentityAgents(st)
 
 	ok = true
 	fmt.Fprintf(a.stdout, "Created: %s\n", name)
@@ -3821,6 +4232,7 @@ func (a app) startEnv(args []string, st *envdState) error {
 			if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 				return err
 			}
+			a.refreshUnlockedIdentityAgents(st)
 			st.addEvent("env", name, "started from protected storage")
 			fmt.Fprintf(a.stdout, "Started: %s\n", name)
 			fmt.Fprintf(a.stdout, "SSH:     ssh %s\n", name)
@@ -3859,6 +4271,7 @@ func (a app) startEnv(args []string, st *envdState) error {
 			if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 				return err
 			}
+			a.refreshUnlockedIdentityAgents(st)
 			st.addEvent("env", name, "recreated sealed runtime before start: "+reason)
 			fmt.Fprintf(a.stdout, "Recreated sealed runtime: %s\n", reason)
 			fmt.Fprintf(a.stdout, "Started: %s\n", name)
@@ -3909,6 +4322,7 @@ func (a app) startEnv(args []string, st *envdState) error {
 	if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 		return err
 	}
+	a.refreshUnlockedIdentityAgents(st)
 	st.addEvent("env", name, "started")
 	fmt.Fprintf(a.stdout, "Started: %s\n", name)
 	fmt.Fprintf(a.stdout, "SSH:     ssh %s\n", name)
@@ -6135,6 +6549,12 @@ func (a app) startUnlockedIdentityAgents(st *envdState) (int, error) {
 	return started, nil
 }
 
+func (a app) refreshUnlockedIdentityAgents(st *envdState) {
+	if _, err := a.startUnlockedIdentityAgents(st); err != nil {
+		st.addEvent("identity", "", "identity agent refresh failed: "+redactSensitive(err.Error()))
+	}
+}
+
 func startStaticIdentityAgent(envName string, identity identityRecord) error {
 	socketPath, err := identityAgentSocketPath(envName)
 	if err != nil {
@@ -6244,11 +6664,6 @@ func (a app) runSSHProxy(args []string) error {
 	envName := ""
 	if len(args) == 1 {
 		envName = args[0]
-		stop, err := a.startSSHProxyIdentityAgent(args[0])
-		if err != nil {
-			return err
-		}
-		defer stop()
 	}
 	if err := a.ensureSSHProxyEnvRunning(args); err != nil {
 		return err
@@ -6290,70 +6705,6 @@ func (a app) ensureSSHProxyEnvRunning(args []string) error {
 	return quiet.withState(func(st *envdState) error {
 		return quiet.startEnv([]string{name}, st)
 	})
-}
-
-func (a app) startSSHProxyIdentityAgent(envName string) (func(), error) {
-	store, err := newStateStore()
-	if err != nil {
-		return func() {}, err
-	}
-	socketPath, err := identityAgentSocketPath(envName)
-	if err != nil {
-		return func() {}, err
-	}
-	if unixSocketAccepts(socketPath) {
-		return func() {}, nil
-	}
-	staleSocket := false
-	if _, err := os.Stat(socketPath); err == nil {
-		staleSocket = true
-	}
-	var identityName string
-	if err := store.withState(a.stderr, func(st *envdState) error {
-		st.ensureDefaults()
-		identity, err := singleSSHIdentityForShell(st, envName)
-		if err != nil {
-			return err
-		}
-		if identity == nil {
-			return nil
-		}
-		identityName = identity.Name
-		return nil
-	}); err != nil {
-		if staleSocket {
-			_ = os.Remove(socketPath)
-		}
-		return func() {}, nil
-	}
-	if identityName == "" {
-		return func() {}, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
-		return func() {}, err
-	}
-	_ = os.Remove(socketPath)
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		return func() {}, err
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go a.handleIdentitySSHAgentConn(conn, envName, identityName)
-		}
-	}()
-	stop := func() {
-		_ = listener.Close()
-		<-done
-		_ = os.Remove(socketPath)
-	}
-	return stop, nil
 }
 
 func isSSHProxyUnlockUnavailable(err error) bool {

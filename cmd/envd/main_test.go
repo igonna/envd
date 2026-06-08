@@ -601,48 +601,18 @@ func TestInstallVhromeLinuxLauncher(t *testing.T) {
 	}
 }
 
-func TestSSHProxyIgnoresStaleIdentitySocketWithoutCache(t *testing.T) {
+func TestSSHProxyUsesRuntimeAccessWithoutUnlock(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("ENVD_DATA_DIR", filepath.Join(home, ".local", "share", "envd"))
-	stateDir := filepath.Join(home, ".local", "state", "envd")
-	t.Setenv("ENVD_STATE_DIR", stateDir)
 	t.Setenv("ENVD_NONINTERACTIVE", "1")
-	t.Setenv("ENVD_UNLOCK_SOCKET", filepath.Join(home, "unlock.sock"))
-	store := stateStore{dir: stateDir, path: filepath.Join(stateDir, "state.enc")}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+	ref := envRef{Name: "books", ID: "abc123", UserName: "dev", DevName: "envd-abc123-dev", Network: "sealed"}
+	if err := publishRuntimeRoute(ref, "sealed"); err != nil {
 		t.Fatal(err)
 	}
-	st := envdState{
-		Environments: map[string]envRecord{"books": {ID: "abc123", Network: "sealed", GatewayGeneration: 1}},
-		Identities: map[string]identityRecord{"github": {
-			Name:       "github",
-			Type:       "ssh",
-			PrivateKey: "secret",
-			Policy:     defaultIdentityPolicy(),
-		}},
-		GatewayGeneration: 1,
-	}
-	if err := store.save(st, []byte("test-password")); err != nil {
-		t.Fatal(err)
-	}
-	socketPath, err := identityAgentSocketPath("books")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(socketPath, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	stop, err := (app{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, root: t.TempDir()}).startSSHProxyIdentityAgent("books")
-	if err != nil {
-		t.Fatalf("stale identity socket blocked ssh proxy: %v", err)
-	}
-	stop()
-	if _, err := os.Stat(socketPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stale socket was not removed: %v", err)
+	_, err := prepareSSHProxyDockerArgs([]string{"books"})
+	if err == nil || !strings.Contains(err.Error(), `environment "books" is not running`) {
+		t.Fatalf("expected runtime-only not-running error, got %v", err)
 	}
 }
 
