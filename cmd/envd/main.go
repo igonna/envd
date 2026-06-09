@@ -31,6 +31,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -338,6 +339,11 @@ func (a app) run(args []string) error {
 			return a.printCommandHelp([]string{"details"})
 		}
 		return a.withState(func(st *envdState) error { return a.runDetails(args[1:], st) })
+	case "cp":
+		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
+			return a.printCommandHelp([]string{"cp"})
+		}
+		return a.runCopy(args[1:])
 	case "start":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"start"})
@@ -980,6 +986,7 @@ Environment:
   start                create or start an environment
   shell                open a shell or run a command
   details              show environment details
+  cp                   copy files to/from an environment
   stop                 stop an environment
   rm                   remove an environment
   vscode               apply minimal VS Code settings
@@ -1057,6 +1064,8 @@ Next command: envd init
 		fmt.Fprint(a.stdout, "Usage:\n  envd shell ENV\n  envd shell ENV COMMAND [args]\n")
 	case "details":
 		fmt.Fprint(a.stdout, "Usage: envd details ENV\n")
+	case "cp":
+		a.printCopyHelp()
 	case "stop":
 		fmt.Fprint(a.stdout, "Usage: envd stop ENV\n")
 	case "rm":
@@ -1280,6 +1289,7 @@ func topLevelCompletionCommands() []string {
 		"start",
 		"shell",
 		"details",
+		"cp",
 		"stop",
 		"rm",
 		"vscode",
@@ -1345,6 +1355,7 @@ _envd() {
     start:'create or start an environment'
     shell:'open a shell or run a command'
     details:'show environment details'
+    cp:'copy files to/from an environment'
     stop:'stop an environment'
     rm:'remove an environment'
     vscode:'open VS Code for an environment'
@@ -1362,7 +1373,7 @@ _envd() {
     help:'show help'
   )
 
-  env_commands=(start shell details stop rm vscode ssh-proxy)
+  env_commands=(start shell details cp stop rm vscode ssh-proxy)
   gateway_commands=(install list use status details render egress share shares view revoke rollback chain)
   doctor_commands=(network why history identity)
   browser_commands=(install update status reset open)
@@ -1379,6 +1390,15 @@ _envd() {
     _describe 'environment' envs
   }
 
+  _envd_cp_target() {
+    local -a remotes
+    remotes=("${(@f)$(_call_program envs envd completion envs 2>/dev/null)}")
+    remotes=("${(@)^remotes}:")
+    _alternative \
+      'files:local file:_files' \
+      'envs:environment prefix:_describe -t envs "environment prefix" remotes'
+  }
+
   if (( CURRENT == 2 )); then
     _describe 'command' commands
     return
@@ -1391,6 +1411,11 @@ _envd() {
     start|shell|details|stop|rm|vscode|ssh-proxy)
       if (( CURRENT == 3 )); then
         _envd_envs
+      fi
+      ;;
+    cp)
+      if (( CURRENT == 3 || CURRENT == 4 )); then
+        _envd_cp_target
       fi
       ;;
     vscode-extensions)
@@ -1463,7 +1488,7 @@ _envd_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]}"
   command="${COMP_WORDS[1]}"
 
-  local commands="init status completion lock unlock password idle reset-state start shell details stop rm vscode vscode-extensions gateway proxy doctor browser hosting network pkg identity migrate version help"
+  local commands="init status completion lock unlock password idle reset-state start shell details cp stop rm vscode vscode-extensions gateway proxy doctor browser hosting network pkg identity migrate version help"
   local gateway_commands="install list use status details render egress share shares view revoke rollback chain"
   local doctor_commands="network why history identity"
   local browser_commands="install update status reset open"
@@ -1478,6 +1503,14 @@ _envd_completion() {
     envd completion envs 2>/dev/null
   }
 
+  _envd_cp_targets() {
+    local envs env
+    envs="$(_envd_envs)"
+    for env in $envs; do
+      printf '%s:\n' "$env"
+    done
+  }
+
   if [ "$COMP_CWORD" -eq 1 ]; then
     COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
     return 0
@@ -1490,6 +1523,11 @@ _envd_completion() {
     start|shell|details|stop|rm|vscode|ssh-proxy)
       if [ "$COMP_CWORD" -eq 2 ]; then
         COMPREPLY=( $(compgen -W "$(_envd_envs)" -- "$cur") )
+      fi
+      ;;
+    cp)
+      if [ "$COMP_CWORD" -eq 2 ] || [ "$COMP_CWORD" -eq 3 ]; then
+        COMPREPLY=( $(compgen -f -- "$cur") $(compgen -W "$(_envd_cp_targets)" -- "$cur") )
       fi
       ;;
     vscode-extensions)
@@ -2100,6 +2138,26 @@ Flags:
 
 Default:
   sealed network, plain storage
+
+`)
+}
+
+func (a app) printCopyHelp() {
+	fmt.Fprint(a.stdout, `Usage:
+  envd cp LOCAL ENV:PATH
+  envd cp ENV:PATH LOCAL
+
+Examples:
+  envd cp ./file books:/repo/
+  envd cp ./folder books:/repo/folder
+  envd cp books:/repo/file .
+  envd cp books:logs ./logs
+
+Rules:
+  one side must be local and one side must be ENV:PATH
+  ENV:relative/path is relative to /home/dev/repo
+  ENV:~/path is relative to /home/dev
+  ENV:/absolute/path is absolute inside the environment
 
 `)
 }
@@ -3925,19 +3983,20 @@ func (a app) runDetails(args []string, st *envdState) error {
 		{"Name", env.Name},
 		{"State", env.Dev.State.Status},
 		{"Network", env.networkMode()},
-		{"VPN", env.netHealth()},
 		{"Storage", env.storageMode(st)},
+	}
+	if env.networkMode() == "sealed" {
+		rows = append(rows, detailRow{"VPN", env.netHealth()})
+	}
+	if ref, err := resolveEnvRef(st, args[0]); err == nil {
+		rows = append(rows, sshConnectionDetailRows(ref)...)
 	}
 	if env.storageMode(st) == "protected" {
 		if rec, ok := st.Environments[args[0]]; ok {
 			rows = append(rows, detailRow{"Backend", rec.StorageBackend})
 		}
 	}
-	rows = append(rows,
-		detailRow{"Gateway generation", strconv.Itoa(st.GatewayGeneration)},
-		detailRow{"Image", env.Dev.Config.Image},
-		detailRow{"Image ID", env.Dev.Image},
-	)
+	rows = append(rows, detailRow{"Image", env.Dev.Config.Image})
 	if env.BlockedReason != "" {
 		rows = append(rows, detailRow{"Blocked", env.BlockedReason})
 	}
@@ -3948,14 +4007,54 @@ func (a app) runDetails(args []string, st *envdState) error {
 	if env.Legacy {
 		rows = append(rows, detailRow{"Legacy", "true"})
 	}
-	if env.Net != nil {
-		rows = append(rows, detailRow{"Sidecar", fmt.Sprintf("%s (%s)", env.Net.Name, env.Net.State.Status)})
-	}
 	if issue := env.issue(st.GatewayGeneration); issue != "" {
 		rows = append(rows, detailRow{"Issue", issue})
 	}
 	printDetailRows(a.stdout, rows)
 	return nil
+}
+
+func sshConnectionDetailRows(ref envRef) []detailRow {
+	userName := ref.UserName
+	if userName == "" {
+		userName = "dev"
+	}
+	rows := []detailRow{
+		{"SSH", "ssh " + ref.Name},
+		{"SFTP", "sftp " + ref.Name},
+	}
+	_, _, envdConfig, knownHosts, keyPath, _, err := sshConfigPaths()
+	if ref.NetName != "" {
+		if port, portErr := dockerPublishedPort(ref.NetName, "22/tcp"); portErr == nil {
+			rows = append(rows, detailRow{"Direct SFTP", fmt.Sprintf("%s@127.0.0.1:%d", userName, port)})
+			if err == nil {
+				rows = append(rows, detailRow{"SFTP command", fmt.Sprintf("sftp -o UserKnownHostsFile=%s -i %s -P %d %s@127.0.0.1", displayPath(knownHosts), displayPath(keyPath), port, userName)})
+			}
+		}
+	}
+	if err == nil {
+		rows = append(rows,
+			detailRow{"Key", displayPath(keyPath)},
+			detailRow{"SSH config", displayPath(envdConfig)},
+			detailRow{"Known hosts", displayPath(knownHosts)},
+		)
+	}
+	return rows
+}
+
+func displayPath(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if path == home {
+		return "~"
+	}
+	prefix := home + string(os.PathSeparator)
+	if strings.HasPrefix(path, prefix) {
+		return "~/" + strings.TrimPrefix(path, prefix)
+	}
+	return path
 }
 
 type detailRow struct {
@@ -6978,6 +7077,173 @@ func (a app) runShell(args []string) error {
 	cmd.Stdout = a.stdout
 	cmd.Stderr = a.stderr
 	return cmd.Run()
+}
+
+type copyEndpoint struct {
+	Raw    string
+	Env    string
+	Path   string
+	Remote bool
+}
+
+func (a app) runCopy(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: envd cp LOCAL ENV:PATH or envd cp ENV:PATH LOCAL")
+	}
+	src, err := parseCopyEndpoint(args[0])
+	if err != nil {
+		return err
+	}
+	dst, err := parseCopyEndpoint(args[1])
+	if err != nil {
+		return err
+	}
+	if src.Remote == dst.Remote {
+		if src.Remote {
+			return fmt.Errorf("env-to-env copy is not supported yet")
+		}
+		return fmt.Errorf("one side must be ENV:PATH")
+	}
+	remote := src
+	if !src.Remote {
+		remote = dst
+	}
+	route, err := a.ensureCopyEnvRunning(remote.Env)
+	if err != nil {
+		return err
+	}
+	containerPath := envCopyContainerPath(remote.Path)
+	if src.Remote {
+		return copyFromEnv(route.DevName, containerPath, dst.Path)
+	}
+	return copyToEnv(route.DevName, src.Path, containerPath)
+}
+
+func parseCopyEndpoint(raw string) (copyEndpoint, error) {
+	if env, remotePath, ok := splitCopyRemote(raw); ok {
+		if err := validateEnvName(env); err != nil {
+			return copyEndpoint{}, err
+		}
+		if strings.TrimSpace(remotePath) == "" {
+			remotePath = "."
+		}
+		return copyEndpoint{Raw: raw, Env: env, Path: remotePath, Remote: true}, nil
+	}
+	return copyEndpoint{Raw: raw, Path: raw}, nil
+}
+
+func splitCopyRemote(raw string) (string, string, bool) {
+	idx := strings.Index(raw, ":")
+	if idx <= 0 {
+		return "", "", false
+	}
+	left := raw[:idx]
+	if strings.Contains(left, "/") || strings.Contains(left, "\\") {
+		return "", "", false
+	}
+	if runtime.GOOS == "windows" && len(left) == 1 {
+		return "", "", false
+	}
+	if validateEnvName(left) != nil {
+		return "", "", false
+	}
+	return left, raw[idx+1:], true
+}
+
+func envCopyContainerPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" || p == "." || p == "~" {
+		return "/home/dev"
+	}
+	if strings.HasPrefix(p, "~/") {
+		return filepath.ToSlash(filepath.Join("/home/dev", strings.TrimPrefix(p, "~/")))
+	}
+	if strings.HasPrefix(p, "/") {
+		return filepath.Clean(p)
+	}
+	return filepath.ToSlash(filepath.Join("/home/dev/repo", p))
+}
+
+func (a app) ensureCopyEnvRunning(name string) (runtimeSSHRoute, error) {
+	route, err := runtimeRoute(name)
+	if err != nil {
+		return runtimeSSHRoute{}, err
+	}
+	if dockerContainerStatus(route.DevName) == "running" {
+		return route, nil
+	}
+	if err := startRuntimeRouteContainers(route); err == nil && dockerContainerStatus(route.DevName) == "running" {
+		return route, nil
+	}
+	quiet := app{stdout: io.Discard, stderr: a.stderr, root: a.root}
+	if err := quiet.withState(func(st *envdState) error {
+		return quiet.startEnv([]string{name}, st)
+	}); err != nil {
+		return runtimeSSHRoute{}, err
+	}
+	route, err = runtimeRoute(name)
+	if err != nil {
+		return runtimeSSHRoute{}, err
+	}
+	if dockerContainerStatus(route.DevName) != "running" {
+		return runtimeSSHRoute{}, fmt.Errorf("environment %q is not running", name)
+	}
+	return route, nil
+}
+
+func copyToEnv(container, localPath, remotePath string) error {
+	if strings.TrimSpace(localPath) == "" {
+		return fmt.Errorf("local source path is empty")
+	}
+	if _, err := os.Stat(localPath); err != nil {
+		return fmt.Errorf("local source %q: %w", localPath, err)
+	}
+	if err := ensureContainerDirForCopy(container, remotePath); err != nil {
+		return err
+	}
+	if err := dockerRun("cp", localPath, container+":"+remotePath); err != nil {
+		return err
+	}
+	return chownContainerPath(container, remotePath)
+}
+
+func copyFromEnv(container, remotePath, localPath string) error {
+	if strings.TrimSpace(localPath) == "" {
+		return fmt.Errorf("local destination path is empty")
+	}
+	if err := ensureLocalParentForCopy(localPath); err != nil {
+		return err
+	}
+	return dockerRun("cp", container+":"+remotePath, localPath)
+}
+
+func ensureContainerDirForCopy(container, remotePath string) error {
+	dir := remotePath
+	if !strings.HasSuffix(remotePath, "/") {
+		dir = path.Dir(remotePath)
+	}
+	if dir == "." || dir == "/" {
+		return nil
+	}
+	return dockerRun("exec", "-u", "root", container, "mkdir", "-p", dir)
+}
+
+func chownContainerPath(container, remotePath string) error {
+	return dockerRun("exec", "-u", "root", container, "sh", "-lc", "chown -R dev:dev "+shellQuote(remotePath)+" 2>/dev/null || true")
+}
+
+func ensureLocalParentForCopy(localPath string) error {
+	if localPath == "." {
+		return nil
+	}
+	if strings.HasSuffix(localPath, string(os.PathSeparator)) {
+		return os.MkdirAll(localPath, 0o755)
+	}
+	parent := filepath.Dir(localPath)
+	if parent == "." || parent == "" {
+		return nil
+	}
+	return os.MkdirAll(parent, 0o755)
 }
 
 func envNeedsStart(ref envRef, networkMode string) bool {
@@ -11720,6 +11986,31 @@ func dockerContainerStatus(name string) string {
 		return "missing"
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func dockerPublishedPort(container, privatePort string) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, dockerBinary(), "port", container, privatePort).Output()
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		_, portText, err := net.SplitHostPort(line)
+		if err != nil {
+			continue
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil {
+			continue
+		}
+		return port, nil
+	}
+	return 0, fmt.Errorf("no published port for %s %s", container, privatePort)
 }
 
 func dockerRun(args ...string) error {
