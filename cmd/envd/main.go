@@ -319,6 +319,9 @@ func (a app) run(args []string) error {
 		if len(args) > 1 && isHelpArg(args[1]) {
 			return a.printCommandHelp([]string{"browser"})
 		}
+		if isBrowserResetCommand(args[1:]) {
+			return a.withStateExplicitPassword(func(_ *envdState, _ []byte) error { return a.runBrowser(args[1:], nil) })
+		}
 		if len(args) == 1 || args[1] == "install" || args[1] == "update" || args[1] == "reset" || args[1] == "status" {
 			return a.runBrowser(args[1:], nil)
 		}
@@ -363,7 +366,7 @@ func (a app) run(args []string) error {
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"rm"})
 		}
-		return a.withState(func(st *envdState) error { return a.rmEnv(args[1:], st) })
+		return a.withStateExplicitPassword(func(st *envdState, _ []byte) error { return a.rmEnv(args[1:], st) })
 	case "lock":
 		return a.withState(func(st *envdState) error { return a.lockEnvd(args[1:], st) })
 	case "shell":
@@ -394,6 +397,9 @@ func (a app) run(args []string) error {
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"pkg"})
 		}
+		if isPkgRemoveCommand(args[1:]) {
+			return a.withStateExplicitPassword(func(st *envdState, _ []byte) error { return a.runPkg(args[1:], st) })
+		}
 		return a.withState(func(st *envdState) error { return a.runPkg(args[1:], st) })
 	case "supervisor":
 		return fmt.Errorf("unknown command %q\n\nRun envd help for available commands.", args[0])
@@ -401,10 +407,25 @@ func (a app) run(args []string) error {
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"migrate"})
 		}
+		if isMigrateProtectedCommand(args[1:]) {
+			return a.withStateExplicitPassword(func(st *envdState, password []byte) error { return a.runMigrate(args[1:], st, password) })
+		}
 		return a.withStatePasswordSaveOnError(func(st *envdState, password []byte) error { return a.runMigrate(args[1:], st, password) })
 	default:
 		return fmt.Errorf("unknown command %q\n\nRun envd help for available commands.", args[0])
 	}
+}
+
+func isBrowserResetCommand(args []string) bool {
+	return len(args) == 2 && args[0] == "reset" && args[1] == "--yes"
+}
+
+func isPkgRemoveCommand(args []string) bool {
+	return len(args) == 3 && args[0] == "rm" && args[2] == "--yes"
+}
+
+func isMigrateProtectedCommand(args []string) bool {
+	return len(args) == 3 && args[0] == "protected" && (args[2] == "--yes" || args[2] == "-y")
 }
 
 func isHelpArg(arg string) bool {
@@ -958,6 +979,17 @@ func (a app) withStatePasswordSaveOnError(fn func(*envdState, []byte) error) err
 	})
 }
 
+func (a app) withStateExplicitPassword(fn func(*envdState, []byte) error) error {
+	store, err := newStateStore()
+	if err != nil {
+		return err
+	}
+	return store.withStateExplicitPasswordSaveOnError(a.stderr, func(st *envdState, password []byte) error {
+		st.ensureDefaults()
+		return fn(st, password)
+	})
+}
+
 func (a app) printHelp() {
 	fmt.Fprint(a.stdout, `envd - sealed development environments with a managed gateway
 
@@ -1069,7 +1101,7 @@ Next command: envd init
 	case "stop":
 		fmt.Fprint(a.stdout, "Usage: envd stop ENV\n")
 	case "rm":
-		fmt.Fprint(a.stdout, "Usage: envd rm ENV --yes\n")
+		fmt.Fprint(a.stdout, "Usage: envd rm ENV --yes\n\nDeletes an environment after explicitly asking for the current master password. Cached unlock is not enough for deletion.\n")
 	case "vscode-extensions":
 		a.printVSCodeExtensionsHelp()
 	case "vscode":
@@ -3790,6 +3822,7 @@ func (a app) printBrowserHelp() {
 
 Vhrome is an envd-managed Chromium profile forced through the active gateway.
 It protects browser traffic only; it is not a whole-machine VPN.
+Reset asks for the current master password; cached unlock is not enough.
 Search: GoogleEn is added as a search option, but Chromium protects the
 default-search setting. Choose it manually in Vhrome settings if needed.
 
@@ -3825,6 +3858,8 @@ Add:
 
 Apply:
   envd start ENV --profile PROFILE
+
+Remove asks for the current master password; cached unlock is not enough.
 
 Common tools:
   tool:codex      installs Node/npm and @openai/codex
@@ -3870,6 +3905,8 @@ Commands:
   inspect              discover legacy envd containers/config
   adopt --yes          record legacy envs in envd state
   protected ENV --yes  move an env to protected storage
+
+Protected migration asks for the current master password; cached unlock is not enough.
 
 `)
 }

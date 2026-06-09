@@ -314,7 +314,15 @@ func (s stateStore) withStatePasswordSaveOnError(stderr io.Writer, fn func(*envd
 	return s.withStatePasswordMode(stderr, true, fn)
 }
 
+func (s stateStore) withStateExplicitPasswordSaveOnError(stderr io.Writer, fn func(*envdState, []byte) error) error {
+	return s.withStatePasswordReaderMode(stderr, true, readMasterPasswordUncached, fn)
+}
+
 func (s stateStore) withStatePasswordMode(stderr io.Writer, saveOnFnErr bool, fn func(*envdState, []byte) error) error {
+	return s.withStatePasswordReaderMode(stderr, saveOnFnErr, readMasterPassword, fn)
+}
+
+func (s stateStore) withStatePasswordReaderMode(stderr io.Writer, saveOnFnErr bool, readPassword func(io.Writer) ([]byte, error), fn func(*envdState, []byte) error) error {
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return err
 	}
@@ -327,7 +335,7 @@ func (s stateStore) withStatePasswordMode(stderr io.Writer, saveOnFnErr bool, fn
 	}
 	defer unlock()
 
-	password, err := readMasterPassword(stderr)
+	password, err := readPassword(stderr)
 	if err != nil {
 		return err
 	}
