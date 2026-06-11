@@ -351,11 +351,6 @@ func (a app) run(args []string) error {
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"start"})
 		}
-		if len(args) == 2 {
-			if ok, err := a.tryRuntimeStart(args[1]); ok || err != nil {
-				return err
-			}
-		}
 		return a.withState(func(st *envdState) error { return a.startOrCreateEnv(args[1:], st) })
 	case "stop":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
@@ -511,6 +506,7 @@ func (a app) runStatus(args []string) error {
 			if err != nil {
 				return err
 			}
+			a.repairRunningIdentityAgents(st)
 			containerStates, err := dockerContainerStates()
 			if err != nil {
 				return err
@@ -952,6 +948,17 @@ func (a app) withState(fn func(*envdState) error) error {
 		return err
 	}
 	return store.withState(a.stderr, func(st *envdState) error {
+		st.ensureDefaults()
+		return fn(st)
+	})
+}
+
+func (a app) withStateReadOnly(fn func(*envdState) error) error {
+	store, err := newStateStore()
+	if err != nil {
+		return err
+	}
+	return store.withStateReadOnly(a.stderr, func(st *envdState) error {
 		st.ensureDefaults()
 		return fn(st)
 	})
@@ -1410,7 +1417,7 @@ _envd() {
   doctor_commands=(network why history identity)
   browser_commands=(install update status reset open)
   pkg_commands=(list show add remove apply)
-  identity_commands=(add list status)
+  identity_commands=(add list)
   idle_commands=(status on off)
   network_modes=(sealed direct offline)
   extension_modes=(lock unlock)
@@ -1525,7 +1532,7 @@ _envd_completion() {
   local doctor_commands="network why history identity"
   local browser_commands="install update status reset open"
   local pkg_commands="list show add remove apply"
-  local identity_commands="add list status"
+  local identity_commands="add list"
   local idle_commands="status on off"
   local network_modes="sealed direct offline"
   local extension_modes="lock unlock"
@@ -4823,6 +4830,9 @@ func (a app) tryRuntimeStart(name string) (bool, error) {
 	if !containerExists(route.DevName) {
 		return false, nil
 	}
+	if devContainerNeedsMountRepair(route.DevName) {
+		return false, nil
+	}
 	if route.Network == "sealed" {
 		netName := "envd-" + route.ID + "-net"
 		if !containerExists(netName) {
@@ -4953,6 +4963,19 @@ func (a app) startEnv(args []string, st *envdState) error {
 		if err := ensureDockerNetwork(gatewayNet); err != nil {
 			return err
 		}
+		if containerExists(ref.DevName) && devContainerNeedsMountRepair(ref.DevName) {
+			if containerExists(ref.NetName) {
+				if err := dockerRun("start", ref.NetName); err != nil {
+					return err
+				}
+				if err := waitForSidecarReady(ref.NetName, 20*time.Second); err != nil {
+					return err
+				}
+			}
+			if err := a.recreateDevContainerForHostIntegrations(st, name, ref, networkMode); err != nil {
+				return err
+			}
+		}
 		recreate, reason, err := sealedRuntimeRecreateStatus(ref)
 		if err != nil {
 			return err
@@ -4974,6 +4997,9 @@ func (a app) startEnv(args []string, st *envdState) error {
 			}
 			if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 				return err
+			}
+			if err := a.refreshStartedEnvIdentityAgent(st, name, ref); err != nil {
+				st.addEvent("identity", name, "identity agent refresh failed: "+redactSensitive(err.Error()))
 			}
 			a.refreshUnlockedIdentityAgents(st)
 			st.addEvent("env", name, "recreated sealed runtime before start: "+reason)
@@ -4999,20 +5025,10 @@ func (a app) startEnv(args []string, st *envdState) error {
 		if err := a.createDevContainer(name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, networkMode, image); err != nil {
 			return err
 		}
-	} else if devContainerNeedsHostDockerSocketRepair(ref.DevName) {
-		if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[0]); err != nil {
+	} else if devContainerNeedsMountRepair(ref.DevName) {
+		if err := a.recreateDevContainerForHostIntegrations(st, name, ref, networkMode); err != nil {
 			return err
 		}
-		image := devImage
-		if rec, ok := st.Environments[name]; ok && rec.Image != "" {
-			image = rec.Image
-		}
-		_ = dockerRun("stop", ref.DevName)
-		_ = dockerRun("rm", "-f", ref.DevName)
-		if err := a.createDevContainer(name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, networkMode, image); err != nil {
-			return err
-		}
-		st.addEvent("env", name, "recreated dev container to attach host Docker socket")
 	}
 	for _, cmd := range devStartCommandsForMode(networkMode, ref.DevName) {
 		if err := dockerRun(cmd...); err != nil {
@@ -5038,6 +5054,23 @@ func canRepairPlainEnv(ref envRef) bool {
 		return false
 	}
 	return volumeExists(ref.HomeVol) && volumeExists(ref.RepoVol)
+}
+
+func (a app) recreateDevContainerForHostIntegrations(st *envdState, name string, ref envRef, networkMode string) error {
+	if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[0]); err != nil {
+		return err
+	}
+	image := devImage
+	if rec, ok := st.Environments[name]; ok && rec.Image != "" {
+		image = rec.Image
+	}
+	_ = dockerRun("stop", ref.DevName)
+	_ = dockerRun("rm", "-f", ref.DevName)
+	if err := a.createDevContainer(name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, networkMode, image); err != nil {
+		return err
+	}
+	st.addEvent("env", name, "recreated dev container to attach host integrations")
+	return nil
 }
 
 func plainEnvDataMissingError(ref envRef) error {
@@ -5670,16 +5703,24 @@ func devContainerNeedsHostDockerSocketRepair(name string) bool {
 	if hostDockerSocketPath() == "" || !containerExists(name) {
 		return false
 	}
-	inspect, err := inspectContainer(name)
+	return !containerHasMountDestination(name, "/var/run/docker.sock")
+}
+
+func devContainerNeedsMountRepair(name string) bool {
+	return devContainerNeedsHostDockerSocketRepair(name)
+}
+
+func containerHasMountDestination(name, destination string) bool {
+	out, err := exec.Command("docker", "inspect", "--format", "{{range .Mounts}}{{println .Destination}}{{end}}", name).Output()
 	if err != nil {
 		return false
 	}
-	for _, mount := range inspect.Mounts {
-		if mount.Destination == "/var/run/docker.sock" {
-			return false
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == destination {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 func (a app) stopEnv(args []string, st *envdState) error {
@@ -5732,6 +5773,8 @@ func (a app) rmEnv(args []string, st *envdState) error {
 	}
 	removeRecoveryPointsForEnv(st, ref.ID)
 	delete(st.Environments, name)
+	_ = stopIdentityAgentProcess(name)
+	_ = removeIdentityAgentSocket(name)
 	_ = unpublishRuntimeRoute(name)
 	_ = syncEnvSSHConfig(st)
 	_ = pruneProfileImages(st)
@@ -6427,8 +6470,20 @@ func disableSystemdIdleScheduler() error {
 }
 
 func lockRuntimeAccess() error {
+	_ = stopAllIdentityAgentProcesses()
 	_ = removeIdentityAgentSockets()
 	return saveRuntimeAccess(runtimeAccessState{Locked: true, Routes: map[string]runtimeSSHRoute{}})
+}
+
+func removeIdentityAgentSocket(envName string) error {
+	socketPath, err := identityAgentSocketPath(envName)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func removeIdentityAgentSockets() error {
@@ -6450,6 +6505,83 @@ func removeIdentityAgentSockets() error {
 		}
 	}
 	return nil
+}
+
+func stopIdentityAgentProcess(envName string) error {
+	if err := validateEnvName(envName); err != nil {
+		return err
+	}
+	pattern := "__identity-agent " + envName + " "
+	return stopProcessesMatching(pattern)
+}
+
+func stopAllIdentityAgentProcesses() error {
+	return stopProcessesMatching("__identity-agent ")
+}
+
+func stopProcessesMatching(pattern string) error {
+	if strings.TrimSpace(pattern) == "" {
+		return nil
+	}
+	cmd := exec.Command("pkill", "-f", pattern)
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func pruneIdentityAgentsForState(st *envdState) {
+	keep := map[string]bool{}
+	for _, name := range sortedEnvNames(st) {
+		keep[name] = true
+	}
+	pruneIdentityAgentSockets(keep)
+	pruneIdentityAgentProcesses(keep)
+}
+
+func pruneIdentityAgentSockets(keep map[string]bool) {
+	dir, err := identityAgentDir()
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".sock") {
+			continue
+		}
+		envName := strings.TrimSuffix(entry.Name(), ".sock")
+		if !keep[envName] {
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
+		}
+	}
+}
+
+func pruneIdentityAgentProcesses(keep map[string]bool) {
+	out, err := exec.Command("pgrep", "-fl", "__identity-agent ").Output()
+	if err != nil {
+		return
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		for i, field := range fields {
+			if field != "__identity-agent" || i+1 >= len(fields) {
+				continue
+			}
+			envName := fields[i+1]
+			if !keep[envName] && validateEnvName(envName) == nil {
+				_ = stopIdentityAgentProcess(envName)
+			}
+			break
+		}
+	}
 }
 
 func publishRuntimeRoute(ref envRef, network string) error {
@@ -7290,7 +7422,7 @@ func envNeedsStart(ref envRef, networkMode string) bool {
 	if networkMode == "sealed" && dockerContainerStatus(ref.NetName) != "running" {
 		return true
 	}
-	if devContainerNeedsHostDockerSocketRepair(ref.DevName) {
+	if devContainerNeedsMountRepair(ref.DevName) {
 		return true
 	}
 	return false
@@ -7342,6 +7474,10 @@ func prepareShellDockerArgs(args []string, st *envdState) ([]string, error) {
 }
 
 func singleSSHIdentityForShell(st *envdState, envName string) (*identityRecord, error) {
+	return singleSSHIdentityForEnv(st, envName, shellIdentityBrokerHealth(st, envName))
+}
+
+func singleSSHIdentityForEnv(st *envdState, envName string, health identityBrokerHealth) (*identityRecord, error) {
 	var out *identityRecord
 	names := make([]string, 0, len(st.Identities))
 	for name := range st.Identities {
@@ -7356,7 +7492,7 @@ func singleSSHIdentityForShell(st *envdState, envName string) (*identityRecord, 
 		if out != nil {
 			return nil, nil
 		}
-		decision := evaluateIdentityBrokerGrant(st, envName, identityName, "ssh", shellIdentityBrokerHealth(st, envName))
+		decision := evaluateIdentityBrokerGrant(st, envName, identityName, "ssh", health)
 		if !decision.Allow {
 			return nil, fmt.Errorf("identity %q denied for %s: %s", identityName, envName, decision.Reason)
 		}
@@ -7394,6 +7530,7 @@ func singleGitHTTPSIdentityForShell(st *envdState, envName string) (*identityRec
 }
 
 func (a app) startUnlockedIdentityAgents(st *envdState) (int, error) {
+	pruneIdentityAgentsForState(st)
 	if len(st.Identities) == 0 || len(st.Environments) == 0 {
 		return 0, nil
 	}
@@ -7408,8 +7545,16 @@ func (a app) startUnlockedIdentityAgents(st *envdState) (int, error) {
 		if identity == nil {
 			continue
 		}
+		ref, err := resolveEnvRef(st, envName)
+		if err != nil || dockerContainerStatus(ref.DevName) != "running" {
+			continue
+		}
 		if err := startStaticIdentityAgent(envName, *identity); err != nil {
 			failures = append(failures, envName+": "+redactSensitive(err.Error()))
+			continue
+		}
+		if err := startEnvContainerIdentityAgent(ref, *identity); err != nil {
+			failures = append(failures, envName+": container identity agent: "+redactSensitive(err.Error()))
 			continue
 		}
 		started++
@@ -7426,6 +7571,62 @@ func (a app) refreshUnlockedIdentityAgents(st *envdState) {
 	}
 }
 
+func (a app) repairRunningIdentityAgents(st *envdState) {
+	for _, name := range sortedEnvNames(st) {
+		ref, err := resolveEnvRef(st, name)
+		if err != nil || dockerContainerStatus(ref.DevName) != "running" {
+			continue
+		}
+		if envContainerIdentityAgentReady(ref) {
+			continue
+		}
+		if err := a.refreshStartedEnvIdentityAgent(st, name, ref); err != nil {
+			st.addEvent("identity", name, "identity agent repair failed: "+redactSensitive(err.Error()))
+		}
+	}
+}
+
+func (a app) refreshStartedEnvIdentityAgent(st *envdState, envName string, ref envRef) error {
+	identity, err := singleSSHIdentityForEnv(st, envName, func() error {
+		if networkOrSealed(ref.Network) == "sealed" {
+			return waitForSidecarReady(ref.NetName, 10*time.Second)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if identity == nil {
+		return nil
+	}
+	if err := startStaticIdentityAgent(envName, *identity); err != nil {
+		return err
+	}
+	if dockerContainerStatus(ref.DevName) == "running" {
+		return startEnvContainerIdentityAgent(ref, *identity)
+	}
+	return nil
+}
+
+func envContainerIdentityAgentReady(ref envRef) bool {
+	userName := ref.UserName
+	if userName == "" {
+		userName = "dev"
+	}
+	if dockerContainerStatus(ref.DevName) != "running" {
+		return false
+	}
+	check := `SSH_AUTH_SOCK="${HOME}/.envd/ssh-agent.sock" ssh-add -l >/dev/null`
+	return dockerRun("exec", "-u", userName, ref.DevName, "sh", "-lc", check) == nil
+}
+
+func cachedOrEnvMasterPasswordAvailable() bool {
+	if _, ok := cachedMasterPassword(); ok {
+		return true
+	}
+	return os.Getenv("ENVD_MASTER_PASSWORD") != ""
+}
+
 func startStaticIdentityAgent(envName string, identity identityRecord) error {
 	socketPath, err := identityAgentSocketPath(envName)
 	if err != nil {
@@ -7434,6 +7635,7 @@ func startStaticIdentityAgent(envName string, identity identityRecord) error {
 	if unixSocketAccepts(socketPath) {
 		return nil
 	}
+	_ = stopIdentityAgentProcess(envName)
 	_ = os.Remove(socketPath)
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
 		return err
@@ -7461,6 +7663,68 @@ func startStaticIdentityAgent(envName string, identity identityRecord) error {
 		return err
 	}
 	return waitForUnixSocket(socketPath, 3*time.Second)
+}
+
+func startEnvContainerIdentityAgent(ref envRef, identity identityRecord) error {
+	userName := ref.UserName
+	if userName == "" {
+		userName = "dev"
+	}
+	if strings.TrimSpace(identity.PrivateKey) == "" {
+		return fmt.Errorf("identity key is empty")
+	}
+	script := `
+set -eu
+home_dir="/home/${DEV_USER}"
+agent_dir="${home_dir}/.envd"
+sock="${agent_dir}/ssh-agent.sock"
+mkdir -p "${agent_dir}"
+chmod 700 "${agent_dir}"
+
+if [ -S "${sock}" ] && SSH_AUTH_SOCK="${sock}" ssh-add -l >/dev/null 2>&1; then
+  exit 0
+fi
+
+if [ -f "${agent_dir}/ssh-agent.env" ]; then
+  set +u
+  . "${agent_dir}/ssh-agent.env" >/dev/null 2>&1 || true
+  if [ -n "${SSH_AGENT_PID:-}" ]; then
+    kill "${SSH_AGENT_PID}" >/dev/null 2>&1 || true
+  fi
+  set -u
+fi
+
+rm -f "${sock}" "${agent_dir}/ssh-agent.env"
+ssh-agent -a "${sock}" -s > "${agent_dir}/ssh-agent.env"
+. "${agent_dir}/ssh-agent.env" >/dev/null
+tmp_key="${agent_dir}/identity-key.$$"
+trap 'rm -f "${tmp_key}"' EXIT INT TERM
+printf '%s' "${ENVD_IDENTITY_KEY_B64}" | base64 -d > "${tmp_key}"
+chmod 600 "${tmp_key}"
+ssh-add "${tmp_key}" >/dev/null
+rm -f "${tmp_key}"
+chmod 600 "${agent_dir}/ssh-agent.env"
+`
+	if err := dockerRun("exec",
+		"-u", userName,
+		"-e", "DEV_USER="+userName,
+		"-e", "ENVD_IDENTITY_KEY_B64="+base64.StdEncoding.EncodeToString([]byte(identity.PrivateKey)),
+		ref.DevName, "sh", "-lc", script); err != nil {
+		return err
+	}
+	return waitForEnvContainerIdentityAgent(ref, userName, 3*time.Second)
+}
+
+func waitForEnvContainerIdentityAgent(ref envRef, userName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	check := `SSH_AUTH_SOCK="${HOME}/.envd/ssh-agent.sock" ssh-add -l >/dev/null`
+	for time.Now().Before(deadline) {
+		if dockerRun("exec", "-u", userName, ref.DevName, "sh", "-lc", check) == nil {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("container identity agent did not become ready")
 }
 
 func unixSocketAccepts(path string) bool {
@@ -7570,10 +7834,10 @@ func (a app) ensureSSHProxyEnvRunning(args []string) error {
 		return fmt.Errorf("environment %q is offline; SSH proxy denied", name)
 	}
 	if dockerContainerStatus(route.DevName) == "running" {
-		return nil
+		return a.ensureSSHProxyIdentityAgent(name, route)
 	}
 	if err := startRuntimeRouteContainers(route); err == nil && dockerContainerStatus(route.DevName) == "running" {
-		return nil
+		return a.ensureSSHProxyIdentityAgent(name, route)
 	}
 	if !term.IsTerminal(int(os.Stderr.Fd())) {
 		return fmt.Errorf("environment %q is not running; run envd start %s", name, name)
@@ -7581,6 +7845,27 @@ func (a app) ensureSSHProxyEnvRunning(args []string) error {
 	quiet := app{stdout: io.Discard, stderr: a.stderr, root: a.root}
 	return quiet.withState(func(st *envdState) error {
 		return quiet.startEnv([]string{name}, st)
+	})
+}
+
+func (a app) ensureSSHProxyIdentityAgent(name string, route runtimeSSHRoute) error {
+	ref := envRef{Name: route.Name, ID: route.ID, UserName: route.UserName, DevName: route.DevName, Network: route.Network, Storage: route.Storage}
+	if networkOrSealed(route.Network) == "sealed" {
+		ref.NetName = "envd-" + route.ID + "-net"
+	}
+	if envContainerIdentityAgentReady(ref) {
+		return nil
+	}
+	if !term.IsTerminal(int(os.Stderr.Fd())) && !cachedOrEnvMasterPasswordAvailable() {
+		return fmt.Errorf("identity agent for %q is not ready; run envd unlock, then retry SSH", name)
+	}
+	quiet := app{stdout: io.Discard, stderr: a.stderr, root: a.root}
+	return quiet.withStateReadOnly(func(st *envdState) error {
+		st.ensureDefaults()
+		if err := quiet.refreshStartedEnvIdentityAgent(st, name, ref); err != nil {
+			return fmt.Errorf("repair identity agent for %q: %w", name, err)
+		}
+		return nil
 	})
 }
 
@@ -7842,11 +8127,27 @@ func identityAgentSocketPath(envName string) (string, error) {
 	if err := validateEnvName(envName); err != nil {
 		return "", err
 	}
+	dir, err := identityAgentDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, envName+".sock"), nil
+}
+
+func identityAgentDir() (string, error) {
 	dir, err := envdDataDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "runtime", "identity-agents", envName+".sock"), nil
+	return filepath.Join(dir, "runtime", "identity-agents"), nil
+}
+
+func ensureIdentityAgentDir() error {
+	dir, err := identityAgentDir()
+	if err != nil {
+		return err
+	}
+	return os.MkdirAll(dir, 0o700)
 }
 
 func upsertManagedSSHBlock(path, envName, block string) error {
@@ -11855,6 +12156,25 @@ fi
 chown -R "${DEV_USER}:${DEV_USER}" "${ssh_dir}"
 chmod 700 "${ssh_dir}"
 chmod 600 "${authorized_keys}"
+config="${ssh_dir}/config"
+touch "${config}"
+config_tmp="${config}.envd-tmp.$$"
+awk '
+  /# --- envd: identity start ---/ {skip=1; next}
+  /# --- envd: identity end ---/ {skip=0; next}
+  skip != 1 {print}
+' "${config}" > "${config_tmp}"
+cat >> "${config_tmp}" <<EOF
+
+# --- envd: identity start ---
+Host *
+  IdentityAgent ${home_dir}/.envd/ssh-agent.sock
+  AddKeysToAgent no
+# --- envd: identity end ---
+EOF
+mv "${config_tmp}" "${config}"
+chown "${DEV_USER}:${DEV_USER}" "${config}"
+chmod 600 "${config}"
 mkdir -p "${home_dir}"
 bashrc="${home_dir}/.bashrc"
 touch "${bashrc}"
@@ -11872,6 +12192,9 @@ cat >> "${tmp}" <<EOF
 # --- envd: prompt start ---
 export ENVD_ENV_NAME="${ENVD_ENV_NAME_VALUE}"
 if [ -n "\${BASH_VERSION:-}" ]; then
+  if [ -S "\${HOME}/.envd/ssh-agent.sock" ]; then
+    export SSH_AUTH_SOCK="\${HOME}/.envd/ssh-agent.sock"
+  fi
   __envd_prompt() {
     if [ -z "\${ENVD_AUTO_CD_DONE:-}" ] && [ "\${PWD}" = "\${HOME}" ] && [ -d /repo ]; then
       cd /repo 2>/dev/null || true
