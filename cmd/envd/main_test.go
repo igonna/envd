@@ -274,7 +274,7 @@ func TestProbeResultsAlignLongNames(t *testing.T) {
 	}
 }
 
-func TestStatusReportsStaleIdentityAgent(t *testing.T) {
+func TestStatusIgnoresObsoleteHostIdentitySocket(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	dataDir := filepath.Join(home, ".local", "share", "envd")
@@ -297,8 +297,8 @@ func TestStatusReportsStaleIdentityAgent(t *testing.T) {
 	if err := a.run([]string{"status"}); err != nil {
 		t.Fatalf("status failed: %v", err)
 	}
-	if !strings.Contains(out.String(), "Identity:") || !strings.Contains(out.String(), "stale for books") {
-		t.Fatalf("status did not report stale identity agent: %q", out.String())
+	if !strings.Contains(out.String(), "Identity:") || !strings.Contains(out.String(), "missing for books") {
+		t.Fatalf("status did not report missing env identity agent: %q", out.String())
 	}
 }
 

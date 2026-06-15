@@ -240,10 +240,7 @@ func main() {
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "__idle-tick" {
-		if err := runRuntimeIdleTick(defaultIdleTimeout); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: %s\n", redactSensitive(err.Error()))
-			os.Exit(1)
-		}
+		_ = disableRuntimeIdleScheduler()
 		return
 	}
 
@@ -257,6 +254,7 @@ func main() {
 	if strings.EqualFold(filepath.Base(os.Args[0]), "Vhrome") {
 		args = append([]string{"browser"}, args...)
 	}
+	disableLegacyRuntimeIdleSchedulerBestEffort()
 	if err := a.run(args); err != nil {
 		fmt.Fprintf(a.stderr, "ERROR: %s\n", redactSensitive(err.Error()))
 		os.Exit(1)
@@ -756,16 +754,13 @@ func identityAgentRuntimeStatus(access runtimeAccessState) string {
 	stale := []string{}
 	missing := []string{}
 	live := 0
-	for name := range access.Routes {
-		socketPath, err := identityAgentSocketPath(name)
-		if err != nil {
-			continue
-		}
-		if _, err := os.Stat(socketPath); errors.Is(err, os.ErrNotExist) {
+	for name, route := range access.Routes {
+		ref := runtimeRefFromRoute(route)
+		if dockerContainerStatus(ref.DevName) != "running" {
 			missing = append(missing, name)
 			continue
 		}
-		if unixSocketAccepts(socketPath) {
+		if envContainerIdentityAgentReady(ref) {
 			live++
 			continue
 		}
@@ -4125,7 +4120,7 @@ func (a app) runVSCodeExtensions(args []string) error {
 	if err != nil {
 		return err
 	}
-	ref := envRef{Name: route.Name, ID: route.ID, UserName: route.UserName, DevName: route.DevName, Network: route.Network}
+	ref := runtimeRefFromRoute(route)
 	if dockerContainerStatus(ref.DevName) != "running" {
 		return fmt.Errorf("environment %q is not running; start it first with: envd start %s", name, name)
 	}
@@ -4228,10 +4223,10 @@ func (a app) runVSCodeOpen(envName string) error {
 }
 
 func (a app) ensureVSCodeEnvRunning(envName string, ref *envRef) error {
-	if dockerContainerStatus(ref.DevName) == "running" {
+	if dockerContainerStatus(ref.DevName) == "running" && (networkOrSealed(ref.Network) != "sealed" || sidecarReadyNow(ref.NetName)) {
 		return nil
 	}
-	route := runtimeSSHRoute{Name: ref.Name, ID: ref.ID, DevName: ref.DevName, UserName: ref.UserName, Network: ref.Network, Storage: ref.Storage}
+	route := runtimeRouteFromRef(*ref, ref.Network)
 	if err := startRuntimeRouteContainers(route); err == nil && dockerContainerStatus(ref.DevName) == "running" {
 		return nil
 	}
@@ -4252,14 +4247,7 @@ func vscodeEnvRef(envName string) (envRef, error) {
 	if err != nil {
 		return envRef{}, err
 	}
-	return envRef{
-		Name:     route.Name,
-		ID:       route.ID,
-		UserName: route.UserName,
-		DevName:  route.DevName,
-		Network:  route.Network,
-		Storage:  route.Storage,
-	}, nil
+	return runtimeRefFromRoute(route), nil
 }
 
 func vscodeUserSettingsPath() (string, error) {
@@ -4464,15 +4452,14 @@ func preseedVSCodeServer(ref envRef) error {
 		user = "dev"
 	}
 	remoteDir := filepath.Join("/home", user, ".vscode-server")
-	remoteArchive := filepath.Join(remoteDir, "vscode-cli-"+commit+".tar.gz")
-	remoteDone := remoteArchive + ".done"
+	remoteCode := filepath.Join(remoteDir, "code-"+commit)
 	serverName := "Stable-" + commit
 	serverTopDir := "vscode-" + serverArtifact
 	serverRoot := filepath.Join(remoteDir, "cli", "servers")
 	serverTarget := filepath.Join(serverRoot, serverName)
 	serverInstall := filepath.Join(serverTarget, "server")
 	serverStaging := filepath.Join(serverRoot, serverName+".staging")
-	if vscodeServerReady(ref.DevName, remoteDone, filepath.Join(serverInstall, "bin", "code-server")) {
+	if vscodeServerReady(ref.DevName, remoteCode, filepath.Join(serverInstall, "bin", "code-server")) {
 		return nil
 	}
 	cliArchivePath, err := ensureVSCodeArchive(commit, artifact, artifact+".tar.gz")
@@ -4487,11 +4474,8 @@ func preseedVSCodeServer(ref envRef) error {
 		"mkdir -p "+shellQuote(remoteDir)+" && chown "+shellQuote(user+":"+user)+" "+shellQuote(remoteDir)); err != nil {
 		return err
 	}
-	if err := dockerRun("cp", cliArchivePath, ref.DevName+":"+remoteArchive); err != nil {
-		return err
-	}
-	if err := dockerRun("exec", "-u", "root", ref.DevName, "sh", "-lc",
-		"touch "+shellQuote(remoteDone)+" && chown "+shellQuote(user+":"+user)+" "+shellQuote(remoteArchive)+" "+shellQuote(remoteDone)); err != nil {
+	remoteCLIArchive := "/tmp/envd-vscode-cli-" + commit + ".tar.gz"
+	if err := dockerRun("cp", cliArchivePath, ref.DevName+":"+remoteCLIArchive); err != nil {
 		return err
 	}
 	remoteServerArchive := "/tmp/envd-vscode-server-" + commit + ".tar.gz"
@@ -4500,6 +4484,13 @@ func preseedVSCodeServer(ref envRef) error {
 	}
 	script := strings.Join([]string{
 		"set -eu",
+		"if [ ! -x " + shellQuote(remoteCode) + " ]; then",
+		"  rm -f " + shellQuote(remoteCode),
+		"  tar -xzf " + shellQuote(remoteCLIArchive) + " -C " + shellQuote(remoteDir) + " code",
+		"  mv " + shellQuote(filepath.Join(remoteDir, "code")) + " " + shellQuote(remoteCode),
+		"  chmod 755 " + shellQuote(remoteCode),
+		"  chown " + shellQuote(user+":"+user) + " " + shellQuote(remoteCode),
+		"fi",
 		"mkdir -p " + shellQuote(serverRoot),
 		"if [ ! -x " + shellQuote(filepath.Join(serverInstall, "bin", "code-server")) + " ]; then",
 		"  rm -rf " + shellQuote(serverTarget) + " " + shellQuote(serverStaging),
@@ -4515,6 +4506,7 @@ func preseedVSCodeServer(ref envRef) error {
 		"  fi",
 		"  chown -R " + shellQuote(user+":"+user) + " " + shellQuote(serverTarget),
 		"fi",
+		"rm -f " + shellQuote(remoteCLIArchive),
 		"rm -f " + shellQuote(remoteServerArchive),
 	}, "\n")
 	if err := dockerRun("exec", "-u", "root", ref.DevName, "sh", "-lc", script); err != nil {
@@ -4753,14 +4745,16 @@ func (a app) runEnv(args []string, st *envdState) error {
 		message += " with profile " + profile + " generation " + strconv.Itoa(profileGeneration)
 	}
 	st.addEvent("env", name, message)
-	ref := envRef{Name: name, ID: id, UserName: "dev", DevName: devName, NetName: netName, ProjectDockerName: projectDockerContainerName(id), Network: network}
+	ref := envRef{Name: name, ID: id, UserName: "dev", DevName: devName, NetName: netName, ProjectDockerName: projectDockerContainerName(id), Network: network, HomeVol: homeVol, RepoVol: repoVol, HomeSource: homeSource, RepoSource: repoSource, Storage: storage, Image: image}
 	if err := repairCreatedEnvAccessForRef(ref); err != nil {
 		return err
 	}
 	if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 		return err
 	}
-	a.refreshUnlockedIdentityAgents(st)
+	if err := a.refreshStartedEnvIdentityAgent(st, name, ref); err != nil {
+		st.addEvent("identity", name, "identity agent refresh failed: "+redactSensitive(err.Error()))
+	}
 
 	ok = true
 	fmt.Fprintf(a.stdout, "Created: %s\n", name)
@@ -4834,8 +4828,7 @@ func (a app) tryRuntimeStart(name string) (bool, error) {
 		return false, nil
 	}
 	if route.Network == "sealed" {
-		netName := "envd-" + route.ID + "-net"
-		if !containerExists(netName) {
+		if !containerExists(runtimeRefFromRoute(route).NetName) {
 			return false, nil
 		}
 	}
@@ -4845,7 +4838,7 @@ func (a app) tryRuntimeStart(name string) (bool, error) {
 	if dockerContainerStatus(route.DevName) != "running" {
 		return false, nil
 	}
-	ref := envRef{Name: route.Name, ID: route.ID, UserName: route.UserName, DevName: route.DevName, Network: route.Network, Storage: route.Storage}
+	ref := runtimeRefFromRoute(route)
 	if err := repairEnvSSHAccessForRef(ref); err != nil {
 		return true, err
 	}
@@ -4918,17 +4911,8 @@ func (a app) startEnv(args []string, st *envdState) error {
 				if err := ensureDockerNetwork(gatewayNet); err != nil {
 					return err
 				}
-				if !containerExists(ref.NetName) {
-					if err := createSidecar(name, ref.ID, ref.NetName); err != nil {
-						return err
-					}
-				} else {
-					if err := dockerRun("start", ref.NetName); err != nil {
-						return err
-					}
-					if err := waitForSidecarReady(ref.NetName, 20*time.Second); err != nil {
-						return err
-					}
+				if _, _, err := ensureSidecarReady(name, ref.ID, ref.NetName); err != nil {
+					return err
 				}
 			}
 			if err := a.createDevContainer(name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, networkMode, image); err != nil {
@@ -4946,7 +4930,9 @@ func (a app) startEnv(args []string, st *envdState) error {
 			if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 				return err
 			}
-			a.refreshUnlockedIdentityAgents(st)
+			if err := a.refreshStartedEnvIdentityAgent(st, name, ref); err != nil {
+				st.addEvent("identity", name, "identity agent refresh failed: "+redactSensitive(err.Error()))
+			}
 			st.addEvent("env", name, "started from protected storage")
 			fmt.Fprintf(a.stdout, "Started: %s\n", name)
 			fmt.Fprintf(a.stdout, "SSH:     ssh %s\n", name)
@@ -4963,56 +4949,12 @@ func (a app) startEnv(args []string, st *envdState) error {
 		if err := ensureDockerNetwork(gatewayNet); err != nil {
 			return err
 		}
-		if containerExists(ref.DevName) && devContainerNeedsMountRepair(ref.DevName) {
-			if containerExists(ref.NetName) {
-				if err := dockerRun("start", ref.NetName); err != nil {
-					return err
-				}
-				if err := waitForSidecarReady(ref.NetName, 20*time.Second); err != nil {
-					return err
-				}
-			}
-			if err := a.recreateDevContainerForHostIntegrations(st, name, ref, networkMode); err != nil {
-				return err
-			}
-		}
-		recreate, reason, err := sealedRuntimeRecreateStatus(ref)
+		recreated, reason, err := a.ensureSealedRuntimeReady(st, name, ref)
 		if err != nil {
 			return err
 		}
-		if recreate {
-			if err := a.recreateSealedRuntime(st, name, ref, reason); err != nil {
-				if rec, ok := st.Environments[name]; ok {
-					rec.BlockedReason = "sealed runtime recreate failed: " + redactSensitive(err.Error())
-					rec.UpdatedAt = time.Now().UTC()
-					st.Environments[name] = rec
-				}
-				st.addEvent("env", name, "sealed runtime recreate failed: "+redactSensitive(err.Error()))
-				_ = stopEnvWorkload(ref)
-				return err
-			}
-			touchEnvUsed(st, name, time.Now().UTC())
-			if err := repairEnvSSHAccessForRef(ref); err != nil {
-				return err
-			}
-			if err := setVSCodeExtensionsLocked(ref, true); err != nil {
-				return err
-			}
-			if err := a.refreshStartedEnvIdentityAgent(st, name, ref); err != nil {
-				st.addEvent("identity", name, "identity agent refresh failed: "+redactSensitive(err.Error()))
-			}
-			a.refreshUnlockedIdentityAgents(st)
-			st.addEvent("env", name, "recreated sealed runtime before start: "+reason)
+		if recreated {
 			fmt.Fprintf(a.stdout, "Recreated sealed runtime: %s\n", reason)
-			fmt.Fprintf(a.stdout, "Started: %s\n", name)
-			fmt.Fprintf(a.stdout, "SSH:     ssh %s\n", name)
-			return nil
-		}
-		if err := dockerRun("start", ref.NetName); err != nil {
-			return err
-		}
-		if err := waitForSidecarReady(ref.NetName, 20*time.Second); err != nil {
-			return err
 		}
 	} else if !containerExists(ref.DevName) {
 		if err := a.ensureRuntimeAssetRecorded(st, runtimeAssets[0]); err != nil {
@@ -5042,7 +4984,9 @@ func (a app) startEnv(args []string, st *envdState) error {
 	if err := setVSCodeExtensionsLocked(ref, true); err != nil {
 		return err
 	}
-	a.refreshUnlockedIdentityAgents(st)
+	if err := a.refreshStartedEnvIdentityAgent(st, name, ref); err != nil {
+		st.addEvent("identity", name, "identity agent refresh failed: "+redactSensitive(err.Error()))
+	}
 	st.addEvent("env", name, "started")
 	fmt.Fprintf(a.stdout, "Started: %s\n", name)
 	fmt.Fprintf(a.stdout, "SSH:     ssh %s\n", name)
@@ -5147,6 +5091,46 @@ func (a app) recreateSealedRuntime(st *envdState, name string, ref envRef, reaso
 	}
 	_ = reason
 	return nil
+}
+
+func (a app) ensureSealedRuntimeReady(st *envdState, name string, ref envRef) (bool, string, error) {
+	recreate, reason, err := sealedRuntimeRecreateStatus(ref)
+	if err != nil {
+		return false, "", err
+	}
+	if recreate {
+		if err := a.recreateSealedRuntime(st, name, ref, reason); err != nil {
+			if rec, ok := st.Environments[name]; ok {
+				rec.BlockedReason = "sealed runtime recreate failed: " + redactSensitive(err.Error())
+				rec.UpdatedAt = time.Now().UTC()
+				st.Environments[name] = rec
+			}
+			st.addEvent("env", name, "sealed runtime recreate failed: "+redactSensitive(err.Error()))
+			_ = stopEnvWorkload(ref)
+			return false, "", err
+		}
+		touchEnvUsed(st, name, time.Now().UTC())
+		if err := repairEnvSSHAccessForRef(ref); err != nil {
+			return false, "", err
+		}
+		if err := setVSCodeExtensionsLocked(ref, true); err != nil {
+			return false, "", err
+		}
+		if err := a.refreshStartedEnvIdentityAgent(st, name, ref); err != nil {
+			st.addEvent("identity", name, "identity agent refresh failed: "+redactSensitive(err.Error()))
+		}
+		st.addEvent("env", name, "recreated sealed runtime before start: "+reason)
+		return true, reason, nil
+	}
+	if _, _, err := ensureSidecarReady(name, ref.ID, ref.NetName); err != nil {
+		reason := "sidecar readiness failed: " + redactSensitive(err.Error())
+		if err := a.recreateSealedRuntime(st, name, ref, reason); err != nil {
+			return false, "", err
+		}
+		st.addEvent("env", name, "recreated sealed runtime before start: "+reason)
+		return true, reason, nil
+	}
+	return false, "", nil
 }
 
 func devStartCommandsForMode(networkMode, devName string) [][]string {
@@ -5421,14 +5405,7 @@ func (a app) applyProfileToEnv(st *envdState, envName, profileName string) error
 		if err := ensureDockerNetwork(gatewayNet); err != nil {
 			return err
 		}
-		if !containerExists(ref.NetName) {
-			if err := createSidecar(envName, ref.ID, ref.NetName); err != nil {
-				return err
-			}
-		} else if err := dockerRun("start", ref.NetName); err != nil {
-			return err
-		}
-		if err := waitForSidecarReady(ref.NetName, 20*time.Second); err != nil {
+		if _, _, err := ensureSidecarReady(envName, ref.ID, ref.NetName); err != nil {
 			return err
 		}
 	}
@@ -5594,6 +5571,37 @@ func createSidecar(envName, id, netName string) error {
 		return err
 	}
 	return waitForSidecarReady(netName, 20*time.Second)
+}
+
+func ensureSidecarReady(envName, id, netName string) (bool, string, error) {
+	recreate, reason, err := sidecarRecreateReason(netName)
+	if err != nil {
+		return false, "", err
+	}
+	if recreate {
+		_ = dockerRun("rm", "-f", netName)
+		if err := createSidecar(envName, id, netName); err != nil {
+			return false, "", err
+		}
+		return true, reason, nil
+	}
+	if err := dockerRun("start", netName); err != nil {
+		reason := "sidecar start failed: " + redactSensitive(err.Error())
+		_ = dockerRun("rm", "-f", netName)
+		if err := createSidecar(envName, id, netName); err != nil {
+			return false, "", err
+		}
+		return true, reason, nil
+	}
+	if err := waitForSidecarReady(netName, 20*time.Second); err != nil {
+		reason := "sidecar readiness failed: " + redactSensitive(err.Error())
+		_ = dockerRun("rm", "-f", netName)
+		if err := createSidecar(envName, id, netName); err != nil {
+			return false, "", err
+		}
+		return true, reason, nil
+	}
+	return false, "", nil
 }
 
 func (a app) createDevContainer(envName, userName, id, devName, netName, storageMode, homeSource, repoSource, networkMode, image string) error {
@@ -5846,13 +5854,17 @@ type runtimeAccessState struct {
 }
 
 type runtimeSSHRoute struct {
-	Name      string    `json:"name"`
-	ID        string    `json:"id"`
-	DevName   string    `json:"dev_name"`
-	UserName  string    `json:"user_name"`
-	Network   string    `json:"network"`
-	Storage   string    `json:"storage,omitempty"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Name       string    `json:"name"`
+	ID         string    `json:"id"`
+	DevName    string    `json:"dev_name"`
+	NetName    string    `json:"net_name,omitempty"`
+	UserName   string    `json:"user_name"`
+	Network    string    `json:"network"`
+	Storage    string    `json:"storage,omitempty"`
+	HomeSource string    `json:"home_source,omitempty"`
+	RepoSource string    `json:"repo_source,omitempty"`
+	Image      string    `json:"image,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type runtimeIdleActivity struct {
@@ -6208,16 +6220,27 @@ func dockerRouteIsRunning(route runtimeSSHRoute) bool {
 }
 
 func stopRuntimeRouteWorkload(route runtimeSSHRoute) error {
-	ref := envRef{
-		Name:     route.Name,
-		ID:       route.ID,
-		UserName: route.UserName,
-		DevName:  route.DevName,
-		NetName:  netContainerName(route.ID),
-		Network:  route.Network,
-		Storage:  storageOrPlain(route.Storage),
-	}
+	ref := runtimeRefFromRoute(route)
 	return stopEnvWorkload(ref)
+}
+
+func disableLegacyRuntimeIdleSchedulerBestEffort() {
+	if strings.HasSuffix(os.Args[0], ".test") {
+		return
+	}
+	dir, err := envdDataDir()
+	if err != nil {
+		return
+	}
+	marker := filepath.Join(dir, "runtime", "idle-background-disabled")
+	if _, err := os.Stat(marker); err == nil {
+		return
+	}
+	if err := disableRuntimeIdleScheduler(); err != nil {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(marker), 0o700)
+	_ = os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600)
 }
 
 func ensureRuntimeIdleScheduler() error {
@@ -6596,15 +6619,37 @@ func publishRuntimeRoute(ref envRef, network string) error {
 	if userName == "" {
 		userName = "dev"
 	}
+	netName := ref.NetName
+	if netName == "" && ref.ID != "" && networkOrSealed(network) == "sealed" {
+		netName = netContainerName(ref.ID)
+	}
+	homeSource := ref.HomeSource
+	if homeSource == "" && ref.ID != "" {
+		homeSource = homeVolumeName(ref.ID)
+	}
+	repoSource := ref.RepoSource
+	if repoSource == "" && ref.ID != "" {
+		repoSource = repoVolumeName(ref.ID)
+	}
+	image := imageOrDefault(ref.Image)
+	if image == devImage {
+		if current := containerConfigImage(ref.DevName); current != "" {
+			image = current
+		}
+	}
 	access.Locked = false
 	access.Routes[ref.Name] = runtimeSSHRoute{
-		Name:      ref.Name,
-		ID:        ref.ID,
-		DevName:   ref.DevName,
-		UserName:  userName,
-		Network:   networkOrSealed(network),
-		Storage:   storageOrPlain(ref.Storage),
-		UpdatedAt: time.Now().UTC(),
+		Name:       ref.Name,
+		ID:         ref.ID,
+		DevName:    ref.DevName,
+		NetName:    netName,
+		UserName:   userName,
+		Network:    networkOrSealed(network),
+		Storage:    storageOrPlain(ref.Storage),
+		HomeSource: homeSource,
+		RepoSource: repoSource,
+		Image:      image,
+		UpdatedAt:  time.Now().UTC(),
 	}
 	_ = touchRuntimeActivity(ref.Name, time.Now().UTC())
 	if err := saveRuntimeAccess(access); err != nil {
@@ -6612,6 +6657,68 @@ func publishRuntimeRoute(ref envRef, network string) error {
 	}
 	_ = runOpportunisticIdleSweep()
 	return nil
+}
+
+func runtimeRefFromRoute(route runtimeSSHRoute) envRef {
+	userName := route.UserName
+	if userName == "" {
+		userName = "dev"
+	}
+	netName := route.NetName
+	if netName == "" && route.ID != "" && networkOrSealed(route.Network) == "sealed" {
+		netName = netContainerName(route.ID)
+	}
+	homeSource := route.HomeSource
+	if homeSource == "" && route.ID != "" {
+		homeSource = homeVolumeName(route.ID)
+	}
+	repoSource := route.RepoSource
+	if repoSource == "" && route.ID != "" {
+		repoSource = repoVolumeName(route.ID)
+	}
+	return envRef{
+		Name:       route.Name,
+		ID:         route.ID,
+		UserName:   userName,
+		DevName:    route.DevName,
+		NetName:    netName,
+		Network:    networkOrSealed(route.Network),
+		HomeSource: homeSource,
+		RepoSource: repoSource,
+		Storage:    storageOrPlain(route.Storage),
+		Image:      imageOrDefault(route.Image),
+	}
+}
+
+func runtimeRouteFromRef(ref envRef, network string) runtimeSSHRoute {
+	userName := ref.UserName
+	if userName == "" {
+		userName = "dev"
+	}
+	return runtimeSSHRoute{
+		Name:       ref.Name,
+		ID:         ref.ID,
+		DevName:    ref.DevName,
+		NetName:    ref.NetName,
+		UserName:   userName,
+		Network:    networkOrSealed(network),
+		Storage:    storageOrPlain(ref.Storage),
+		HomeSource: ref.HomeSource,
+		RepoSource: ref.RepoSource,
+		Image:      imageOrDefault(ref.Image),
+		UpdatedAt:  time.Now().UTC(),
+	}
+}
+
+func containerConfigImage(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return ""
+	}
+	item, err := inspectContainer(name)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(item.Config.Image)
 }
 
 func unpublishRuntimeRoute(name string) error {
@@ -7338,7 +7445,7 @@ func (a app) ensureCopyEnvRunning(name string) (runtimeSSHRoute, error) {
 	if err != nil {
 		return runtimeSSHRoute{}, err
 	}
-	if dockerContainerStatus(route.DevName) == "running" {
+	if dockerContainerStatus(route.DevName) == "running" && (networkOrSealed(route.Network) != "sealed" || sidecarReadyNow(runtimeRefFromRoute(route).NetName)) {
 		return route, nil
 	}
 	if err := startRuntimeRouteContainers(route); err == nil && dockerContainerStatus(route.DevName) == "running" {
@@ -7833,14 +7940,14 @@ func (a app) ensureSSHProxyEnvRunning(args []string) error {
 	if route.Network == "offline" {
 		return fmt.Errorf("environment %q is offline; SSH proxy denied", name)
 	}
-	if dockerContainerStatus(route.DevName) == "running" {
+	if dockerContainerStatus(route.DevName) == "running" && (networkOrSealed(route.Network) != "sealed" || sidecarReadyNow(runtimeRefFromRoute(route).NetName)) {
 		return a.ensureSSHProxyIdentityAgent(name, route)
 	}
 	if err := startRuntimeRouteContainers(route); err == nil && dockerContainerStatus(route.DevName) == "running" {
 		return a.ensureSSHProxyIdentityAgent(name, route)
 	}
-	if !term.IsTerminal(int(os.Stderr.Fd())) {
-		return fmt.Errorf("environment %q is not running; run envd start %s", name, name)
+	if !term.IsTerminal(int(os.Stderr.Fd())) && !cachedOrEnvMasterPasswordAvailable() {
+		return fmt.Errorf("environment %q needs repair; run envd unlock, then retry SSH", name)
 	}
 	quiet := app{stdout: io.Discard, stderr: a.stderr, root: a.root}
 	return quiet.withState(func(st *envdState) error {
@@ -7849,34 +7956,34 @@ func (a app) ensureSSHProxyEnvRunning(args []string) error {
 }
 
 func (a app) ensureSSHProxyIdentityAgent(name string, route runtimeSSHRoute) error {
-	ref := envRef{Name: route.Name, ID: route.ID, UserName: route.UserName, DevName: route.DevName, Network: route.Network, Storage: route.Storage}
-	if networkOrSealed(route.Network) == "sealed" {
-		ref.NetName = "envd-" + route.ID + "-net"
-	}
+	ref := runtimeRefFromRoute(route)
 	if envContainerIdentityAgentReady(ref) {
 		return nil
 	}
 	if !term.IsTerminal(int(os.Stderr.Fd())) && !cachedOrEnvMasterPasswordAvailable() {
-		return fmt.Errorf("identity agent for %q is not ready; run envd unlock, then retry SSH", name)
+		return nil
 	}
 	quiet := app{stdout: io.Discard, stderr: a.stderr, root: a.root}
-	return quiet.withStateReadOnly(func(st *envdState) error {
+	if err := quiet.withStateReadOnly(func(st *envdState) error {
 		st.ensureDefaults()
 		if err := quiet.refreshStartedEnvIdentityAgent(st, name, ref); err != nil {
 			return fmt.Errorf("repair identity agent for %q: %w", name, err)
 		}
 		return nil
-	})
+	}); err != nil {
+		return nil
+	}
+	return nil
 }
 
 func startRuntimeRouteContainers(route runtimeSSHRoute) error {
-	if route.Network == "sealed" {
-		netName := "envd-" + route.ID + "-net"
-		if containerExists(netName) && dockerContainerStatus(netName) != "running" {
-			if err := dockerRun("start", netName); err != nil {
-				return err
-			}
-		}
+	route.Network = networkOrSealed(route.Network)
+	route.Storage = storageOrPlain(route.Storage)
+	if dockerContainerStatus(route.DevName) == "running" && (route.Network != "sealed" || sidecarReadyNow(runtimeRefFromRoute(route).NetName)) {
+		return nil
+	}
+	if route.Storage == "plain" && route.ID != "" && route.DevName != "" {
+		return repairRuntimeRouteContainers(route)
 	}
 	if containerExists(route.DevName) && dockerContainerStatus(route.DevName) != "running" {
 		if err := dockerRun("start", route.DevName); err != nil {
@@ -7884,6 +7991,76 @@ func startRuntimeRouteContainers(route runtimeSSHRoute) error {
 		}
 	}
 	return nil
+}
+
+func repairRuntimeRouteContainers(route runtimeSSHRoute) error {
+	ref := runtimeRefFromRoute(route)
+	if ref.Storage != "plain" {
+		return fmt.Errorf("runtime repair requires decrypted state for %s storage", ref.Storage)
+	}
+	if ref.DevName == "" || ref.ID == "" {
+		return fmt.Errorf("runtime route is incomplete")
+	}
+	if ref.Image == devImage {
+		if current := containerConfigImage(ref.DevName); current != "" {
+			ref.Image = current
+		}
+	}
+	if ref.HomeSource == "" || ref.RepoSource == "" {
+		return fmt.Errorf("runtime route is missing volume metadata")
+	}
+	if err := dockerRun("volume", "create", ref.HomeSource); err != nil {
+		return err
+	}
+	if err := dockerRun("volume", "create", ref.RepoSource); err != nil {
+		return err
+	}
+	a := app{stdout: io.Discard, stderr: os.Stderr}
+	switch ref.Network {
+	case "sealed":
+		if err := ensureDockerNetwork(gatewayNet); err != nil {
+			return err
+		}
+		if !sidecarReadyNow(ref.NetName) || !containerExists(ref.DevName) {
+			_ = dockerRun("rm", "-f", ref.DevName)
+			_ = dockerRun("rm", "-f", ref.NetName)
+			if err := createSidecar(ref.Name, ref.ID, ref.NetName); err != nil {
+				return err
+			}
+			if err := a.createDevContainer(ref.Name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, ref.Network, ref.Image); err != nil {
+				return err
+			}
+			if err := verifySealedEnvStartup(ref.DevName); err != nil {
+				return err
+			}
+		} else if dockerContainerStatus(ref.DevName) != "running" {
+			if err := dockerRun("start", ref.DevName); err != nil {
+				return err
+			}
+		}
+	case "direct", "offline":
+		if !containerExists(ref.DevName) {
+			if err := a.createDevContainer(ref.Name, ref.UserName, ref.ID, ref.DevName, ref.NetName, ref.Storage, ref.HomeSource, ref.RepoSource, ref.Network, ref.Image); err != nil {
+				return err
+			}
+		} else if dockerContainerStatus(ref.DevName) != "running" {
+			if err := dockerRun("start", ref.DevName); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unknown network mode %q", ref.Network)
+	}
+	if dockerContainerStatus(ref.DevName) != "running" {
+		return fmt.Errorf("environment %q did not become running", ref.Name)
+	}
+	if err := repairEnvSSHAccessForRef(ref); err != nil {
+		return err
+	}
+	if err := setVSCodeExtensionsLocked(ref, true); err != nil {
+		return err
+	}
+	return publishRuntimeRoute(ref, ref.Network)
 }
 
 func isSSHProxyUnlockUnavailable(err error) bool {
@@ -7908,7 +8085,7 @@ func prepareSSHProxyDockerArgs(args []string) ([]string, error) {
 	if dockerContainerStatus(route.DevName) != "running" {
 		return nil, fmt.Errorf("environment %q is not running; start it first with: envd start %s", name, name)
 	}
-	ref := envRef{Name: route.Name, ID: route.ID, UserName: route.UserName, DevName: route.DevName, Network: route.Network}
+	ref := runtimeRefFromRoute(route)
 	if err := ensureEnvContainerAccess(ref); err != nil {
 		return nil, err
 	}
@@ -12419,11 +12596,11 @@ func volumeExists(name string) bool {
 }
 
 func sealedRuntimeRecreateStatus(ref envRef) (bool, string, error) {
-	if !containerExists(ref.NetName) {
-		return true, "missing sidecar container", nil
-	}
 	if !containerExists(ref.DevName) {
 		return true, "missing dev container", nil
+	}
+	if recreate, reason, err := sidecarRecreateReason(ref.NetName); err != nil || recreate {
+		return recreate, reason, err
 	}
 	if devContainerNeedsHostDockerSocketRepair(ref.DevName) {
 		return true, "Docker socket mount missing", nil
@@ -12437,6 +12614,33 @@ func sealedRuntimeRecreateStatus(ref envRef) (bool, string, error) {
 		return false, "", err
 	}
 	return sealedRuntimeRecreateReason(current, desired)
+}
+
+func sidecarRecreateReason(netName string) (bool, string, error) {
+	if !containerExists(netName) {
+		return true, "missing sidecar container", nil
+	}
+	sidecar, err := inspectContainer(netName)
+	if err != nil {
+		return false, "", err
+	}
+	if sidecar.State.Restarting {
+		return true, "sidecar restarting", nil
+	}
+	if sidecar.State.Status != "running" {
+		return true, "sidecar " + sidecar.State.Status, nil
+	}
+	if sidecar.State.Health != nil {
+		switch sidecar.State.Health.Status {
+		case "unhealthy":
+			return true, "sidecar unhealthy", nil
+		case "starting":
+			if sidecar.RestartCount > 0 {
+				return true, "sidecar restart loop", nil
+			}
+		}
+	}
+	return false, "", nil
 }
 
 func sealedRuntimeRecreateReason(currentSidecarImageID, desiredSidecarImageID string) (bool, string, error) {
@@ -13018,6 +13222,21 @@ func waitForSidecarReady(name string, timeout time.Duration) error {
 	return fmt.Errorf("sidecar %s did not become ready: %s", name, last)
 }
 
+func sidecarReadyNow(name string) bool {
+	item, err := inspectContainer(name)
+	if err != nil {
+		return false
+	}
+	if item.State.Status != "running" || item.State.Restarting {
+		return false
+	}
+	if item.State.Health != nil && item.State.Health.Status == "unhealthy" {
+		return false
+	}
+	_, err = dockerExecOutputQuiet(name, 2*time.Second, "sidecar tun", "sh", "-lc", "ip link show tun0 >/dev/null 2>&1")
+	return err == nil
+}
+
 func verifySealedEnvStartup(name string) error {
 	if _, err := dockerExecOutputQuiet(name, 3*time.Second, "sealed startup DNS", "getent", "hosts", "example.com"); err != nil {
 		return layerErr("sealed startup", err)
@@ -13158,10 +13377,11 @@ func dirHasFiles(path string) bool {
 }
 
 type dockerInspect struct {
-	ID     string `json:"Id"`
-	Name   string `json:"Name"`
-	Image  string `json:"Image"`
-	Mounts []struct {
+	ID           string `json:"Id"`
+	Name         string `json:"Name"`
+	Image        string `json:"Image"`
+	RestartCount int    `json:"RestartCount"`
+	Mounts       []struct {
 		Type        string `json:"Type"`
 		Source      string `json:"Source"`
 		Destination string `json:"Destination"`
@@ -13171,8 +13391,9 @@ type dockerInspect struct {
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	State struct {
-		Status string `json:"Status"`
-		Health *struct {
+		Status     string `json:"Status"`
+		Restarting bool   `json:"Restarting"`
+		Health     *struct {
 			Status string `json:"Status"`
 		} `json:"Health"`
 	} `json:"State"`
@@ -13213,6 +13434,7 @@ type envRef struct {
 	ProjectDockerVol  string
 	HomeSource        string
 	RepoSource        string
+	Image             string
 	Storage           string
 	StorageBackend    string
 	StorageImagePath  string
@@ -13378,6 +13600,7 @@ func resolveEnvRef(st *envdState, name string) (envRef, error) {
 				ProjectDockerVol:  rec.ID + "-docker",
 				HomeSource:        rec.ID + "-home",
 				RepoSource:        rec.ID + "-repo",
+				Image:             rec.Image,
 				Storage:           "plain",
 				Legacy:            true,
 			}, nil
@@ -13397,6 +13620,7 @@ func resolveEnvRef(st *envdState, name string) (envRef, error) {
 			ProjectDockerVol:  projectDockerVolumeName(rec.ID),
 			HomeSource:        homeSource,
 			RepoSource:        repoSource,
+			Image:             rec.Image,
 			Storage:           storageOrPlain(rec.Storage),
 			StorageBackend:    rec.StorageBackend,
 			StorageImagePath:  rec.StorageImagePath,
