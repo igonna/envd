@@ -307,6 +307,12 @@ func (a app) run(args []string) error {
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.runGateway(args[1:], nil)
 		}
+		if isGatewayRemoveSubcommand(args[1:]) && !isGatewayRemoveCommand(args[1:]) {
+			return a.runGateway(args[1:], nil)
+		}
+		if isGatewayRemoveCommand(args[1:]) {
+			return a.withStateExplicitPassword(func(st *envdState, _ []byte) error { return a.runGateway(args[1:], st) })
+		}
 		return a.withState(func(st *envdState) error { return a.runGateway(args[1:], st) })
 	case "hosting":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
@@ -415,6 +421,14 @@ func isBrowserResetCommand(args []string) bool {
 
 func isPkgRemoveCommand(args []string) bool {
 	return len(args) == 3 && args[0] == "rm" && args[2] == "--yes"
+}
+
+func isGatewayRemoveCommand(args []string) bool {
+	return len(args) == 3 && (args[0] == "rm" || args[0] == "remove") && args[2] == "--yes"
+}
+
+func isGatewayRemoveSubcommand(args []string) bool {
+	return len(args) > 0 && (args[0] == "rm" || args[0] == "remove")
 }
 
 func isMigrateProtectedCommand(args []string) bool {
@@ -1408,7 +1422,7 @@ _envd() {
   )
 
   env_commands=(start shell details cp stop rm vscode ssh-proxy)
-  gateway_commands=(install list use status details render egress share shares view revoke rollback chain)
+  gateway_commands=(install list use status inspect render egress share shares view revoke rollback rm remove chain)
   doctor_commands=(network why history identity)
   browser_commands=(install update status reset open)
   pkg_commands=(list show add remove apply)
@@ -1523,7 +1537,7 @@ _envd_completion() {
   command="${COMP_WORDS[1]}"
 
   local commands="init status completion lock unlock password idle reset-state start shell details cp stop rm vscode vscode-extensions gateway proxy doctor browser hosting network pkg identity migrate version help"
-  local gateway_commands="install list use status details render egress share shares view revoke rollback chain"
+  local gateway_commands="install list use status inspect render egress share shares view revoke rollback rm remove chain"
   local doctor_commands="network why history identity"
   local browser_commands="install update status reset open"
   local pkg_commands="list show add remove apply"
@@ -2115,6 +2129,8 @@ func (a app) runGateway(args []string, st *envdState) error {
 		return a.runGatewayUse(args[1:], st)
 	case "rollback":
 		return a.runGatewayRollback(args[1:], st)
+	case "rm", "remove":
+		return a.runGatewayRemove(args[1:], st)
 	case "chain":
 		return a.runGatewayChain(args[1:], st)
 	default:
@@ -2136,6 +2152,7 @@ Manage:
   envd gateway status
   envd gateway inspect
   envd gateway rollback
+  envd gateway rm NAME --yes
 
 App Access:
   envd gateway share NAME [LABEL]
@@ -8681,6 +8698,48 @@ func (a app) runMigrateAdopt(st *envdState) error {
 		adopted++
 	}
 	fmt.Fprintf(a.stdout, "Adopted: %d legacy plain environments\n", adopted)
+	return nil
+}
+
+func (a app) runGatewayRemove(args []string, st *envdState) error {
+	if len(args) != 2 || args[1] != "--yes" {
+		return fmt.Errorf("usage: envd gateway rm NAME --yes")
+	}
+	if st == nil {
+		return fmt.Errorf("gateway remove requires encrypted envd state")
+	}
+	name := args[0]
+	if err := validateGatewayName(name); err != nil {
+		return err
+	}
+	st.ensureDefaults()
+	if st.ActiveGateway == name {
+		return fmt.Errorf("cannot remove active gateway %q; switch first with: envd gateway use NAME", name)
+	}
+	if _, ok := st.Gateways[name]; !ok {
+		if _, ok := st.RemoteGateways[name]; !ok {
+			if _, ok := st.GatewayChains[name]; !ok {
+				return fmt.Errorf("gateway %q not found", name)
+			}
+		}
+	}
+	for chainName, chain := range st.GatewayChains {
+		if chainName == name {
+			continue
+		}
+		if chain.Entry == name || chain.Exit == name {
+			return fmt.Errorf("cannot remove gateway %q; chain %q still uses it", name, chainName)
+		}
+	}
+	delete(st.Gateways, name)
+	delete(st.RemoteGateways, name)
+	delete(st.GatewayShares, name)
+	delete(st.GatewayChains, name)
+	if st.PreviousGateway == name {
+		st.PreviousGateway = ""
+	}
+	st.addEvent("gateway", name, "removed local gateway metadata")
+	fmt.Fprintf(a.stdout, "Removed gateway: %s\n", name)
 	return nil
 }
 

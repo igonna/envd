@@ -3999,6 +3999,113 @@ func TestGatewayListShowsRemoteLocalAndChains(t *testing.T) {
 	}
 }
 
+func TestGatewayRemoveDeletesInactiveGatewayMetadata(t *testing.T) {
+	now := time.Now().UTC()
+	st := envdState{
+		ActiveGateway:   "active",
+		PreviousGateway: "old",
+		Gateways: map[string]gatewayRecord{
+			"active": gatewayRecordFromConfig("active", gatewayConfig{ServerIP: "150.241.79.37", ServerPort: "443", Raw: map[string]string{}}, now),
+			"old":    gatewayRecordFromConfig("old", gatewayConfig{ServerIP: "198.51.100.20", ServerPort: "443", Raw: map[string]string{}}, now),
+		},
+		RemoteGateways: map[string]remoteGatewayRecord{
+			"old": {Name: "old", Host: "198.51.100.20", Provider: "xray"},
+		},
+		GatewayShares: map[string][]gatewayShareRecord{
+			"old": {{Name: "phone", UUID: "share-uuid", CreatedAt: now, UpdatedAt: now}},
+		},
+	}
+	var out bytes.Buffer
+	err := (app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}).runGatewayRemove([]string{"old", "--yes"}, &st)
+	if err != nil {
+		t.Fatalf("gateway remove failed: %v", err)
+	}
+	if _, ok := st.Gateways["old"]; ok {
+		t.Fatal("local gateway metadata was not removed")
+	}
+	if _, ok := st.RemoteGateways["old"]; ok {
+		t.Fatal("remote gateway metadata was not removed")
+	}
+	if _, ok := st.GatewayShares["old"]; ok {
+		t.Fatal("gateway shares were not removed")
+	}
+	if st.PreviousGateway != "" {
+		t.Fatalf("previous gateway was not cleared: %q", st.PreviousGateway)
+	}
+	if !strings.Contains(out.String(), "Removed gateway: old") {
+		t.Fatalf("remove output missing confirmation: %q", out.String())
+	}
+	if len(st.Events) == 0 || !strings.Contains(st.Events[len(st.Events)-1].Message, "removed local gateway metadata") {
+		t.Fatalf("remove event missing: %+v", st.Events)
+	}
+}
+
+func TestGatewayRemoveRefusesActiveGateway(t *testing.T) {
+	now := time.Now().UTC()
+	st := envdState{
+		ActiveGateway: "ams1",
+		Gateways: map[string]gatewayRecord{
+			"ams1": gatewayRecordFromConfig("ams1", gatewayConfig{ServerIP: "150.241.79.37", ServerPort: "443", Raw: map[string]string{}}, now),
+		},
+	}
+	err := (app{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, root: t.TempDir()}).runGatewayRemove([]string{"ams1", "--yes"}, &st)
+	if err == nil || !strings.Contains(err.Error(), "cannot remove active gateway") {
+		t.Fatalf("expected active gateway refusal, got %v", err)
+	}
+	if _, ok := st.Gateways["ams1"]; !ok {
+		t.Fatal("active gateway was removed")
+	}
+}
+
+func TestGatewayRemoveRefusesGatewayUsedByChain(t *testing.T) {
+	now := time.Now().UTC()
+	st := envdState{
+		ActiveGateway: "exit",
+		Gateways: map[string]gatewayRecord{
+			"entry": gatewayRecordFromConfig("entry", gatewayConfig{ServerIP: "198.51.100.10", ServerPort: "443", Raw: map[string]string{}}, now),
+			"exit":  gatewayRecordFromConfig("exit", gatewayConfig{ServerIP: "203.0.113.10", ServerPort: "443", Raw: map[string]string{}}, now),
+		},
+		GatewayChains: map[string]gatewayChainRecord{
+			"work": {Name: "work", Entry: "entry", Exit: "exit", CreatedAt: now, UpdatedAt: now},
+		},
+	}
+	err := (app{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, root: t.TempDir()}).runGatewayRemove([]string{"entry", "--yes"}, &st)
+	if err == nil || !strings.Contains(err.Error(), "chain \"work\" still uses it") {
+		t.Fatalf("expected chain reference refusal, got %v", err)
+	}
+	if _, ok := st.Gateways["entry"]; !ok {
+		t.Fatal("gateway used by chain was removed")
+	}
+}
+
+func TestGatewayRemoveDeletesChainRecord(t *testing.T) {
+	now := time.Now().UTC()
+	st := envdState{
+		ActiveGateway: "exit",
+		Gateways: map[string]gatewayRecord{
+			"entry": gatewayRecordFromConfig("entry", gatewayConfig{ServerIP: "198.51.100.10", ServerPort: "443", Raw: map[string]string{}}, now),
+			"exit":  gatewayRecordFromConfig("exit", gatewayConfig{ServerIP: "203.0.113.10", ServerPort: "443", Raw: map[string]string{}}, now),
+		},
+		GatewayChains: map[string]gatewayChainRecord{
+			"work": {Name: "work", Entry: "entry", Exit: "exit", CreatedAt: now, UpdatedAt: now},
+		},
+	}
+	var out bytes.Buffer
+	err := (app{stdout: &out, stderr: &bytes.Buffer{}, root: t.TempDir()}).runGatewayRemove([]string{"work", "--yes"}, &st)
+	if err != nil {
+		t.Fatalf("gateway chain remove failed: %v", err)
+	}
+	if _, ok := st.GatewayChains["work"]; ok {
+		t.Fatal("gateway chain metadata was not removed")
+	}
+	if _, ok := st.Gateways["entry"]; !ok {
+		t.Fatal("chain endpoint gateway was removed")
+	}
+	if !strings.Contains(out.String(), "Removed gateway: work") {
+		t.Fatalf("remove output missing confirmation: %q", out.String())
+	}
+}
+
 func TestGatewayActivationFailureDoesNotMutateState(t *testing.T) {
 	now := time.Now().UTC()
 	st := envdState{
