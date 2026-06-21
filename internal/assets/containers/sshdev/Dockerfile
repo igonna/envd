@@ -3,6 +3,8 @@ FROM ubuntu:24.04
 ARG DOCKER_COMPOSE_VERSION=v2.27.1
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV NPM_CONFIG_PREFIX=/home/dev/.local
+ENV PATH=/home/dev/.local/bin:${PATH}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server sudo git curl ca-certificates bash vim cloc \

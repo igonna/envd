@@ -1468,9 +1468,14 @@ func TestProfileDockerfile(t *testing.T) {
 		"'python3'",
 		"'python3-pip'",
 		"'python3-venv'",
+		"ENV NPM_CONFIG_PREFIX=/home/dev/.local",
+		"ENV PATH=/home/dev/.local/bin:${PATH}",
+		"RUN install -d -o 1000 -g 1000 /home/dev /home/dev/.local /home/dev/.npm",
+		"USER 1000:1000",
 		"npm install -g 'pnpm'",
 		"'@openai/codex'",
-		"python3 -m pip install --break-system-packages 'poetry'",
+		"python3 -m pip install --user --break-system-packages 'poetry'",
+		"USER root",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Dockerfile missing %q:\n%s", want, got)
@@ -1597,6 +1602,22 @@ func TestSidecarHealthcheckUsesResolvedGatewayIP(t *testing.T) {
 	}
 }
 
+func TestSSHDevDockerfileUsesUserLocalToolPrefix(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "internal", "assets", "containers", "sshdev", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read sshdev Dockerfile: %v", err)
+	}
+	got := string(raw)
+	for _, want := range []string{
+		"ENV NPM_CONFIG_PREFIX=/home/dev/.local",
+		"ENV PATH=/home/dev/.local/bin:${PATH}",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sshdev Dockerfile missing %q", want)
+		}
+	}
+}
+
 func TestSSHDevEntrypointInstallsEnvdAuthorizedKey(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "internal", "assets", "containers", "sshdev", "entrypoint.sh"))
 	if err != nil {
@@ -1608,6 +1629,11 @@ func TestSSHDevEntrypointInstallsEnvdAuthorizedKey(t *testing.T) {
 		`AUTHORIZED_KEYS="${SSH_DIR}/authorized_keys"`,
 		`grep -qxF "$ENVD_AUTHORIZED_KEY" "$AUTHORIZED_KEYS"`,
 		`chmod 600 "$AUTHORIZED_KEYS"`,
+		`export NPM_CONFIG_PREFIX="$HOME/.local"`,
+		`export PATH="$HOME/.local/bin:$PATH"`,
+		`NPMRC="${HOME_DIR}/.npmrc"`,
+		`grep -v '^prefix=' "$NPMRC"`,
+		`printf 'prefix=%s/.local\n' "$HOME_DIR"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("sshdev entrypoint missing %q", want)

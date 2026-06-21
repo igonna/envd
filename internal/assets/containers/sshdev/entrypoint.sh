@@ -24,6 +24,7 @@ if ! id -u "$DEV_USER" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$HOME_DIR"
+mkdir -p "${HOME_DIR}/.local" "${HOME_DIR}/.npm"
 
 # If home is a mounted volume, /etc/skel wasn't copied. Copy defaults once.
 if [ ! -f "${HOME_DIR}/.bashrc" ] && [ -d /etc/skel ]; then
@@ -57,6 +58,27 @@ else
 fi
 unset color_prompt force_color_prompt
 EOF
+fi
+
+if ! grep -q "envd: user-local bin" "${HOME_DIR}/.bashrc" 2>/dev/null; then
+  cat >> "${HOME_DIR}/.bashrc" <<'EOF'
+
+# --- envd: user-local bin ---
+export NPM_CONFIG_PREFIX="$HOME/.local"
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+EOF
+fi
+
+NPMRC="${HOME_DIR}/.npmrc"
+if ! grep -q "^prefix=${HOME_DIR}/.local$" "$NPMRC" 2>/dev/null; then
+  touch "$NPMRC"
+  tmp_npmrc="${NPMRC}.envd-tmp.$$"
+  grep -v '^prefix=' "$NPMRC" > "$tmp_npmrc" 2>/dev/null || true
+  printf 'prefix=%s/.local\n' "$HOME_DIR" >> "$tmp_npmrc"
+  mv "$tmp_npmrc" "$NPMRC"
 fi
 
 # Auto-cd to /repo for normal SSH login shells only (safe for VS Code)

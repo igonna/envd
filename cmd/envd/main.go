@@ -7351,6 +7351,9 @@ func (a app) runShell(args []string) error {
 					return err
 				}
 			} else {
+				if err := repairEnvSSHAccessForRef(ref); err != nil {
+					return err
+				}
 				touchEnvUsed(st, name, time.Now().UTC())
 			}
 		}
@@ -12412,11 +12415,21 @@ mv "${config_tmp}" "${config}"
 chown "${DEV_USER}:${DEV_USER}" "${config}"
 chmod 600 "${config}"
 mkdir -p "${home_dir}"
+mkdir -p "${home_dir}/.local" "${home_dir}/.npm"
+npmrc="${home_dir}/.npmrc"
+touch "${npmrc}"
+npmrc_tmp="${npmrc}.envd-tmp.$$"
+grep -v '^prefix=' "${npmrc}" > "${npmrc_tmp}" 2>/dev/null || true
+printf 'prefix=%s/.local\n' "${home_dir}" >> "${npmrc_tmp}"
+mv "${npmrc_tmp}" "${npmrc}"
 bashrc="${home_dir}/.bashrc"
 touch "${bashrc}"
 tmp="${bashrc}.envd-tmp.$$"
 trap 'rm -f "${tmp}"' EXIT INT TERM
 awk '
+  /# --- envd: user-local bin ---/ {skip_user_local=1; next}
+  skip_user_local == 1 && /^esac$/ {skip_user_local=0; next}
+  skip_user_local == 1 {next}
   /# --- envd: prompt start ---/ {skip=1; next}
   /# --- envd: prompt end ---/ {skip=0; next}
   /# --- envd: ensure colored prompt ---/ {skip=1; next}
@@ -12424,6 +12437,13 @@ awk '
   skip != 1 {print}
 ' "${bashrc}" > "${tmp}"
 cat >> "${tmp}" <<EOF
+
+# --- envd: user-local bin ---
+export NPM_CONFIG_PREFIX="\${HOME}/.local"
+case ":\${PATH}:" in
+  *":\${HOME}/.local/bin:"*) ;;
+  *) export PATH="\${HOME}/.local/bin:\${PATH}" ;;
+esac
 
 # --- envd: prompt start ---
 export ENVD_ENV_NAME="${ENVD_ENV_NAME_VALUE}"
@@ -12447,7 +12467,9 @@ fi
 # --- envd: prompt end ---
 EOF
 mv "${tmp}" "${bashrc}"
-chown "${DEV_USER}:${DEV_USER}" "${bashrc}"
+chown -R "${DEV_USER}:${DEV_USER}" "${home_dir}/.local" "${home_dir}/.npm"
+chown "${DEV_USER}:${DEV_USER}" "${bashrc}" "${npmrc}"
+chmod 600 "${npmrc}"
 `
 	return dockerRun("exec",
 		"-e", "DEV_USER="+userName,
@@ -14127,6 +14149,10 @@ func profileDockerfile(profile profileRecord) string {
 	sortStrings(apt)
 	var b strings.Builder
 	b.WriteString("FROM " + devImage + "\n")
+	if len(npm) > 0 || len(pip) > 0 {
+		b.WriteString("ENV NPM_CONFIG_PREFIX=/home/dev/.local\n")
+		b.WriteString("ENV PATH=/home/dev/.local/bin:${PATH}\n")
+	}
 	if len(apt) > 0 {
 		b.WriteString("RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends")
 		for _, name := range apt {
@@ -14134,19 +14160,26 @@ func profileDockerfile(profile profileRecord) string {
 		}
 		b.WriteString(" && rm -rf /var/lib/apt/lists/*\n")
 	}
+	if len(npm) > 0 || len(pip) > 0 {
+		b.WriteString("RUN install -d -o 1000 -g 1000 /home/dev /home/dev/.local /home/dev/.npm\n")
+	}
 	if len(npm) > 0 {
+		b.WriteString("USER 1000:1000\n")
 		b.WriteString("RUN npm install -g")
 		for _, name := range npm {
 			b.WriteString(" " + shellQuote(name))
 		}
 		b.WriteString("\n")
+		b.WriteString("USER root\n")
 	}
 	if len(pip) > 0 {
-		b.WriteString("RUN python3 -m pip install --break-system-packages")
+		b.WriteString("USER 1000:1000\n")
+		b.WriteString("RUN python3 -m pip install --user --break-system-packages")
 		for _, name := range pip {
 			b.WriteString(" " + shellQuote(name))
 		}
 		b.WriteString("\n")
+		b.WriteString("USER root\n")
 	}
 	return b.String()
 }
