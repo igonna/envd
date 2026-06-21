@@ -5871,17 +5871,18 @@ type runtimeAccessState struct {
 }
 
 type runtimeSSHRoute struct {
-	Name       string    `json:"name"`
-	ID         string    `json:"id"`
-	DevName    string    `json:"dev_name"`
-	NetName    string    `json:"net_name,omitempty"`
-	UserName   string    `json:"user_name"`
-	Network    string    `json:"network"`
-	Storage    string    `json:"storage,omitempty"`
-	HomeSource string    `json:"home_source,omitempty"`
-	RepoSource string    `json:"repo_source,omitempty"`
-	Image      string    `json:"image,omitempty"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	Name           string    `json:"name"`
+	ID             string    `json:"id"`
+	DevName        string    `json:"dev_name"`
+	NetName        string    `json:"net_name,omitempty"`
+	UserName       string    `json:"user_name"`
+	Network        string    `json:"network"`
+	Storage        string    `json:"storage,omitempty"`
+	HomeSource     string    `json:"home_source,omitempty"`
+	RepoSource     string    `json:"repo_source,omitempty"`
+	Image          string    `json:"image,omitempty"`
+	HasSSHIdentity bool      `json:"has_ssh_identity,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type runtimeIdleActivity struct {
@@ -6654,19 +6655,24 @@ func publishRuntimeRoute(ref envRef, network string) error {
 			image = current
 		}
 	}
+	hasSSHIdentity := false
+	if existing, ok := access.Routes[ref.Name]; ok {
+		hasSSHIdentity = existing.HasSSHIdentity
+	}
 	access.Locked = false
 	access.Routes[ref.Name] = runtimeSSHRoute{
-		Name:       ref.Name,
-		ID:         ref.ID,
-		DevName:    ref.DevName,
-		NetName:    netName,
-		UserName:   userName,
-		Network:    networkOrSealed(network),
-		Storage:    storageOrPlain(ref.Storage),
-		HomeSource: homeSource,
-		RepoSource: repoSource,
-		Image:      image,
-		UpdatedAt:  time.Now().UTC(),
+		Name:           ref.Name,
+		ID:             ref.ID,
+		DevName:        ref.DevName,
+		NetName:        netName,
+		UserName:       userName,
+		Network:        networkOrSealed(network),
+		Storage:        storageOrPlain(ref.Storage),
+		HomeSource:     homeSource,
+		RepoSource:     repoSource,
+		Image:          image,
+		HasSSHIdentity: hasSSHIdentity,
+		UpdatedAt:      time.Now().UTC(),
 	}
 	_ = touchRuntimeActivity(ref.Name, time.Now().UTC())
 	if err := saveRuntimeAccess(access); err != nil {
@@ -6674,6 +6680,24 @@ func publishRuntimeRoute(ref envRef, network string) error {
 	}
 	_ = runOpportunisticIdleSweep()
 	return nil
+}
+
+func updateRuntimeRouteSSHIdentity(envName string, hasSSHIdentity bool) error {
+	access, err := loadRuntimeAccess()
+	if err != nil {
+		return err
+	}
+	route, ok := access.Routes[envName]
+	if !ok {
+		return nil
+	}
+	if route.HasSSHIdentity == hasSSHIdentity {
+		return nil
+	}
+	route.HasSSHIdentity = hasSSHIdentity
+	route.UpdatedAt = time.Now().UTC()
+	access.Routes[envName] = route
+	return saveRuntimeAccess(access)
 }
 
 func runtimeRefFromRoute(route runtimeSSHRoute) envRef {
@@ -7724,14 +7748,18 @@ func (a app) refreshStartedEnvIdentityAgent(st *envdState, envName string, ref e
 		return err
 	}
 	if identity == nil {
+		_ = updateRuntimeRouteSSHIdentity(envName, false)
 		return nil
 	}
 	if err := startStaticIdentityAgent(envName, *identity); err != nil {
 		return err
 	}
 	if dockerContainerStatus(ref.DevName) == "running" {
-		return startEnvContainerIdentityAgent(ref, *identity)
+		if err := startEnvContainerIdentityAgent(ref, *identity); err != nil {
+			return err
+		}
 	}
+	_ = updateRuntimeRouteSSHIdentity(envName, true)
 	return nil
 }
 
@@ -7981,6 +8009,9 @@ func (a app) ensureSSHProxyIdentityAgent(name string, route runtimeSSHRoute) err
 		return nil
 	}
 	if !term.IsTerminal(int(os.Stderr.Fd())) && !cachedOrEnvMasterPasswordAvailable() {
+		if route.HasSSHIdentity {
+			return fmt.Errorf("identity agent for %q is not ready; run `envd unlock`, then reconnect", name)
+		}
 		return nil
 	}
 	quiet := app{stdout: io.Discard, stderr: a.stderr, root: a.root}
@@ -7991,6 +8022,9 @@ func (a app) ensureSSHProxyIdentityAgent(name string, route runtimeSSHRoute) err
 		}
 		return nil
 	}); err != nil {
+		if route.HasSSHIdentity {
+			return err
+		}
 		return nil
 	}
 	return nil

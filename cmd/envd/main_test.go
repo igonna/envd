@@ -320,6 +320,65 @@ func TestStatusReportsMissingIdentityAgent(t *testing.T) {
 	}
 }
 
+func TestRuntimeRoutePreservesAndUpdatesSSHIdentityFlag(t *testing.T) {
+	t.Setenv("ENVD_DATA_DIR", t.TempDir())
+	ref := envRef{
+		Name:       "books",
+		ID:         "abc123",
+		UserName:   "dev",
+		DevName:    "envd-abc123-dev",
+		NetName:    "envd-abc123-net",
+		Network:    "sealed",
+		Storage:    "plain",
+		HomeSource: "envd-abc123-home",
+		RepoSource: "envd-abc123-repo",
+		Image:      "profile:1",
+	}
+	if err := saveRuntimeAccess(runtimeAccessState{Locked: false, Routes: map[string]runtimeSSHRoute{}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishRuntimeRoute(ref, "sealed"); err != nil {
+		t.Fatalf("publish route failed: %v", err)
+	}
+	access, err := loadRuntimeAccess()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if access.Routes["books"].HasSSHIdentity {
+		t.Fatal("new route unexpectedly has ssh identity flag")
+	}
+	if err := updateRuntimeRouteSSHIdentity("books", true); err != nil {
+		t.Fatalf("update identity flag failed: %v", err)
+	}
+	access, err = loadRuntimeAccess()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !access.Routes["books"].HasSSHIdentity {
+		t.Fatal("identity flag was not set")
+	}
+	if err := publishRuntimeRoute(ref, "sealed"); err != nil {
+		t.Fatalf("republish route failed: %v", err)
+	}
+	access, err = loadRuntimeAccess()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !access.Routes["books"].HasSSHIdentity {
+		t.Fatal("identity flag was not preserved across republish")
+	}
+	if err := updateRuntimeRouteSSHIdentity("books", false); err != nil {
+		t.Fatalf("clear identity flag failed: %v", err)
+	}
+	access, err = loadRuntimeAccess()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if access.Routes["books"].HasSSHIdentity {
+		t.Fatal("identity flag was not cleared")
+	}
+}
+
 func TestBrowserLaunchFlagsForceProxyAndLeakMitigations(t *testing.T) {
 	profile := filepath.Join(t.TempDir(), "profile")
 	extensionDir := browserExtensionDirForProfile(profile)
