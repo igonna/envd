@@ -77,6 +77,67 @@ func TestTopLevelListCommandRemoved(t *testing.T) {
 	}
 }
 
+func TestZshCpCompletionUsesCompaddNotBrokenAlternativeDescribe(t *testing.T) {
+	got := zshCompletionScript()
+	for _, want := range []string{
+		"_envd_cp_target()",
+		"compadd -S ':' --",
+		"envd completion remote-paths",
+		"${(q)path}",
+		"compadd -Q --",
+		"matching_remotes",
+		"_files",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("zsh completion missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "_alternative") || strings.Contains(got, "envs:environment prefix:_describe") {
+		t.Fatalf("zsh cp completion still uses broken _alternative/_describe action:\n%s", got)
+	}
+}
+
+func TestCompletionRemotePathParts(t *testing.T) {
+	tests := []struct {
+		in            string
+		wantDirPrefix string
+		wantName      string
+		wantDir       string
+	}{
+		{"", "", "", "/home/dev/repo"},
+		{"src", "", "src", "/home/dev/repo"},
+		{"src/", "src/", "", "/home/dev/repo/src"},
+		{"src/ma", "src/", "ma", "/home/dev/repo/src"},
+		{"~/", "~/", "", "/home/dev"},
+		{"~/Downloads/a", "~/Downloads/", "a", "/home/dev/Downloads"},
+		{"/etc/ho", "/etc/", "ho", "/etc"},
+	}
+	for _, tt := range tests {
+		gotDirPrefix, gotName, gotDir := completionRemotePathParts(tt.in)
+		if gotDirPrefix != tt.wantDirPrefix || gotName != tt.wantName || gotDir != tt.wantDir {
+			t.Fatalf("completionRemotePathParts(%q) = (%q, %q, %q), want (%q, %q, %q)", tt.in, gotDirPrefix, gotName, gotDir, tt.wantDirPrefix, tt.wantName, tt.wantDir)
+		}
+	}
+}
+
+func TestClearZshCompletionDump(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{".zcompdump", ".zcompdump-host", ".zcompdump.zwc", ".keep"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clearZshCompletionDump(dir)
+	for _, name := range []string{".zcompdump", ".zcompdump-host", ".zcompdump.zwc"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s was not removed, err=%v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".keep")); err != nil {
+		t.Fatalf(".keep should remain: %v", err)
+	}
+}
+
 func TestRemovedTopLevelCommands(t *testing.T) {
 	a := app{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, root: t.TempDir()}
 	for _, cmd := range []string{"internet", "events", "why", "inspect", "supervisor"} {
@@ -2321,6 +2382,23 @@ func TestPrepareShellDockerArgsInjectsGitHTTPSIdentity(t *testing.T) {
 	}
 	if strings.Contains(got, "secret-token") {
 		t.Fatalf("git https shell args leaked token: %s", got)
+	}
+}
+
+func TestWaitForBrokerHealthRetriesTransientBlockedState(t *testing.T) {
+	attempts := 0
+	health := waitForBrokerHealth(func() error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("blocked")
+		}
+		return nil
+	}, time.Second)
+	if err := health(); err != nil {
+		t.Fatalf("health did not recover: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("unexpected health attempts: %d", attempts)
 	}
 }
 

@@ -1171,6 +1171,11 @@ func (a app) runCompletion(args []string) error {
 			fmt.Fprintln(a.stdout, name)
 		}
 		return nil
+	case "remote-paths":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: envd completion remote-paths ENV:PATH")
+		}
+		return a.printCompletionRemotePaths(args[1])
 	case "commands":
 		for _, name := range topLevelCompletionCommands() {
 			fmt.Fprintln(a.stdout, name)
@@ -1250,6 +1255,7 @@ func (a app) installZshCompletion(quiet bool) error {
 	if err := os.WriteFile(path, []byte(zshCompletionScript()), 0o644); err != nil {
 		return err
 	}
+	clearZshCompletionDump(home)
 	zshrc := filepath.Join(home, ".zshrc")
 	block := `
 # envd zsh completion
@@ -1279,8 +1285,19 @@ compinit
 	if !quiet {
 		fmt.Fprintln(a.stdout, "Completion: zsh installed")
 		fmt.Fprintf(a.stdout, "Script:     %s\n", path)
+		fmt.Fprintln(a.stdout, "Shell:      restart terminal or run `exec zsh`")
 	}
 	return nil
+}
+
+func clearZshCompletionDump(home string) {
+	matches, err := filepath.Glob(filepath.Join(home, ".zcompdump*"))
+	if err != nil {
+		return
+	}
+	for _, match := range matches {
+		_ = os.Remove(match)
+	}
 }
 
 func (a app) installBashCompletion(quiet bool) error {
@@ -1385,6 +1402,103 @@ func completionEnvNames() []string {
 	return names
 }
 
+func (a app) printCompletionRemotePaths(raw string) error {
+	env, remotePrefix, ok := splitCopyRemote(raw)
+	if !ok {
+		return nil
+	}
+	route, err := runtimeRoute(env)
+	if err != nil {
+		return nil
+	}
+	if dockerContainerStatus(route.DevName) != "running" {
+		return nil
+	}
+	entries, err := completionRemotePaths(route.DevName, env, remotePrefix)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		fmt.Fprintln(a.stdout, entry)
+	}
+	return nil
+}
+
+func completionRemotePaths(container, env, remotePrefix string) ([]string, error) {
+	dirPrefix, namePrefix, containerDir := completionRemotePathParts(remotePrefix)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	script := `
+set -eu
+dir=$1
+prefix=$2
+[ -d "$dir" ] || exit 0
+find "$dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null | while IFS= read -r item; do
+  name=${item##*/}
+  case "$name" in "$prefix"*) ;; *) continue ;; esac
+  if [ -d "$item" ]; then
+    printf '%s/\n' "$name"
+  else
+    printf '%s\n' "$name"
+  fi
+done
+`
+	out, err := exec.CommandContext(ctx, dockerBinary(), "exec", "-u", "dev", container, "sh", "-lc", script, "envd-complete", containerDir, namePrefix).Output()
+	if err != nil {
+		return nil, err
+	}
+	var entries []string
+	for _, line := range strings.Split(string(out), "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" {
+			continue
+		}
+		entries = append(entries, env+":"+dirPrefix+name)
+	}
+	sortStrings(entries)
+	return entries, nil
+}
+
+func completionRemotePathParts(remotePrefix string) (dirPrefix, namePrefix, containerDir string) {
+	remotePrefix = strings.TrimSpace(remotePrefix)
+	if remotePrefix == "" {
+		return "", "", "/home/dev/repo"
+	}
+	if strings.HasSuffix(remotePrefix, "/") {
+		dirPrefix = remotePrefix
+		namePrefix = ""
+	} else {
+		idx := strings.LastIndex(remotePrefix, "/")
+		if idx >= 0 {
+			dirPrefix = remotePrefix[:idx+1]
+			namePrefix = remotePrefix[idx+1:]
+		} else {
+			dirPrefix = ""
+			namePrefix = remotePrefix
+		}
+	}
+	base := strings.TrimSuffix(dirPrefix, "/")
+	switch {
+	case strings.HasPrefix(dirPrefix, "/"):
+		if base == "" {
+			containerDir = "/"
+		} else {
+			containerDir = path.Clean(base)
+		}
+	case dirPrefix == "~/":
+		containerDir = "/home/dev"
+	case strings.HasPrefix(dirPrefix, "~/"):
+		containerDir = path.Clean(path.Join("/home/dev", strings.TrimPrefix(base, "~/")))
+	default:
+		if base == "" {
+			containerDir = "/home/dev/repo"
+		} else {
+			containerDir = path.Clean(path.Join("/home/dev/repo", base))
+		}
+	}
+	return dirPrefix, namePrefix, containerDir
+}
+
 func zshCompletionScript() string {
 	return `#compdef envd
 
@@ -1439,12 +1553,37 @@ _envd() {
   }
 
   _envd_cp_target() {
+    local cur="$words[$CURRENT]"
+    if [[ "$cur" == *:* ]]; then
+      local -a paths
+      paths=("${(@f)$(_call_program remote-paths envd completion remote-paths "$cur" 2>/dev/null)}")
+      if (( ${#paths} )); then
+        local -a quoted_paths
+        local path
+        for path in "${paths[@]}"; do
+          quoted_paths+=("${(q)path}")
+        done
+        compadd -Q -- "${quoted_paths[@]}"
+      fi
+      return
+    fi
+
     local -a remotes
     remotes=("${(@f)$(_call_program envs envd completion envs 2>/dev/null)}")
-    remotes=("${(@)^remotes}:")
-    _alternative \
-      'files:local file:_files' \
-      'envs:environment prefix:_describe -t envs "environment prefix" remotes'
+    if (( ${#remotes} )); then
+      local -a matching_remotes
+      local remote
+      for remote in "${remotes[@]}"; do
+        if [[ "$remote" == "$cur"* ]]; then
+          matching_remotes+=("$remote")
+        fi
+      done
+      if (( ${#matching_remotes} )); then
+        compadd -S ':' -- "${matching_remotes[@]}"
+        return
+      fi
+    fi
+    _files
   }
 
   if (( CURRENT == 2 )); then
@@ -1553,6 +1692,10 @@ _envd_completion() {
 
   _envd_cp_targets() {
     local envs env
+    if [[ "$cur" == *:* ]]; then
+      envd completion remote-paths "$cur" 2>/dev/null
+      return
+    fi
     envs="$(_envd_envs)"
     for env in $envs; do
       printf '%s:\n' "$env"
@@ -1575,6 +1718,12 @@ _envd_completion() {
       ;;
     cp)
       if [ "$COMP_CWORD" -eq 2 ] || [ "$COMP_CWORD" -eq 3 ]; then
+        if [[ "$cur" != */* && "$cur" != "~"* && "$cur" != "."* ]]; then
+          COMPREPLY=( $(compgen -W "$(_envd_cp_targets)" -- "$cur") )
+          if [ "${#COMPREPLY[@]}" -gt 0 ]; then
+            return 0
+          fi
+        fi
         COMPREPLY=( $(compgen -f -- "$cur") $(compgen -W "$(_envd_cp_targets)" -- "$cur") )
       fi
       ;;
@@ -7653,7 +7802,36 @@ func singleSSHIdentityForEnv(st *envdState, envName string, health identityBroke
 	return out, nil
 }
 
-var shellIdentityBrokerHealth = runtimeIdentityBrokerHealth
+var shellIdentityBrokerHealth = defaultShellIdentityBrokerHealth
+
+func defaultShellIdentityBrokerHealth(st *envdState, envName string) identityBrokerHealth {
+	return waitForIdentityBrokerHealth(st, envName, 10*time.Second)
+}
+
+func waitForIdentityBrokerHealth(st *envdState, envName string, timeout time.Duration) identityBrokerHealth {
+	return waitForBrokerHealth(runtimeIdentityBrokerHealth(st, envName), timeout)
+}
+
+func waitForBrokerHealth(health identityBrokerHealth, timeout time.Duration) identityBrokerHealth {
+	return func() error {
+		deadline := time.Now().Add(timeout)
+		var last error
+		for {
+			if err := health(); err == nil {
+				return nil
+			} else {
+				last = err
+			}
+			if timeout <= 0 || time.Now().After(deadline) {
+				if last != nil {
+					return last
+				}
+				return fmt.Errorf("sealed route health did not become ready")
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
 
 func singleGitHTTPSIdentityForShell(st *envdState, envName string) (*identityRecord, error) {
 	var out *identityRecord
