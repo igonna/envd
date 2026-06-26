@@ -1965,13 +1965,21 @@ func (a app) printProbeResults(checks []probeResult) (bool, map[string]string) {
 
 func (a app) runDoctorNetwork(args []string, st *envdState) error {
 	if len(args) > 1 {
-		return fmt.Errorf("usage: envd doctor network [history]")
+		return fmt.Errorf("usage: envd doctor network [--verbose|history]")
 	}
+	verbose := false
 	if len(args) == 1 {
-		if args[0] != "history" {
-			return fmt.Errorf("usage: envd doctor network [history]")
+		switch args[0] {
+		case "history":
+			return a.runNetworkReport(nil, st)
+		case "--verbose":
+			verbose = true
+		default:
+			return fmt.Errorf("usage: envd doctor network [--verbose|history]")
 		}
-		return a.runNetworkReport(nil, st)
+	}
+	if !verbose {
+		return a.runDoctorNetworkCompact(st)
 	}
 	checks := []probeResult{}
 	width := len("Gateway SOCKS HTTPS")
@@ -2159,6 +2167,109 @@ func (a app) runDoctorNetwork(args []string, st *envdState) error {
 	return nil
 }
 
+func (a app) runDoctorNetworkCompact(st *envdState) error {
+	width := len("Gateway tunnel")
+	checks := []probeResult{}
+	directResults := []internetProbeRecord{
+		probeWebQuorum("Direct web", "direct", nil, 5*time.Second, 20*time.Second),
+	}
+	for _, result := range networkCheckProbeResults(internetCheckRecord{Results: directResults}) {
+		checks = append(checks, result)
+		a.printProbeResult(result, width)
+	}
+	cfg, source, err := a.activeGatewayConfig(st)
+	gatewayResults := []internetProbeRecord{}
+	if err != nil {
+		result := probeResult{Name: "Gateway config", Err: err}
+		checks = append(checks, result)
+		a.printProbeResult(result, width)
+		gatewayResults = append(gatewayResults, internetProbeRecord{Name: "Gateway web", Path: "gateway", Status: "skip", Detail: redactSensitive(err.Error())})
+	} else {
+		runGateway := func(timeout time.Duration) {
+			results, records := a.compactGatewayNetworkChecks(cfg, source, timeout)
+			gatewayResults = append(gatewayResults, records...)
+			for _, result := range results {
+				checks = append(checks, result)
+				a.printProbeResult(result, width)
+			}
+		}
+		runGateway(6 * time.Second)
+		sealed := timedProbe(func() probeResult { return a.probeSealedEnvTraffic(st) })
+		checks = append(checks, sealed)
+		a.printProbeResult(sealed, width)
+		if gatewayRecoveryNeeded(checks) {
+			remote := timedProbe(func() probeResult { return a.probeRemoteGatewayPressure(st) })
+			checks = append(checks, remote)
+			a.printProbeResult(remote, width)
+			recovery := timedProbe(func() probeResult { return a.probeGatewayRecovery(st) })
+			checks = append(checks, recovery)
+			a.printProbeResult(recovery, width)
+			if recovery.Err == nil {
+				runGateway(8 * time.Second)
+				sealed = timedProbe(func() probeResult { return a.probeSealedEnvTraffic(st) })
+				checks = append(checks, sealed)
+				a.printProbeResult(sealed, width)
+			}
+			if gatewayRecoveryNeeded(checks) {
+				remoteRecovery := timedProbe(func() probeResult { return a.probeRemoteGatewayRecovery(st) })
+				checks = append(checks, remoteRecovery)
+				a.printProbeResult(remoteRecovery, width)
+				if remoteRecovery.Err == nil {
+					runGateway(8 * time.Second)
+					sealed = timedProbe(func() probeResult { return a.probeSealedEnvTraffic(st) })
+					checks = append(checks, sealed)
+					a.printProbeResult(sealed, width)
+				}
+			}
+		}
+	}
+	recordNetworkCheck(st, internetCheckRecord{
+		Time:    time.Now().UTC(),
+		Results: append(directResults, gatewayResults...),
+		Summary: summarizeInternetResults(append(directResults, gatewayResults...)),
+	})
+	if latestProbeFailures(checks) {
+		return errors.New("doctor found failures")
+	}
+	return nil
+}
+
+func (a app) compactGatewayNetworkChecks(cfg gatewayConfig, source string, timeout time.Duration) ([]probeResult, []internetProbeRecord) {
+	host := hostForClient(cfg.BindIP)
+	socks := net.JoinHostPort(host, strconv.Itoa(cfg.SOCKSPort))
+	httpProxy := net.JoinHostPort(host, strconv.Itoa(cfg.HTTPHostPort))
+	checks := []probeResult{
+		timedProbe(func() probeResult { return probeLocalGatewayPorts(socks, httpProxy) }),
+	}
+	proxyURL := mustParseURL("http://" + httpProxy)
+	records := []internetProbeRecord{
+		probeWebQuorum("Gateway web", "gateway "+source, proxyURL, timeout, 20*time.Second),
+	}
+	for _, result := range networkCheckProbeResults(internetCheckRecord{Results: records}) {
+		if result.Name == "Gateway web" {
+			result.Name = "Gateway tunnel"
+		}
+		checks = append(checks, result)
+	}
+	started := time.Now()
+	if ip, err := a.gatewayEgressIP(cfg); err != nil {
+		checks = append(checks, withProbeDuration(probeResult{Name: "Gateway egress", Err: layerErr("remote gateway", err)}, time.Since(started)))
+	} else {
+		checks = append(checks, withProbeDuration(probeResult{Name: "Gateway egress", Detail: strings.TrimSpace(ip) + " via " + source}, time.Since(started)))
+	}
+	return checks, records
+}
+
+func probeLocalGatewayPorts(socks, httpProxy string) probeResult {
+	if result := probeTCP("Gateway ports", socks, 3*time.Second); result.Err != nil {
+		return probeResult{Name: "Gateway ports", Err: fmt.Errorf("SOCKS %s: %w", socks, result.Err)}
+	}
+	if result := probeTCP("Gateway ports", httpProxy, 3*time.Second); result.Err != nil {
+		return probeResult{Name: "Gateway ports", Err: fmt.Errorf("HTTP %s: %w", httpProxy, result.Err)}
+	}
+	return probeResult{Name: "Gateway ports", Detail: "SOCKS " + socks + "; HTTP " + httpProxy}
+}
+
 func gatewayRecoveryNeeded(checks []probeResult) bool {
 	latest := map[string]error{}
 	for _, check := range checks {
@@ -2168,6 +2279,9 @@ func gatewayRecoveryNeeded(checks []probeResult) bool {
 		for _, name := range gatewaySingleSourceProbeNames() {
 			delete(latest, name)
 		}
+	}
+	if err, ok := latest["Gateway tunnel"]; ok && err == nil {
+		delete(latest, "Gateway egress")
 	}
 	for _, check := range checks {
 		if _, ok := latest[check.Name]; !ok {
@@ -2183,7 +2297,8 @@ func gatewayRecoveryNeeded(checks []probeResult) bool {
 func gatewayRecoverableProbe(check probeResult) bool {
 	switch check.Name {
 	case "Gateway SOCKS port", "Gateway HTTP port", "Gateway SOCKS HTTPS", "Gateway HTTP HTTPS",
-		"Gateway egress IP", "Gateway HTTPS", "Gateway Docker Hub", "Gateway web quorum":
+		"Gateway egress IP", "Gateway HTTPS", "Gateway Docker Hub", "Gateway web quorum",
+		"Gateway ports", "Gateway tunnel", "Gateway egress":
 		return true
 	case "Sealed HTTPS":
 		return strings.Contains(check.Err.Error(), "gateway")
@@ -2201,6 +2316,9 @@ func latestProbeFailures(checks []probeResult) bool {
 		for _, name := range gatewaySingleSourceProbeNames() {
 			delete(latest, name)
 		}
+	}
+	if err, ok := latest["Gateway tunnel"]; ok && err == nil {
+		delete(latest, "Gateway egress")
 	}
 	if err, ok := latest["Direct web quorum"]; ok && err == nil {
 		for _, name := range directSingleSourceProbeNames() {
@@ -4101,6 +4219,7 @@ func (a app) printDoctorHelp() {
   envd doctor why ENV
   envd doctor history
   envd doctor network
+  envd doctor network --verbose
 
 Checks:
   host Docker, embedded images, gateway runtime, proxy ports, and env repair
@@ -4111,7 +4230,8 @@ Deep:
 Other:
   why ENV     explain the last state change for an env
   history     show recent envd events
-  network     test direct/gateway reachability, proxy handshakes, sealed HTTPS
+  network     test direct web, gateway tunnel, egress, and sealed HTTPS
+  --verbose   show raw direct/gateway probe details
 
 `)
 }
@@ -12547,11 +12667,34 @@ func confidenceScore(confidence string) int {
 
 func (a app) gatewayEgressIP(cfg gatewayConfig) (string, error) {
 	addr := net.JoinHostPort(hostForClient(cfg.BindIP), strconv.Itoa(cfg.HTTPHostPort))
-	ip, err := fetchViaHTTPProxy(addr, "https://api.ipify.org/", 10*time.Second)
-	if err != nil {
-		return "", err
+	targets := []string{"https://api4.ipify.org/", "https://ipv4.icanhazip.com/", "https://ifconfig.me/ip"}
+	type result struct {
+		target string
+		ip     string
+		err    error
 	}
-	return strings.TrimSpace(ip), nil
+	ch := make(chan result, len(targets))
+	for _, target := range targets {
+		go func(target string) {
+			ip, err := fetchViaHTTPProxy(addr, target, 6*time.Second)
+			if err == nil {
+				ip = strings.TrimSpace(ip)
+				if net.ParseIP(ip) == nil {
+					err = fmt.Errorf("unexpected IP response %q", ip)
+				}
+			}
+			ch <- result{target: target, ip: ip, err: err}
+		}(target)
+	}
+	failures := []string{}
+	for range targets {
+		got := <-ch
+		if got.err == nil {
+			return got.ip, nil
+		}
+		failures = append(failures, got.target+": "+redactSensitive(got.err.Error()))
+	}
+	return "", fmt.Errorf("egress IP lookup failed: %s", strings.Join(failures, "; "))
 }
 
 func (a app) activeGatewayConfig(st *envdState) (gatewayConfig, string, error) {
@@ -13871,7 +14014,7 @@ test "$ok" -ge 3
 func sealedEgressScript() string {
 	return `
 set +e
-for target in https://api.ipify.org https://icanhazip.com https://ifconfig.me/ip; do
+for target in https://api4.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
   ip="$(curl -fsS --max-time 4 "$target" 2>/dev/null | tr -d '\r' | awk 'NF {print; exit}')"
   if [ -n "$ip" ]; then
     printf '%s\n' "$ip"

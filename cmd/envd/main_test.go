@@ -3941,6 +3941,19 @@ func TestGatewayQuorumSuppressesSingleSourceFailures(t *testing.T) {
 	}
 }
 
+func TestGatewayTunnelSuppressesCompactEgressFailure(t *testing.T) {
+	checks := []probeResult{
+		{Name: "Gateway tunnel", Detail: "4/4 ok"},
+		{Name: "Gateway egress", Err: errors.New("ip lookup timeout")},
+	}
+	if gatewayRecoveryNeeded(checks) {
+		t.Fatalf("healthy gateway tunnel should not trigger recovery for egress lookup failure")
+	}
+	if latestProbeFailures(checks) {
+		t.Fatalf("healthy gateway tunnel should suppress compact egress lookup failure")
+	}
+}
+
 func TestDirectQuorumSuppressesSingleSourceFailures(t *testing.T) {
 	checks := []probeResult{
 		{Name: "Direct HTTPS", Err: errors.New("ipify timeout")},
