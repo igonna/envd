@@ -307,6 +307,9 @@ func (a app) run(args []string) error {
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.runGateway(args[1:], nil)
 		}
+		if !isKnownGatewaySubcommand(args[1]) {
+			return a.runGateway(args[1:], nil)
+		}
 		if isGatewayRemoveSubcommand(args[1:]) && !isGatewayRemoveCommand(args[1:]) {
 			return a.runGateway(args[1:], nil)
 		}
@@ -390,6 +393,9 @@ func (a app) run(args []string) error {
 	case "network":
 		if len(args) == 1 || (len(args) > 1 && isHelpArg(args[1])) {
 			return a.printCommandHelp([]string{"network"})
+		}
+		if len(args) > 1 && args[1] == "doctor" {
+			return a.withState(func(st *envdState) error { return a.runDoctorNetwork(args[2:], st) })
 		}
 		return a.withStatePasswordSaveOnError(func(st *envdState, password []byte) error { return a.networkEnv(args[1:], st, password) })
 	case "pkg":
@@ -2041,6 +2047,9 @@ func (a app) runDoctorNetwork(args []string, st *envdState) error {
 	checks = append(checks, sealed)
 	a.printProbeResult(sealed, width)
 	if err == nil && gatewayRecoveryNeeded(checks) {
+		remote := timedProbe(func() probeResult { return a.probeRemoteGatewayPressure(st) })
+		checks = append(checks, remote)
+		a.printProbeResult(remote, width)
 		recovery := timedProbe(func() probeResult { return a.probeGatewayRecovery(st) })
 		checks = append(checks, recovery)
 		a.printProbeResult(recovery, width)
@@ -2089,6 +2098,54 @@ func (a app) runDoctorNetwork(args []string, st *envdState) error {
 			sealed = timedProbe(func() probeResult { return a.probeSealedEnvTraffic(st) })
 			checks = append(checks, sealed)
 			a.printProbeResult(sealed, width)
+			if gatewayRecoveryNeeded(checks) {
+				remoteRecovery := timedProbe(func() probeResult { return a.probeRemoteGatewayRecovery(st) })
+				checks = append(checks, remoteRecovery)
+				a.printProbeResult(remoteRecovery, width)
+				if remoteRecovery.Err == nil {
+					rechecks := []probeResult{
+						timedProbe(func() probeResult { return probeTCP("Gateway SOCKS port", socks, 3*time.Second) }),
+						timedProbe(func() probeResult { return probeTCP("Gateway HTTP port", httpProxy, 3*time.Second) }),
+						timedProbe(func() probeResult {
+							return probeSOCKS("Gateway SOCKS HTTPS", socks, "api.ipify.org:443", 8*time.Second)
+						}),
+						timedProbe(func() probeResult {
+							return probeHTTPProxy("Gateway HTTP HTTPS", httpProxy, "api.ipify.org:443", 8*time.Second)
+						}),
+					}
+					for _, result := range rechecks {
+						checks = append(checks, result)
+						a.printProbeResult(result, width)
+					}
+					started := time.Now()
+					if ip, err := a.gatewayEgressIP(cfg); err != nil {
+						result := withProbeDuration(probeResult{Name: "Gateway egress IP", Err: layerErr("remote gateway", err)}, time.Since(started))
+						checks = append(checks, result)
+						a.printProbeResult(result, width)
+					} else {
+						result := withProbeDuration(probeResult{Name: "Gateway egress IP", Detail: strings.TrimSpace(ip) + " via " + source}, time.Since(started))
+						checks = append(checks, result)
+						a.printProbeResult(result, width)
+					}
+					recheckedGatewayResults := []internetProbeRecord{
+						timedInternetProbe(func() internetProbeRecord {
+							return probeHTTPProxyURL("Gateway HTTPS", "gateway "+source, httpProxy, "https://api.ipify.org/", 8*time.Second)
+						}),
+						timedInternetProbe(func() internetProbeRecord {
+							return probeHTTPProxyURL("Gateway Docker Hub", "gateway "+source, httpProxy, "https://registry-1.docker.io/v2/", 8*time.Second)
+						}),
+						probeWebQuorum("Gateway web quorum", "gateway "+source, mustParseURL("http://"+httpProxy), 8*time.Second, 20*time.Second),
+					}
+					gatewayResults = append(gatewayResults, recheckedGatewayResults...)
+					for _, result := range networkCheckProbeResults(internetCheckRecord{Results: recheckedGatewayResults}) {
+						checks = append(checks, result)
+						a.printProbeResult(result, width)
+					}
+					sealed = timedProbe(func() probeResult { return a.probeSealedEnvTraffic(st) })
+					checks = append(checks, sealed)
+					a.printProbeResult(sealed, width)
+				}
+			}
 		}
 	}
 	recordNetworkCheck(st, internetCheckRecord{
@@ -2145,6 +2202,11 @@ func latestProbeFailures(checks []probeResult) bool {
 			delete(latest, name)
 		}
 	}
+	if err, ok := latest["Direct web quorum"]; ok && err == nil {
+		for _, name := range directSingleSourceProbeNames() {
+			delete(latest, name)
+		}
+	}
 	for _, err := range latest {
 		if err != nil {
 			return true
@@ -2163,11 +2225,136 @@ func gatewaySingleSourceProbeNames() []string {
 	}
 }
 
+func directSingleSourceProbeNames() []string {
+	return []string{
+		"Direct HTTPS",
+		"Direct Docker Hub",
+	}
+}
+
 func (a app) probeGatewayRecovery(st *envdState) probeResult {
 	if err := a.restartActiveGatewayRuntime(st); err != nil {
 		return probeResult{Name: "Gateway recovery", Err: err}
 	}
 	return probeResult{Name: "Gateway recovery", Detail: "restarted local gateway"}
+}
+
+func (a app) probeRemoteGatewayRecovery(st *envdState) probeResult {
+	const name = "Remote recovery"
+	rec, plan, err := activeRemoteGatewayPlan(st)
+	if err != nil {
+		return probeResult{Name: name, Err: err}
+	}
+	client, err := dialRemoteGateway(plan, rec.Password, rec.HostKeySHA256)
+	if err != nil {
+		return probeResult{Name: name, Err: fmt.Errorf("remote SSH unavailable: %w", err)}
+	}
+	defer client.Close()
+	if _, err := runSSHCommand(client, remoteGatewayRecoveryScript(rec.Material.Port)); err != nil {
+		return probeResult{Name: name, Err: fmt.Errorf("remote Xray restart failed: %w", err)}
+	}
+	return probeResult{Name: name, Detail: "restarted remote Xray"}
+}
+
+func remoteGatewayRecoveryScript(port int) string {
+	return fmt.Sprintf(`set -eu
+cat > /usr/local/bin/envd-xray-watchdog.tmp <<'ENVD_XRAY_WATCHDOG'
+%s
+ENVD_XRAY_WATCHDOG
+install -m 755 /usr/local/bin/envd-xray-watchdog.tmp /usr/local/bin/envd-xray-watchdog
+rm -f /usr/local/bin/envd-xray-watchdog.tmp
+cat > /etc/systemd/system/envd-xray-watchdog.service.tmp <<'ENVD_XRAY_WATCHDOG_SERVICE'
+%s
+ENVD_XRAY_WATCHDOG_SERVICE
+install -m 644 /etc/systemd/system/envd-xray-watchdog.service.tmp /etc/systemd/system/envd-xray-watchdog.service
+rm -f /etc/systemd/system/envd-xray-watchdog.service.tmp
+cat > /etc/systemd/system/envd-xray-watchdog.timer.tmp <<'ENVD_XRAY_WATCHDOG_TIMER'
+%s
+ENVD_XRAY_WATCHDOG_TIMER
+install -m 644 /etc/systemd/system/envd-xray-watchdog.timer.tmp /etc/systemd/system/envd-xray-watchdog.timer
+rm -f /etc/systemd/system/envd-xray-watchdog.timer.tmp
+systemctl daemon-reload
+systemctl enable --now envd-xray-watchdog.timer
+systemctl restart envd-xray.service
+systemctl is-active --quiet envd-xray.service
+`, remoteXrayWatchdogScript(port), remoteXrayWatchdogServiceUnit(), remoteXrayWatchdogTimerUnit())
+}
+
+func (a app) probeRemoteGatewayPressure(st *envdState) probeResult {
+	const name = "Remote pressure"
+	rec, plan, err := activeRemoteGatewayPlan(st)
+	if err != nil {
+		return probeResult{Name: name, Detail: "unavailable: " + redactSensitive(err.Error())}
+	}
+	client, err := dialRemoteGateway(plan, rec.Password, rec.HostKeySHA256)
+	if err != nil {
+		return probeResult{Name: name, Detail: "unavailable: " + redactSensitive(err.Error())}
+	}
+	defer client.Close()
+	raw, err := runSSHCommand(client, remoteGatewayPressureScript(rec.Material.Port))
+	if err != nil {
+		return probeResult{Name: name, Detail: "unavailable: " + redactSensitive(err.Error())}
+	}
+	return probeResult{Name: name, Detail: formatRemoteGatewayPressure(raw)}
+}
+
+func activeRemoteGatewayPlan(st *envdState) (remoteGatewayRecord, gatewayInstallPlan, error) {
+	if st == nil || st.ActiveGateway == "" {
+		return remoteGatewayRecord{}, gatewayInstallPlan{}, fmt.Errorf("no active remote gateway")
+	}
+	rec, ok := st.RemoteGateways[st.ActiveGateway]
+	if !ok {
+		return remoteGatewayRecord{}, gatewayInstallPlan{}, fmt.Errorf("active gateway is not remote-managed")
+	}
+	if strings.TrimSpace(rec.Password) == "" {
+		return remoteGatewayRecord{}, gatewayInstallPlan{}, fmt.Errorf("remote password missing")
+	}
+	plan := gatewayInstallPlan{Name: rec.Name, Host: rec.Host, User: rec.User, Provider: rec.Provider, Strategy: rec.Strategy, Mode: rec.Mode}
+	return rec, plan, nil
+}
+
+func remoteGatewayPressureScript(port int) string {
+	return fmt.Sprintf(`set +e
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl show envd-xray.service -p ActiveState -p SubState -p Result -p NRestarts -p ExecMainPID --no-pager 2>/dev/null
+fi
+if command -v ss >/dev/null 2>&1; then
+  ss -s 2>/dev/null | sed -n 's/.*estab \([0-9][0-9]*\).*/tcp_estab=\1/p' | head -1
+  ss -s 2>/dev/null | sed -n 's/.*orphaned \([0-9][0-9]*\).*/tcp_orphaned=\1/p' | head -1
+  fin_wait_1=$(ss -Htan state fin-wait-1 "( sport = :%d )" 2>/dev/null | wc -l | tr -d ' ')
+  echo "fin_wait_1=${fin_wait_1:-0}"
+  ss -Htn state established "( sport = :%d )" 2>/dev/null \
+    | awk '{peer=$4; if (peer == "" || peer == "*:*") peer=$5; gsub(/^\[/, "", peer); gsub(/\]$/, "", peer); sub(/:[0-9]+$/, "", peer); if (peer != "") print peer}' \
+    | sort | uniq -c | sort -nr | awk 'NR==1 {print "top_client_flows="$1; print "top_client="$2}'
+fi
+`, port, port)
+}
+
+func formatRemoteGatewayPressure(raw string) string {
+	kv := parseKeyValues(raw)
+	active := defaultString(kv["ActiveState"], "unknown")
+	sub := defaultString(kv["SubState"], "unknown")
+	restarts := defaultString(kv["NRestarts"], "unknown")
+	pid := defaultString(kv["ExecMainPID"], "unknown")
+	estab := defaultString(kv["tcp_estab"], "unknown")
+	orphaned := defaultString(kv["tcp_orphaned"], "unknown")
+	finWait1 := defaultString(kv["fin_wait_1"], "unknown")
+	topClient := kv["top_client"]
+	topFlows := kv["top_client_flows"]
+	detail := fmt.Sprintf("service %s/%s restarts=%s pid=%s tcp_estab=%s orphaned=%s fin_wait_1=%s", active, sub, restarts, pid, estab, orphaned, finWait1)
+	if topClient != "" && topFlows != "" {
+		detail += " top_client=" + topClient + " flows=" + topFlows
+	}
+	if n, err := strconv.Atoi(orphaned); err == nil && n >= 100 {
+		detail += " WARN high orphaned TCP"
+	} else if n, err := strconv.Atoi(finWait1); err == nil && n >= 50 {
+		detail += " WARN high FIN-WAIT-1"
+	} else if n, err := strconv.Atoi(estab); err == nil && n >= 400 {
+		detail += " WARN high connection pressure"
+	} else if n, err := strconv.Atoi(topFlows); err == nil && n >= 100 {
+		detail += " WARN high single-client pressure"
+	}
+	return detail
 }
 
 func timedProbe(fn func() probeResult) probeResult {
@@ -2284,6 +2471,15 @@ func (a app) runGateway(args []string, st *envdState) error {
 		return a.runGatewayChain(args[1:], st)
 	default:
 		return fmt.Errorf("unknown gateway subcommand %q", args[0])
+	}
+}
+
+func isKnownGatewaySubcommand(command string) bool {
+	switch command {
+	case "list", "ls", "status", "inspect", "render", "egress", "share", "shares", "view", "revoke", "risk", "install", "use", "rollback", "rm", "remove", "chain":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -9508,10 +9704,26 @@ cat > /etc/systemd/system/envd-xray.service.tmp <<'ENVD_XRAY_SERVICE'
 ENVD_XRAY_SERVICE
 install -m 644 /etc/systemd/system/envd-xray.service.tmp /etc/systemd/system/envd-xray.service
 rm -f /etc/systemd/system/envd-xray.service.tmp
+cat > /usr/local/bin/envd-xray-watchdog.tmp <<'ENVD_XRAY_WATCHDOG'
+%s
+ENVD_XRAY_WATCHDOG
+install -m 755 /usr/local/bin/envd-xray-watchdog.tmp /usr/local/bin/envd-xray-watchdog
+rm -f /usr/local/bin/envd-xray-watchdog.tmp
+cat > /etc/systemd/system/envd-xray-watchdog.service.tmp <<'ENVD_XRAY_WATCHDOG_SERVICE'
+%s
+ENVD_XRAY_WATCHDOG_SERVICE
+install -m 644 /etc/systemd/system/envd-xray-watchdog.service.tmp /etc/systemd/system/envd-xray-watchdog.service
+rm -f /etc/systemd/system/envd-xray-watchdog.service.tmp
+cat > /etc/systemd/system/envd-xray-watchdog.timer.tmp <<'ENVD_XRAY_WATCHDOG_TIMER'
+%s
+ENVD_XRAY_WATCHDOG_TIMER
+install -m 644 /etc/systemd/system/envd-xray-watchdog.timer.tmp /etc/systemd/system/envd-xray-watchdog.timer
+rm -f /etc/systemd/system/envd-xray-watchdog.timer.tmp
 systemctl daemon-reload
 systemctl enable envd-xray.service
+systemctl enable --now envd-xray-watchdog.timer
 systemctl restart envd-xray.service
-`, material.ServiceUnit)
+`, material.ServiceUnit, remoteXrayWatchdogScript(material.Port), remoteXrayWatchdogServiceUnit(), remoteXrayWatchdogTimerUnit())
 }
 
 func remoteFirewallScript(firewall string, port int) string {
@@ -9861,6 +10073,75 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
+`
+}
+
+func remoteXrayWatchdogScript(port int) string {
+	return fmt.Sprintf(`#!/bin/sh
+set -eu
+port=%d
+orphan_limit=100
+fin_wait_1_limit=50
+estab_limit=500
+single_client_limit=150
+
+if ! command -v ss >/dev/null 2>&1; then
+  exit 0
+fi
+
+summary="$(ss -s 2>/dev/null || true)"
+orphaned="$(printf '%%s\n' "$summary" | sed -n 's/.*orphaned \([0-9][0-9]*\).*/\1/p' | head -1)"
+estab="$(printf '%%s\n' "$summary" | sed -n 's/.*estab \([0-9][0-9]*\).*/\1/p' | head -1)"
+orphaned="${orphaned:-0}"
+estab="${estab:-0}"
+fin_wait_1="$(ss -Htan state fin-wait-1 "( sport = :$port )" 2>/dev/null | wc -l | tr -d ' ')"
+fin_wait_1="${fin_wait_1:-0}"
+top_client_flows="$(ss -Htn state established "( sport = :$port )" 2>/dev/null \
+  | awk '{peer=$4; if (peer == "" || peer == "*:*") peer=$5; gsub(/^\[/, "", peer); gsub(/\]$/, "", peer); sub(/:[0-9]+$/, "", peer); if (peer != "") print peer}' \
+  | sort | uniq -c | sort -nr | awk 'NR==1 {print $1}')"
+top_client_flows="${top_client_flows:-0}"
+
+reason=""
+if [ "$orphaned" -ge "$orphan_limit" ]; then
+  reason="orphaned=$orphaned"
+elif [ "$fin_wait_1" -ge "$fin_wait_1_limit" ]; then
+  reason="fin_wait_1=$fin_wait_1"
+elif [ "$estab" -ge "$estab_limit" ]; then
+  reason="tcp_estab=$estab"
+elif [ "$top_client_flows" -ge "$single_client_limit" ]; then
+  reason="top_client_flows=$top_client_flows"
+fi
+
+if [ -n "$reason" ]; then
+  logger -t envd-xray-watchdog "restarting envd-xray: $reason tcp_estab=$estab orphaned=$orphaned fin_wait_1=$fin_wait_1 top_client_flows=$top_client_flows"
+  systemctl restart envd-xray.service
+fi
+`, port)
+}
+
+func remoteXrayWatchdogServiceUnit() string {
+	return `[Unit]
+Description=envd Xray socket watchdog
+After=envd-xray.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/envd-xray-watchdog
+`
+}
+
+func remoteXrayWatchdogTimerUnit() string {
+	return `[Unit]
+Description=envd Xray socket watchdog timer
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=envd-xray-watchdog.service
+
+[Install]
+WantedBy=timers.target
 `
 }
 

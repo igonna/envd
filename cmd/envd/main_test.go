@@ -138,6 +138,60 @@ func TestClearZshCompletionDump(t *testing.T) {
 	}
 }
 
+func TestFormatRemoteGatewayPressureWarnsOnHighConnectionPressure(t *testing.T) {
+	raw := strings.Join([]string{
+		"ActiveState=active",
+		"SubState=running",
+		"NRestarts=0",
+		"ExecMainPID=17333",
+		"tcp_estab=630",
+		"tcp_orphaned=0",
+		"fin_wait_1=0",
+		"top_client_flows=219",
+		"top_client=91.241.137.209",
+	}, "\n")
+	got := formatRemoteGatewayPressure(raw)
+	for _, want := range []string{
+		"service active/running",
+		"restarts=0",
+		"tcp_estab=630",
+		"top_client=91.241.137.209 flows=219",
+		"WARN high connection pressure",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("pressure summary missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestFormatRemoteGatewayPressureWarnsOnRemoteSocketBacklog(t *testing.T) {
+	raw := strings.Join([]string{
+		"ActiveState=active",
+		"SubState=running",
+		"NRestarts=0",
+		"ExecMainPID=17333",
+		"tcp_estab=33",
+		"tcp_orphaned=491",
+		"fin_wait_1=105",
+	}, "\n")
+	got := formatRemoteGatewayPressure(raw)
+	for _, want := range []string{
+		"orphaned=491",
+		"fin_wait_1=105",
+		"WARN high orphaned TCP",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("pressure summary missing %q: %s", want, got)
+		}
+	}
+
+	raw = strings.ReplaceAll(raw, "tcp_orphaned=491", "tcp_orphaned=0")
+	got = formatRemoteGatewayPressure(raw)
+	if !strings.Contains(got, "WARN high FIN-WAIT-1") {
+		t.Fatalf("pressure summary should warn on FIN-WAIT-1: %s", got)
+	}
+}
+
 func TestRemovedTopLevelCommands(t *testing.T) {
 	a := app{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, root: t.TempDir()}
 	for _, cmd := range []string{"internet", "events", "why", "inspect", "supervisor"} {
@@ -2894,6 +2948,41 @@ func TestGenerateRemoteGatewayMaterial(t *testing.T) {
 	}
 }
 
+func TestRemoteSystemdInstallInstallsSocketWatchdog(t *testing.T) {
+	material := remoteGatewayMaterial{
+		Port:        443,
+		ServiceUnit: remoteXrayServiceUnit(),
+	}
+	script := remoteSystemdInstallScript(material)
+	for _, want := range []string{
+		"/usr/local/bin/envd-xray-watchdog",
+		"envd-xray-watchdog.service",
+		"envd-xray-watchdog.timer",
+		"systemctl enable --now envd-xray-watchdog.timer",
+		"orphaned",
+		"fin_wait_1",
+		"systemctl restart envd-xray.service",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("systemd install script missing %q:\n%s", want, script)
+		}
+	}
+}
+
+func TestRemoteGatewayRecoveryInstallsSocketWatchdog(t *testing.T) {
+	script := remoteGatewayRecoveryScript(443)
+	for _, want := range []string{
+		"/usr/local/bin/envd-xray-watchdog",
+		"envd-xray-watchdog.timer",
+		"systemctl enable --now envd-xray-watchdog.timer",
+		"systemctl restart envd-xray.service",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("remote recovery script missing %q:\n%s", want, script)
+		}
+	}
+}
+
 func TestRemoteInstallXrayScriptBootstrapsRequiredTools(t *testing.T) {
 	material := remoteGatewayMaterial{
 		XrayVersion: remoteXrayVersion,
@@ -2995,6 +3084,7 @@ func TestRunGatewayInstallApplyInstallsVerifiesAndStoresProfile(t *testing.T) {
 		"Xray-linux-${xray_arch}.zip",
 		"/usr/local/etc/envd/xray/config.json",
 		"systemctl enable envd-xray.service",
+		"systemctl enable --now envd-xray-watchdog.timer",
 		"ufw allow",
 		"systemctl is-active --quiet envd-xray.service",
 	} {
@@ -3848,6 +3938,16 @@ func TestGatewayQuorumSuppressesSingleSourceFailures(t *testing.T) {
 	}
 	if latestProbeFailures(checks) {
 		t.Fatalf("healthy gateway quorum should suppress single-source failure")
+	}
+}
+
+func TestDirectQuorumSuppressesSingleSourceFailures(t *testing.T) {
+	checks := []probeResult{
+		{Name: "Direct HTTPS", Err: errors.New("ipify timeout")},
+		{Name: "Direct web quorum", Detail: "4/4 ok"},
+	}
+	if latestProbeFailures(checks) {
+		t.Fatalf("healthy direct quorum should suppress direct single-source failure")
 	}
 }
 
