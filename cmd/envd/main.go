@@ -691,6 +691,8 @@ func runtimeEnvStatusRows(access runtimeAccessState) []envStatusRow {
 		issue := ""
 		if state == "missing" {
 			issue = "run envd start " + name
+		} else if route.HasSSHIdentity && state == "running" && !envContainerIdentityAgentReady(runtimeRefFromRoute(route)) {
+			issue = "identity stale"
 		}
 		rows = append(rows, envStatusRow{
 			Name:    name,
@@ -8520,9 +8522,8 @@ func (a app) ensureSSHProxyIdentityAgent(name string, route runtimeSSHRoute) err
 		return nil
 	}
 	if !term.IsTerminal(int(os.Stderr.Fd())) && !cachedOrEnvMasterPasswordAvailable() {
-		if route.HasSSHIdentity {
-			return fmt.Errorf("identity agent for %q is not ready; run `envd unlock`, then reconnect", name)
-		}
+		// Identity forwarding is useful for git inside the env, but it must not
+		// block base SSH/VS Code access when the master cache expired.
 		return nil
 	}
 	quiet := app{stdout: io.Discard, stderr: a.stderr, root: a.root}

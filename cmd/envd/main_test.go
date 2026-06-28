@@ -435,6 +435,24 @@ func TestStatusReportsMissingIdentityAgent(t *testing.T) {
 	}
 }
 
+func TestSSHProxyDoesNotBlockBaseAccessWhenIdentityAgentIsStale(t *testing.T) {
+	t.Setenv("ENVD_DATA_DIR", t.TempDir())
+	t.Setenv("ENVD_STATE_DIR", t.TempDir())
+	route := runtimeSSHRoute{
+		Name:           "books",
+		ID:             "abc123",
+		DevName:        "envd-abc123-dev",
+		NetName:        "envd-abc123-net",
+		Network:        "sealed",
+		HasSSHIdentity: true,
+	}
+	var stderr bytes.Buffer
+	a := app{stdout: io.Discard, stderr: &stderr, root: t.TempDir()}
+	if err := a.ensureSSHProxyIdentityAgent("books", route); err != nil {
+		t.Fatalf("stale identity agent should not block base SSH access, got %v", err)
+	}
+}
+
 func TestRuntimeRoutePreservesAndUpdatesSSHIdentityFlag(t *testing.T) {
 	t.Setenv("ENVD_DATA_DIR", t.TempDir())
 	ref := envRef{
