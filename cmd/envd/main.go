@@ -2376,6 +2376,16 @@ func (a app) probeRemoteGatewayRecovery(st *envdState) probeResult {
 
 func remoteGatewayRecoveryScript(port int) string {
 	return fmt.Sprintf(`set -eu
+cat > /usr/local/bin/envd-xray-hardening.tmp <<'ENVD_XRAY_HARDENING'
+%s
+ENVD_XRAY_HARDENING
+install -m 755 /usr/local/bin/envd-xray-hardening.tmp /usr/local/bin/envd-xray-hardening
+rm -f /usr/local/bin/envd-xray-hardening.tmp
+cat > /etc/systemd/system/envd-xray-hardening.service.tmp <<'ENVD_XRAY_HARDENING_SERVICE'
+%s
+ENVD_XRAY_HARDENING_SERVICE
+install -m 644 /etc/systemd/system/envd-xray-hardening.service.tmp /etc/systemd/system/envd-xray-hardening.service
+rm -f /etc/systemd/system/envd-xray-hardening.service.tmp
 cat > /usr/local/bin/envd-xray-watchdog.tmp <<'ENVD_XRAY_WATCHDOG'
 %s
 ENVD_XRAY_WATCHDOG
@@ -2392,10 +2402,12 @@ ENVD_XRAY_WATCHDOG_TIMER
 install -m 644 /etc/systemd/system/envd-xray-watchdog.timer.tmp /etc/systemd/system/envd-xray-watchdog.timer
 rm -f /etc/systemd/system/envd-xray-watchdog.timer.tmp
 systemctl daemon-reload
+systemctl enable --now envd-xray-hardening.service
 systemctl enable --now envd-xray-watchdog.timer
+systemctl restart envd-xray-hardening.service || true
 systemctl restart envd-xray.service
 systemctl is-active --quiet envd-xray.service
-`, remoteXrayWatchdogScript(port), remoteXrayWatchdogServiceUnit(), remoteXrayWatchdogTimerUnit())
+`, remoteXrayHardeningScript(port), remoteXrayHardeningServiceUnit(), remoteXrayWatchdogScript(port), remoteXrayWatchdogServiceUnit(), remoteXrayWatchdogTimerUnit())
 }
 
 func (a app) probeRemoteGatewayPressure(st *envdState) probeResult {
@@ -2441,11 +2453,13 @@ if command -v ss >/dev/null 2>&1; then
   ss -s 2>/dev/null | sed -n 's/.*orphaned \([0-9][0-9]*\).*/tcp_orphaned=\1/p' | head -1
   fin_wait_1=$(ss -Htan state fin-wait-1 "( sport = :%d )" 2>/dev/null | wc -l | tr -d ' ')
   echo "fin_wait_1=${fin_wait_1:-0}"
+  syn_recv=$(ss -Htan state syn-recv "( sport = :%d )" 2>/dev/null | wc -l | tr -d ' ')
+  echo "syn_recv=${syn_recv:-0}"
   ss -Htn state established "( sport = :%d )" 2>/dev/null \
     | awk '{peer=$4; if (peer == "" || peer == "*:*") peer=$5; gsub(/^\[/, "", peer); gsub(/\]$/, "", peer); sub(/:[0-9]+$/, "", peer); if (peer != "") print peer}' \
     | sort | uniq -c | sort -nr | awk 'NR==1 {print "top_client_flows="$1; print "top_client="$2}'
 fi
-`, port, port)
+`, port, port, port)
 }
 
 func formatRemoteGatewayPressure(raw string) string {
@@ -2457,9 +2471,10 @@ func formatRemoteGatewayPressure(raw string) string {
 	estab := defaultString(kv["tcp_estab"], "unknown")
 	orphaned := defaultString(kv["tcp_orphaned"], "unknown")
 	finWait1 := defaultString(kv["fin_wait_1"], "unknown")
+	synRecv := defaultString(kv["syn_recv"], "unknown")
 	topClient := kv["top_client"]
 	topFlows := kv["top_client_flows"]
-	detail := fmt.Sprintf("service %s/%s restarts=%s pid=%s tcp_estab=%s orphaned=%s fin_wait_1=%s", active, sub, restarts, pid, estab, orphaned, finWait1)
+	detail := fmt.Sprintf("service %s/%s restarts=%s pid=%s tcp_estab=%s orphaned=%s fin_wait_1=%s syn_recv=%s", active, sub, restarts, pid, estab, orphaned, finWait1, synRecv)
 	if topClient != "" && topFlows != "" {
 		detail += " top_client=" + topClient + " flows=" + topFlows
 	}
@@ -2467,6 +2482,8 @@ func formatRemoteGatewayPressure(raw string) string {
 		detail += " WARN high orphaned TCP"
 	} else if n, err := strconv.Atoi(finWait1); err == nil && n >= 50 {
 		detail += " WARN high FIN-WAIT-1"
+	} else if n, err := strconv.Atoi(synRecv); err == nil && n >= 100 {
+		detail += " WARN high SYN-RECV"
 	} else if n, err := strconv.Atoi(estab); err == nil && n >= 400 {
 		detail += " WARN high connection pressure"
 	} else if n, err := strconv.Atoi(topFlows); err == nil && n >= 100 {
@@ -9764,6 +9781,7 @@ func runSSHCommandNoOutput(client *ssh.Client, script string) error {
 }
 
 func remoteInstallXrayScript(material remoteGatewayMaterial) string {
+	configJSON := normalizeRemoteXrayLogConfig(material.ConfigJSON)
 	return fmt.Sprintf(`set -eu
 install -d -m 700 /usr/local/etc/envd/xray
 if [ -f /usr/local/etc/envd/xray/config.json ]; then
@@ -9814,7 +9832,28 @@ if ! /usr/local/bin/xray version 2>/dev/null | head -n1 | grep -F %s >/dev/null 
   rm -rf "$tmp"
 fi
 /usr/local/bin/xray version >/dev/null
-`, material.ConfigJSON, shellQuote(material.XrayVersion), material.XrayVersion)
+`, configJSON, shellQuote(material.XrayVersion), material.XrayVersion)
+}
+
+func normalizeRemoteXrayLogConfig(configJSON string) string {
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		return configJSON
+	}
+	logConfig, _ := cfg["log"].(map[string]any)
+	if logConfig == nil {
+		logConfig = map[string]any{}
+	}
+	logConfig["access"] = "none"
+	if _, ok := logConfig["loglevel"]; !ok {
+		logConfig["loglevel"] = "warning"
+	}
+	cfg["log"] = logConfig
+	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return configJSON
+	}
+	return string(raw)
 }
 
 func remoteSystemdInstallScript(material remoteGatewayMaterial) string {
@@ -9824,6 +9863,16 @@ cat > /etc/systemd/system/envd-xray.service.tmp <<'ENVD_XRAY_SERVICE'
 ENVD_XRAY_SERVICE
 install -m 644 /etc/systemd/system/envd-xray.service.tmp /etc/systemd/system/envd-xray.service
 rm -f /etc/systemd/system/envd-xray.service.tmp
+cat > /usr/local/bin/envd-xray-hardening.tmp <<'ENVD_XRAY_HARDENING'
+%s
+ENVD_XRAY_HARDENING
+install -m 755 /usr/local/bin/envd-xray-hardening.tmp /usr/local/bin/envd-xray-hardening
+rm -f /usr/local/bin/envd-xray-hardening.tmp
+cat > /etc/systemd/system/envd-xray-hardening.service.tmp <<'ENVD_XRAY_HARDENING_SERVICE'
+%s
+ENVD_XRAY_HARDENING_SERVICE
+install -m 644 /etc/systemd/system/envd-xray-hardening.service.tmp /etc/systemd/system/envd-xray-hardening.service
+rm -f /etc/systemd/system/envd-xray-hardening.service.tmp
 cat > /usr/local/bin/envd-xray-watchdog.tmp <<'ENVD_XRAY_WATCHDOG'
 %s
 ENVD_XRAY_WATCHDOG
@@ -9841,9 +9890,11 @@ install -m 644 /etc/systemd/system/envd-xray-watchdog.timer.tmp /etc/systemd/sys
 rm -f /etc/systemd/system/envd-xray-watchdog.timer.tmp
 systemctl daemon-reload
 systemctl enable envd-xray.service
+systemctl enable --now envd-xray-hardening.service
 systemctl enable --now envd-xray-watchdog.timer
+systemctl restart envd-xray-hardening.service || true
 systemctl restart envd-xray.service
-`, material.ServiceUnit, remoteXrayWatchdogScript(material.Port), remoteXrayWatchdogServiceUnit(), remoteXrayWatchdogTimerUnit())
+`, material.ServiceUnit, remoteXrayHardeningScript(material.Port), remoteXrayHardeningServiceUnit(), remoteXrayWatchdogScript(material.Port), remoteXrayWatchdogServiceUnit(), remoteXrayWatchdogTimerUnit())
 }
 
 func remoteFirewallScript(firewall string, port int) string {
@@ -10143,7 +10194,7 @@ func remoteRealitySNI(strategy string) string {
 
 func remoteXrayServerConfig(uuid, privateKey, shortID, sni string, port int) (string, error) {
 	cfg := map[string]any{
-		"log": map[string]any{"loglevel": "warning"},
+		"log": map[string]any{"access": "none", "loglevel": "warning"},
 		"inbounds": []any{map[string]any{
 			"listen":   "0.0.0.0",
 			"port":     port,
@@ -10181,7 +10232,8 @@ func remoteXrayServiceUnit() string {
 	return `[Unit]
 Description=envd Xray Reality gateway
 After=network-online.target
-Wants=network-online.target
+After=envd-xray-hardening.service
+Wants=network-online.target envd-xray-hardening.service
 
 [Service]
 Type=simple
@@ -10196,12 +10248,121 @@ WantedBy=multi-user.target
 `
 }
 
+func remoteXrayHardeningScript(port int) string {
+	return fmt.Sprintf(`#!/bin/sh
+set -eu
+port=%d
+
+cat > /etc/sysctl.d/99-envd-xray.conf.tmp <<'ENVD_XRAY_SYSCTL'
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 8192
+net.core.somaxconn = 8192
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_retries2 = 8
+net.ipv4.ip_local_port_range = 10240 60999
+ENVD_XRAY_SYSCTL
+install -m 644 /etc/sysctl.d/99-envd-xray.conf.tmp /etc/sysctl.d/99-envd-xray.conf
+rm -f /etc/sysctl.d/99-envd-xray.conf.tmp
+sysctl -p /etc/sysctl.d/99-envd-xray.conf >/dev/null 2>&1 || true
+
+if [ -d /etc/systemd/journald.conf.d ]; then
+  :
+else
+  mkdir -p /etc/systemd/journald.conf.d
+fi
+cat > /etc/systemd/journald.conf.d/99-envd.conf.tmp <<'ENVD_JOURNALD'
+[Journal]
+SystemMaxUse=200M
+SystemMaxFileSize=32M
+MaxRetentionSec=14day
+Compress=yes
+ENVD_JOURNALD
+install -m 644 /etc/systemd/journald.conf.d/99-envd.conf.tmp /etc/systemd/journald.conf.d/99-envd.conf
+rm -f /etc/systemd/journald.conf.d/99-envd.conf.tmp
+systemctl restart systemd-journald.service >/dev/null 2>&1 || true
+journalctl --vacuum-size=200M >/dev/null 2>&1 || true
+
+if ! command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
+  run_limited() {
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 60 "$@"
+    else
+      "$@"
+    fi
+  }
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    run_limited apt-get update >/dev/null 2>&1 || true
+    run_limited apt-get install -y --no-install-recommends nftables >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    run_limited dnf install -y nftables >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    run_limited yum install -y nftables >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    run_limited apk add --no-cache nftables >/dev/null 2>&1 || true
+  fi
+fi
+
+if command -v nft >/dev/null 2>&1; then
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+delete table inet envd_xray
+table inet envd_xray {
+  chain input {
+    type filter hook input priority -5; policy accept;
+    tcp dport $port ct state new meter envd_xray_v4 { ip saddr timeout 1m limit rate over 600/minute burst 300 packets } drop
+    tcp dport $port ct state new meter envd_xray_v6 { ip6 saddr timeout 1m limit rate over 600/minute burst 300 packets } drop
+  }
+}
+EOF
+  if ! nft -f "$tmp" >/dev/null 2>&1; then
+    sed '1d' "$tmp" > "$tmp.create"
+    if ! nft -f "$tmp.create" >/dev/null 2>&1; then
+      logger -t envd-xray-hardening "nft rate-limit install failed; continuing with sysctl only"
+      nft delete table inet envd_xray >/dev/null 2>&1 || true
+    fi
+    rm -f "$tmp.create"
+  fi
+  rm -f "$tmp"
+elif command -v iptables >/dev/null 2>&1; then
+  iptables -N ENVD_XRAY 2>/dev/null || true
+  iptables -F ENVD_XRAY 2>/dev/null || true
+  iptables -A ENVD_XRAY -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null || true
+  iptables -A ENVD_XRAY -m conntrack --ctstate NEW -m hashlimit --hashlimit-name envd_xray --hashlimit-above 600/minute --hashlimit-burst 300 --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP 2>/dev/null || true
+  iptables -A ENVD_XRAY -j RETURN 2>/dev/null || true
+  iptables -C INPUT -p tcp --dport "$port" -j ENVD_XRAY 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ENVD_XRAY 2>/dev/null || true
+fi
+
+logger -t envd-xray-hardening "applied tcp hardening for port $port"
+`, port)
+}
+
+func remoteXrayHardeningServiceUnit() string {
+	return `[Unit]
+Description=envd Xray TCP hardening
+After=network-pre.target
+Before=envd-xray.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/envd-xray-hardening
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+`
+}
+
 func remoteXrayWatchdogScript(port int) string {
 	return fmt.Sprintf(`#!/bin/sh
 set -eu
 port=%d
 orphan_limit=100
 fin_wait_1_limit=50
+syn_recv_limit=100
 estab_limit=500
 single_client_limit=150
 
@@ -10216,6 +10377,8 @@ orphaned="${orphaned:-0}"
 estab="${estab:-0}"
 fin_wait_1="$(ss -Htan state fin-wait-1 "( sport = :$port )" 2>/dev/null | wc -l | tr -d ' ')"
 fin_wait_1="${fin_wait_1:-0}"
+syn_recv="$(ss -Htan state syn-recv "( sport = :$port )" 2>/dev/null | wc -l | tr -d ' ')"
+syn_recv="${syn_recv:-0}"
 top_client_flows="$(ss -Htn state established "( sport = :$port )" 2>/dev/null \
   | awk '{peer=$4; if (peer == "" || peer == "*:*") peer=$5; gsub(/^\[/, "", peer); gsub(/\]$/, "", peer); sub(/:[0-9]+$/, "", peer); if (peer != "") print peer}' \
   | sort | uniq -c | sort -nr | awk 'NR==1 {print $1}')"
@@ -10226,6 +10389,8 @@ if [ "$orphaned" -ge "$orphan_limit" ]; then
   reason="orphaned=$orphaned"
 elif [ "$fin_wait_1" -ge "$fin_wait_1_limit" ]; then
   reason="fin_wait_1=$fin_wait_1"
+elif [ "$syn_recv" -ge "$syn_recv_limit" ]; then
+  reason="syn_recv=$syn_recv"
 elif [ "$estab" -ge "$estab_limit" ]; then
   reason="tcp_estab=$estab"
 elif [ "$top_client_flows" -ge "$single_client_limit" ]; then
@@ -10233,7 +10398,7 @@ elif [ "$top_client_flows" -ge "$single_client_limit" ]; then
 fi
 
 if [ -n "$reason" ]; then
-  logger -t envd-xray-watchdog "restarting envd-xray: $reason tcp_estab=$estab orphaned=$orphaned fin_wait_1=$fin_wait_1 top_client_flows=$top_client_flows"
+  logger -t envd-xray-watchdog "restarting envd-xray: $reason tcp_estab=$estab orphaned=$orphaned fin_wait_1=$fin_wait_1 syn_recv=$syn_recv top_client_flows=$top_client_flows"
   systemctl restart envd-xray.service
 fi
 `, port)

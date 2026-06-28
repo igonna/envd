@@ -2940,6 +2940,9 @@ func TestGenerateRemoteGatewayMaterial(t *testing.T) {
 			t.Fatalf("material missing %q:\nconfig=%s\nunit=%s", want, material.ConfigJSON, material.ServiceUnit)
 		}
 	}
+	if !strings.Contains(material.ConfigJSON, `"access": "none"`) {
+		t.Fatalf("server inbound config should disable access logs:\n%s", material.ConfigJSON)
+	}
 	if strings.Contains(material.ConfigJSON, `"encryption"`) {
 		t.Fatalf("server inbound config must not contain VLESS client encryption:\n%s", material.ConfigJSON)
 	}
@@ -2955,12 +2958,22 @@ func TestRemoteSystemdInstallInstallsSocketWatchdog(t *testing.T) {
 	}
 	script := remoteSystemdInstallScript(material)
 	for _, want := range []string{
+		"/usr/local/bin/envd-xray-hardening",
+		"envd-xray-hardening.service",
+		"systemctl enable --now envd-xray-hardening.service",
+		"99-envd-xray.conf",
+		"net.ipv4.tcp_syncookies",
+		"apt-get install -y --no-install-recommends nftables",
+		"SystemMaxUse=200M",
+		"journalctl --vacuum-size=200M",
+		"envd_xray",
 		"/usr/local/bin/envd-xray-watchdog",
 		"envd-xray-watchdog.service",
 		"envd-xray-watchdog.timer",
 		"systemctl enable --now envd-xray-watchdog.timer",
 		"orphaned",
 		"fin_wait_1",
+		"syn_recv",
 		"systemctl restart envd-xray.service",
 	} {
 		if !strings.Contains(script, want) {
@@ -2972,6 +2985,9 @@ func TestRemoteSystemdInstallInstallsSocketWatchdog(t *testing.T) {
 func TestRemoteGatewayRecoveryInstallsSocketWatchdog(t *testing.T) {
 	script := remoteGatewayRecoveryScript(443)
 	for _, want := range []string{
+		"/usr/local/bin/envd-xray-hardening",
+		"envd-xray-hardening.service",
+		"systemctl enable --now envd-xray-hardening.service",
 		"/usr/local/bin/envd-xray-watchdog",
 		"envd-xray-watchdog.timer",
 		"systemctl enable --now envd-xray-watchdog.timer",
@@ -3000,6 +3016,16 @@ func TestRemoteInstallXrayScriptBootstrapsRequiredTools(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Fatalf("remote install script missing %q:\n%s", want, script)
 		}
+	}
+}
+
+func TestRemoteInstallXrayScriptDisablesAccessLogsForOldMaterial(t *testing.T) {
+	script := remoteInstallXrayScript(remoteGatewayMaterial{
+		XrayVersion: remoteXrayVersion,
+		ConfigJSON:  `{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[]}`,
+	})
+	if !strings.Contains(script, `"access": "none"`) {
+		t.Fatalf("remote install should normalize old material to disable access logs:\n%s", script)
 	}
 }
 
@@ -3083,7 +3109,9 @@ func TestRunGatewayInstallApplyInstallsVerifiesAndStoresProfile(t *testing.T) {
 	for _, want := range []string{
 		"Xray-linux-${xray_arch}.zip",
 		"/usr/local/etc/envd/xray/config.json",
+		"envd-xray-hardening.service",
 		"systemctl enable envd-xray.service",
+		"systemctl enable --now envd-xray-hardening.service",
 		"systemctl enable --now envd-xray-watchdog.timer",
 		"ufw allow",
 		"systemctl is-active --quiet envd-xray.service",
